@@ -546,6 +546,86 @@ int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_add_bf16");
 }
 
+__global__ static void h3_silu_bf16_kernel(const uint16_t *input,
+                                           uint16_t *output, uint32_t count) {
+    uint32_t index = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    float value = h3_bf16_bits_to_f32(input[index]);
+    output[index] = h3_f32_to_bf16_bits(value / (1.0f + expf(-value)));
+}
+
+struct h3_rms_norm_args {
+    uint32_t rows;
+    uint32_t width;
+    float epsilon;
+};
+
+__global__ static void h3_rms_norm_bf16_kernel(const uint16_t *input,
+                                               const uint16_t *weight,
+                                               uint16_t *output,
+                                               h3_rms_norm_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.rows) return;
+
+    extern __shared__ float reductions[];
+    const uint16_t *row_input = input + (size_t)row * args.width;
+    float local_sum = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float value = h3_bf16_bits_to_f32(row_input[column]);
+        local_sum = fmaf(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float inverse =
+        rsqrtf(reductions[0] / (float)args.width + args.epsilon);
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float normalized = h3_bf16_bits_to_f32(row_input[column]) * inverse;
+        output[(size_t)row * args.width + column] = h3_f32_to_bf16_bits(
+            normalized * h3_bf16_bits_to_f32(weight[column]));
+    }
+}
+
+int h3_gpu_silu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *input, uint32_t elements) {
+    if (!gpu || !output || !input || output->dtype != H3_GPU_BF16 ||
+        input->dtype != H3_GPU_BF16 || output->elements < elements ||
+        input->elements < elements)
+        return h3_gpu_fail(gpu, "invalid SiLU request");
+    unsigned threads = 256;
+    unsigned blocks =
+        (unsigned)(((size_t)elements + threads - 1) / threads);
+    h3_silu_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)input->device, (uint16_t *)output->device, elements);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_silu_bf16");
+}
+
+int h3_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *input,
+                         const h3_gpu_tensor *weight, uint32_t rows,
+                         uint32_t width, float epsilon) {
+    size_t count = (size_t)rows * width;
+    if (!gpu || !output || !input || !weight ||
+        output->dtype != H3_GPU_BF16 || input->dtype != H3_GPU_BF16 ||
+        weight->dtype != H3_GPU_BF16 || output->elements < count ||
+        input->elements < count || weight->elements < width || !rows || !width)
+        return h3_gpu_fail(gpu, "invalid RMSNorm request");
+    h3_rms_norm_args args = {rows, width, epsilon};
+    unsigned threads = 256;
+    h3_rms_norm_bf16_kernel<<<rows, threads, threads * sizeof(float),
+                              gpu->stream>>>(
+        (const uint16_t *)input->device, (const uint16_t *)weight->device,
+        (uint16_t *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_rms_norm_bf16");
+}
+
 int h3_gpu_begin(h3_gpu *gpu) {
     if (!gpu) return 0;
     gpu->error[0] = '\0';

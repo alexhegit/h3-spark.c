@@ -1,6 +1,5 @@
 #include "h3_gpu.h"
 #include "h3_gpu_cuda_internal.h"
-#include <stdio.h>
 
 static int h3_gpu_stub_impl(h3_gpu *gpu, const char *name) {
     h3_gpu_cuda_set_error(gpu, name);
@@ -341,18 +340,6 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_gpu_stub_impl(gpu, "h3_gpu_mlp_int8_bf16");
 }
 
-int h3_gpu_silu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                     const h3_gpu_tensor *input, uint32_t elements) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_silu_bf16");
-}
-
-int h3_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                         const h3_gpu_tensor *input,
-                         const h3_gpu_tensor *weight, uint32_t rows,
-                         uint32_t width, float epsilon) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_rms_norm_bf16");
-}
-
 int h3_gpu_layer_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *input,
                            const h3_gpu_tensor *weight,
@@ -676,3 +663,4 @@ int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *up, uint32_t elements) {
     return h3_gpu_stub_impl(gpu, "h3_gpu_silu_mul_bf16");
 }
+

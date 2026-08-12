@@ -39,9 +39,13 @@ h3_cuda_smoke: tests/test_cuda_smoke.o $(LIB_OBJ)
 h3_cuda_probe: tools/h3_cuda_probe.o h3_cuda.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-test: h3_tests h3_cuda_smoke
+h3_cuda_ops: tests/test_cuda_ops.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+test: h3_tests h3_cuda_smoke h3_cuda_ops
 	./h3_tests
 	./h3_cuda_smoke
+	./h3_cuda_ops
 
 smoke: h3_cuda_smoke
 	./h3_cuda_smoke
@@ -69,5 +73,5 @@ linenoise.o: CFLAGS += -Wno-conversion
 -include $(wildcard *.d tests/*.d tools/*.d)
 
 clean:
-	rm -f h3 h3_tests h3_cuda_smoke h3_cuda_probe libh3_cuda.a \
+	rm -f h3 h3_tests h3_cuda_smoke h3_cuda_ops h3_cuda_probe libh3_cuda.a \
 		*.o *.d tests/*.o tests/*.d tools/*.o tools/*.d
