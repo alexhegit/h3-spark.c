@@ -1,52 +1,64 @@
 # Spark autoloop progress log
 
-Automated Phase 0 scaffold for **h3-cuda** on DGX Spark.
+Automated **h3-cuda** port on DGX Spark (`spark` branch).
 
 ## Gate commands
 
 ```bash
-make -f Makefile.linux test          # h3_tests + h3_cuda_smoke
-make -f Makefile.linux probe          # CUDA device probe
-make -f Makefile.linux h3             # full CLI binary
-./h3 --info -d ./MiniMax-H3           # model inventory (weights required)
+make -f Makefile.linux test          # h3_tests + cuda smoke/ops + tokenizer smoke (if JSON present)
+make -f Makefile.linux probe         # CUDA device probe (GB10 sm_121)
+make -f Makefile.linux h3            # full CLI binary
+H3_TOKENIZER_JSON=path/to/tokenizer.json make -f Makefile.linux test
+make -f Makefile.linux tokenizer_test  # full vocab parity (needs MiniMax-H3 tokenizer)
 ```
 
-## Completed (Phase 0)
+## Phase 0 (complete)
 
-- [x] `Makefile.linux` — gcc + nvcc, `-lcudart -lstdc++ -licuuc`
-- [x] `h3_cuda.c` / `h3_device.c` — CUDA device probe → `h3_device_info`
-- [x] `h3_gpu.cu` — context, streams, tensor alloc, copy/cast/add BF16, weight pread
-- [x] `h3_gpu_stubs.c` — 66 unimplemented `h3_gpu_*` APIs (link-safe)
-- [x] `h3_tokenizer.c` — stub (encode/decode pending Phase 1)
-- [x] Linux host fixes: `h3_host.c` bilinear resize, `h3.c` stat time, `h3_ffmpeg.c`
-- [x] `h3_cli.c` `xdg-open`, `main.c` CUDA `--info` labels
-- [x] `tests/test_cuda_smoke.c` — GPU tensor roundtrip
-- [x] `./h3_tests` — 1768 host checks pass on Spark
+- [x] `Makefile.linux`, `h3_cuda.c`, `h3_device.c`, `h3_gpu.cu` scaffold
+- [x] Tensor alloc, copy/cast/add BF16, weight pread
+- [x] `h3_gpu_stubs.c` + `scripts/gen_gpu_stubs.py`
+- [x] Linux host portability fixes
+- [x] `tests/test_cuda_smoke.c`, `./h3_tests` 1768 checks
 
-## Not yet done (next session)
+## Phase 1 progress (2026-08-12 autoloop)
 
-- [ ] `h3_tokenizer.c` full BPE port (ICU + JSON)
-- [ ] BF16 linear / RMSNorm / AdaLN kernels
-- [ ] `test_real_dit_block` parity
-- [ ] `./h3_generate` end-to-end
+### CUDA BF16 ops implemented
 
-## New files
+| API | Status |
+|-----|--------|
+| `h3_gpu_silu_bf16` | done |
+| `h3_gpu_rms_norm_bf16` | done |
+| `h3_gpu_linear_bf16` | done (cuBLAS `GemmEx`) |
+| `h3_gpu_adaln_bf16` / `_offset` | done |
+| `h3_gpu_gate_bf16` | done |
+| `h3_gpu_swiglu_bf16` | done |
+| `h3_gpu_mlp_bf16` | done (linear→swiglu→linear) |
 
-| File | Role |
-|------|------|
-| `Makefile.linux` | Linux/CUDA build |
-| `h3_cuda.c`, `h3_cuda.h` | GB10 probe |
-| `h3_device.c`, `h3_device.h` | Platform dispatch |
-| `h3_gpu.cu` | CUDA backend (implemented subset) |
-| `h3_gpu_stubs.c` | Generated API stubs |
-| `h3_gpu_cuda_internal.h` | Stub error helper |
-| `h3_tokenizer.c` | Tokenizer stub |
-| `tools/h3_cuda_probe.c` | Standalone probe binary |
-| `tests/test_cuda_smoke.c` | GPU smoke test |
+- [x] `tests/test_cuda_ops.c` — numerical checks vs CPU oracle
+- [x] Stubs reduced: **58** remaining (from 66)
 
-## Modified (portable / Linux)
+### Tokenizer
 
-- `h3.c`, `h3_host.c`, `h3_ffmpeg.c`, `h3_cli.c`, `main.c`, `tests/test_h3.c`
+- [x] Full `h3_tokenizer.c` BPE port (cJSON + ICU NFC)
+- [x] `third_party/cJSON.c` vendored
+- [x] `tests/test_tokenizer_smoke.c` — roundtrip when JSON available
+- [ ] Full `tests/test_tokenizer.c` parity — needs `MiniMax-H3/tokenizer/tokenizer.json`
+
+## Not yet done
+
+- [ ] SDPA, QKV+RoPE, embedding, remaining ~58 GPU stubs
+- [ ] `test_real_dit_block` parity (needs weights + fixtures)
+- [ ] `./h3_generate` end-to-end on Spark
+
+## Commits (Phase 1 autoloop)
+
+```
+05f8991 SwiGLU + decomposed MLP
+0b98314 AdaLN + gate
+0985ea4 linear_bf16 cuBLAS
+d009804 SiLU + RMSNorm
+36d5f0b Phase 0 scaffold
+```
 
 ---
 

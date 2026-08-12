@@ -5,7 +5,7 @@ CC := gcc
 NVCC := /usr/local/cuda/bin/nvcc
 CUDA_LIB := /usr/local/cuda/lib64
 
-CFLAGS := -std=c11 -O2 -Wall -Wextra -Wpedantic -MMD -MP -I. -D_GNU_SOURCE \
+CFLAGS := -std=c11 -O2 -Wall -Wextra -Wpedantic -MMD -MP -I. -Ithird_party -D_GNU_SOURCE \
 	-I/usr/local/cuda/include
 NVCCFLAGS := -std=c++17 -O2 -Xcompiler -fPIC -I.
 LDFLAGS := -L$(CUDA_LIB) -Wl,-rpath,$(CUDA_LIB) -lcudart -lcublas -lstdc++ -licuuc -lm -pthread
@@ -13,14 +13,14 @@ LDFLAGS := -L$(CUDA_LIB) -Wl,-rpath,$(CUDA_LIB) -lcudart -lcublas -lstdc++ -licu
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 	h3_dit_schedule.c h3_dit.c h3_video_vae.c h3_video_encoder.c \
 	h3_audio_vae.c h3_ffmpeg.c h3_terminal.c h3_vision_encoder.c \
-	h3_multimodal.c h3_device.c h3_cuda.c h3_tokenizer.c
+	h3_multimodal.c h3_device.c h3_cuda.c h3_tokenizer.c third_party/cJSON.c
 
 LIB_CUDA := h3_gpu.cu h3_gpu_stubs.c
 
 LIB_OBJ := $(LIB_C:.c=.o) h3_gpu.o h3_gpu_stubs.o
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
-.PHONY: all test smoke probe clean
+.PHONY: all test smoke probe clean tokenizer_test tokenizer_smoke
 
 all: h3
 
@@ -42,10 +42,24 @@ h3_cuda_probe: tools/h3_cuda_probe.o h3_cuda.o
 h3_cuda_ops: tests/test_cuda_ops.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+# Requires MiniMax-H3/tokenizer/tokenizer.json (or pass path as argv[1]).
+tokenizer_test: tests/test_tokenizer.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+tokenizer_smoke: tests/test_tokenizer_smoke.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 test: h3_tests h3_cuda_smoke h3_cuda_ops
 	./h3_tests
 	./h3_cuda_smoke
 	./h3_cuda_ops
+	@if test -f MiniMax-H3/tokenizer/tokenizer.json || test -n "$$H3_TOKENIZER_JSON"; then \
+		$(MAKE) -f Makefile.linux tokenizer_smoke; \
+		path=$${H3_TOKENIZER_JSON:-MiniMax-H3/tokenizer/tokenizer.json}; \
+		./tokenizer_smoke $$path; \
+	else \
+		echo "skip: tokenizer JSON not available"; \
+	fi
 
 smoke: h3_cuda_smoke
 	./h3_cuda_smoke
@@ -74,4 +88,5 @@ linenoise.o: CFLAGS += -Wno-conversion
 
 clean:
 	rm -f h3 h3_tests h3_cuda_smoke h3_cuda_ops h3_cuda_probe libh3_cuda.a \
-		*.o *.d tests/*.o tests/*.d tools/*.o tools/*.d
+		tokenizer_test tokenizer_smoke \
+		*.o *.d tests/*.o tests/*.d tools/*.o tools/*.d third_party/*.o third_party/*.d
