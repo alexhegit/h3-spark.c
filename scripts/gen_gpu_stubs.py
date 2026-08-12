@@ -27,6 +27,7 @@ IMPLEMENTED = {
     "h3_gpu_linear_bf16",
     "h3_gpu_adaln_bf16", "h3_gpu_adaln_bf16_offset", "h3_gpu_gate_bf16",
     "h3_gpu_swiglu_bf16", "h3_gpu_mlp_bf16",
+    "h3_gpu_gelu_bf16", "h3_gpu_embedding_bf16",
     "h3_gpu_cuda_set_error",
 }
 

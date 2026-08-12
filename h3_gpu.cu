@@ -925,6 +925,108 @@ int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     return ok;
 }
 
+static inline __device__ __host__ float h3_erf_approx(float value) {
+    float sign = value < 0.0f ? -1.0f : 1.0f;
+    float x = fabsf(value);
+    float t = 1.0f / (1.0f + 0.3275911f * x);
+    float polynomial = (((((1.061405429f * t - 1.453152027f) * t) +
+                          1.421413741f) *
+                             t -
+                         0.284496736f) *
+                            t +
+                        0.254829592f) *
+                       t;
+    return sign * (1.0f - polynomial * expf(-x * x));
+}
+
+struct h3_gelu_bf16_args {
+    uint32_t elements;
+    uint32_t approximate;
+};
+
+__global__ static void h3_gelu_bf16_kernel(const uint16_t *input,
+                                           uint16_t *output,
+                                           h3_gelu_bf16_args args) {
+    uint32_t index = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= args.elements) return;
+    float value = h3_bf16_bits_to_f32(input[index]);
+    float activated;
+    if (args.approximate) {
+        float inner = 0.7978845608028654f *
+                      (value + 0.044715f * value * value * value);
+        activated = inner <= -10.0f ? 0.0f
+                                    : inner >= 10.0f
+                                          ? value
+                                          : 0.5f * value * (1.0f + tanhf(inner));
+    } else {
+        activated = value <= -10.0f ? 0.0f
+                                    : value >= 10.0f
+                                          ? value
+                                          : 0.5f * value *
+                                                (1.0f + h3_erf_approx(value *
+                                                                      0.7071067811865475f));
+    }
+    output[index] = h3_f32_to_bf16_bits(activated);
+}
+
+int h3_gpu_gelu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *input, uint32_t elements,
+                     int approximate) {
+    if (!gpu || !output || !input || output->dtype != H3_GPU_BF16 ||
+        input->dtype != H3_GPU_BF16 || output->elements < elements ||
+        input->elements < elements)
+        return h3_gpu_fail(gpu, "invalid GELU request");
+    h3_gelu_bf16_args args = {elements, approximate ? 1u : 0u};
+    unsigned threads = 256;
+    unsigned blocks =
+        (unsigned)(((size_t)elements + threads - 1) / threads);
+    h3_gelu_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)input->device, (uint16_t *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_gelu_bf16");
+}
+
+struct h3_embedding_args {
+    uint32_t tokens;
+    uint32_t vocab_size;
+    uint32_t width;
+};
+
+__global__ static void h3_embedding_bf16_kernel(
+    const uint16_t *weight, const uint32_t *token_ids, uint16_t *output,
+    h3_embedding_args args) {
+    uint32_t column = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t token = (uint32_t)blockIdx.y;
+    if (token >= args.tokens || column >= args.width) return;
+    uint32_t identifier = token_ids[token];
+    output[(size_t)token * args.width + column] =
+        identifier < args.vocab_size
+            ? weight[(size_t)identifier * args.width + column]
+            : (uint16_t)0;
+}
+
+int h3_gpu_embedding_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *weight,
+                          const h3_gpu_tensor *token_ids, uint32_t tokens,
+                          uint32_t vocab_size, uint32_t width) {
+    size_t output_count = (size_t)tokens * width;
+    if (!gpu || !output || !weight || !token_ids ||
+        output->dtype != H3_GPU_BF16 || weight->dtype != H3_GPU_BF16 ||
+        token_ids->dtype != H3_GPU_U32 ||
+        output->elements < output_count ||
+        weight->elements < (size_t)vocab_size * width ||
+        token_ids->elements < tokens || !tokens || !vocab_size || !width)
+        return h3_gpu_fail(gpu, "invalid embedding request");
+    h3_embedding_args args = {tokens, vocab_size, width};
+    dim3 threads(256, 1, 1);
+    dim3 blocks((width + threads.x - 1) / threads.x, tokens, 1);
+    h3_embedding_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)weight->device, (const uint32_t *)token_ids->device,
+        (uint16_t *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_embedding_bf16");
+}
+
 int h3_gpu_begin(h3_gpu *gpu) {
     if (!gpu) return 0;
     gpu->error[0] = '\0';

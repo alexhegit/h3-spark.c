@@ -105,6 +105,19 @@ static void swiglu_ref(const float *fused, float *output, uint32_t rows,
     }
 }
 
+static float gelu_ref(float value, int approximate) {
+    if (approximate) {
+        float inner = 0.7978845608028654f *
+                      (value + 0.044715f * value * value * value);
+        if (inner <= -10.0f) return 0.0f;
+        if (inner >= 10.0f) return value;
+        return 0.5f * value * (1.0f + tanhf(inner));
+    }
+    if (value <= -10.0f) return 0.0f;
+    if (value >= 10.0f) return value;
+    return 0.5f * value * (1.0f + erff(value * 0.7071067811865475f));
+}
+
 static void rms_norm_ref(const float *input, const float *weight, float *output,
                          uint32_t rows, uint32_t width, float epsilon) {
     for (uint32_t row = 0; row < rows; row++) {
@@ -513,6 +526,87 @@ int main(void) {
         }
     }
 
+    const uint32_t gelu_count = 256;
+    float gelu_host[256];
+    uint16_t gelu_in_bf16[256];
+    uint16_t gelu_out_bf16[256];
+    for (uint32_t i = 0; i < gelu_count; i++) {
+        gelu_host[i] = -4.0f + (float)i * (8.0f / (float)(gelu_count - 1));
+        gelu_in_bf16[i] = f32_to_bf16(gelu_host[i]);
+    }
+    h3_gpu_tensor *gelu_in =
+        h3_gpu_tensor_from_bf16(gpu, gelu_in_bf16, gelu_count);
+    h3_gpu_tensor *gelu_out = h3_gpu_tensor_new_bf16(gpu, gelu_count);
+    check(gelu_in && gelu_out, "gelu tensor alloc");
+    if (gelu_in && gelu_out) {
+        check(h3_gpu_gelu_bf16(gpu, gelu_out, gelu_in, gelu_count, 1), "gelu");
+        check(h3_gpu_submit(gpu), "submit gelu");
+        check(h3_gpu_tensor_read_bf16(gelu_out, gelu_out_bf16, gelu_count),
+              "read gelu");
+        for (uint32_t i = 0; i < gelu_count; i++) {
+            float got = bf16_to_f32(gelu_out_bf16[i]);
+            float expected = gelu_ref(gelu_host[i], 1);
+            if (fabsf(got - expected) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: gelu mismatch at %u got=%f expected=%f\n", i,
+                        got, expected);
+                failures++;
+                break;
+            }
+        }
+    }
+
+    const uint32_t embed_tokens = 5;
+    const uint32_t embed_vocab = 8;
+    const uint32_t embed_width = 16;
+    const size_t embed_weight_count = (size_t)embed_vocab * embed_width;
+    const size_t embed_output_count = (size_t)embed_tokens * embed_width;
+    uint32_t token_ids_host[] = {0, 3, 7, 99, 2};
+    float embed_weight_host[embed_weight_count];
+    uint16_t embed_weight_bf16[embed_weight_count];
+    uint16_t embed_out_bf16[embed_output_count];
+    for (size_t i = 0; i < embed_weight_count; i++) {
+        embed_weight_host[i] = (float)(i + 1) * 0.01f;
+        embed_weight_bf16[i] = f32_to_bf16(embed_weight_host[i]);
+    }
+    h3_gpu_tensor *embed_weight =
+        h3_gpu_tensor_from_bf16(gpu, embed_weight_bf16, embed_weight_count);
+    h3_gpu_tensor *embed_ids =
+        h3_gpu_tensor_from_u32(gpu, token_ids_host, embed_tokens);
+    h3_gpu_tensor *embed_out =
+        h3_gpu_tensor_new_bf16(gpu, embed_output_count);
+    check(embed_weight && embed_ids && embed_out, "embedding tensor alloc");
+    if (embed_weight && embed_ids && embed_out) {
+        check(h3_gpu_embedding_bf16(gpu, embed_out, embed_weight, embed_ids,
+                                    embed_tokens, embed_vocab, embed_width),
+              "embedding");
+        check(h3_gpu_submit(gpu), "submit embedding");
+        check(h3_gpu_tensor_read_bf16(embed_out, embed_out_bf16,
+                                      embed_output_count),
+              "read embedding");
+        for (uint32_t token = 0; token < embed_tokens; token++) {
+            uint32_t identifier = token_ids_host[token];
+            for (uint32_t column = 0; column < embed_width; column++) {
+                size_t index = (size_t)token * embed_width + column;
+                float expected = identifier < embed_vocab
+                                     ? embed_weight_host[(size_t)identifier *
+                                                               embed_width +
+                                                           column]
+                                     : 0.0f;
+                float got = bf16_to_f32(embed_out_bf16[index]);
+                if (fabsf(got - expected) >= 1e-2f) {
+                    fprintf(stderr,
+                            "FAIL: embedding mismatch token=%u col=%u got=%f "
+                            "expected=%f\n",
+                            token, column, got, expected);
+                    failures++;
+                    token = embed_tokens;
+                    break;
+                }
+            }
+        }
+    }
+
     h3_gpu_tensor_free(silu_in);
     h3_gpu_tensor_free(silu_out);
     h3_gpu_tensor_free(norm_in);
@@ -537,6 +631,11 @@ int main(void) {
     h3_gpu_tensor_free(mlp_fc1);
     h3_gpu_tensor_free(mlp_fc2);
     h3_gpu_tensor_free(mlp_output);
+    h3_gpu_tensor_free(gelu_in);
+    h3_gpu_tensor_free(gelu_out);
+    h3_gpu_tensor_free(embed_weight);
+    h3_gpu_tensor_free(embed_ids);
+    h3_gpu_tensor_free(embed_out);
     h3_gpu_free(gpu);
 
     if (failures) {

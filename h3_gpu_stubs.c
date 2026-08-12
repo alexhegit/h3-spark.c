@@ -331,12 +331,6 @@ int h3_gpu_layer_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_gpu_stub_impl(gpu, "h3_gpu_layer_norm_bf16");
 }
 
-int h3_gpu_gelu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                     const h3_gpu_tensor *input, uint32_t elements,
-                     int approximate) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_gelu_bf16");
-}
-
 int h3_gpu_vision_qkv_rope_bf16(
                      h3_gpu *gpu, h3_gpu_tensor *query,
                      h3_gpu_tensor *key, h3_gpu_tensor *value,
@@ -474,13 +468,6 @@ int h3_gpu_sdpa_bf16_head_major_output(
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale) {
     return h3_gpu_stub_impl(gpu, "h3_gpu_sdpa_bf16_head_major_output");
-}
-
-int h3_gpu_embedding_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                          const h3_gpu_tensor *weight,
-                          const h3_gpu_tensor *token_ids, uint32_t tokens,
-                          uint32_t vocab_size, uint32_t width) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_embedding_bf16");
 }
 
 int h3_gpu_text_qk_rope_bf16(h3_gpu *gpu,
