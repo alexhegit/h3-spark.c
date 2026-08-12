@@ -357,26 +357,6 @@ int h3_gpu_vision_qkv_rope_bf16(
     return h3_gpu_stub_impl(gpu, "h3_gpu_vision_qkv_rope_bf16");
 }
 
-int h3_gpu_adaln_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                      const h3_gpu_tensor *input,
-                      const h3_gpu_tensor *norm_weight,
-                      const h3_gpu_tensor *modulation,
-                      const h3_gpu_tensor *row_map, uint32_t rows,
-                      uint32_t width, uint32_t slots, uint32_t shift_slot,
-                      uint32_t scale_slot, float epsilon) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_adaln_bf16");
-}
-
-int h3_gpu_adaln_bf16_offset(h3_gpu *gpu, h3_gpu_tensor *output,
-                      const h3_gpu_tensor *input, size_t input_offset,
-                      const h3_gpu_tensor *norm_weight,
-                      const h3_gpu_tensor *modulation,
-                      const h3_gpu_tensor *row_map, uint32_t rows,
-                      uint32_t width, uint32_t slots, uint32_t shift_slot,
-                      uint32_t scale_slot, float epsilon) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_adaln_bf16_offset");
-}
-
 int h3_gpu_adaln_linear_bf16(
                       h3_gpu *gpu, h3_gpu_tensor *output,
                       h3_gpu_tensor *inverse,
@@ -390,15 +370,6 @@ int h3_gpu_adaln_linear_bf16(
                       uint32_t shift_slot, uint32_t scale_slot,
                       float epsilon) {
     return h3_gpu_stub_impl(gpu, "h3_gpu_adaln_linear_bf16");
-}
-
-int h3_gpu_gate_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                     const h3_gpu_tensor *residual,
-                     const h3_gpu_tensor *branch,
-                     const h3_gpu_tensor *modulation,
-                     const h3_gpu_tensor *row_map, uint32_t rows,
-                     uint32_t width, uint32_t slots, uint32_t gate_slot) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_gate_bf16");
 }
 
 int h3_gpu_gate_adaln_bf16(

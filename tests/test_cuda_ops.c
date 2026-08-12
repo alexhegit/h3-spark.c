@@ -51,6 +51,47 @@ static void linear_ref(const float *input, const float *weight,
     }
 }
 
+static void adaln_ref(const float *input, const float *weight,
+                      const float *modulation, const uint32_t *row_map,
+                      float *output, uint32_t rows, uint32_t width,
+                      uint32_t slots, uint32_t shift_slot, uint32_t scale_slot,
+                      float epsilon) {
+    for (uint32_t row = 0; row < rows; row++) {
+        const float *row_input = input + (size_t)row * width;
+        float *row_output = output + (size_t)row * width;
+        float sum = 0.0f;
+        for (uint32_t column = 0; column < width; column++) {
+            float value = row_input[column];
+            sum = fmaf(value, value, sum);
+        }
+        float inverse = 1.0f / sqrtf(sum / (float)width + epsilon);
+        size_t base = (size_t)row_map[row] * slots * width;
+        for (uint32_t column = 0; column < width; column++) {
+            float normalized =
+                row_input[column] * inverse * weight[column];
+            float shift =
+                modulation[base + shift_slot * width + column];
+            float scale =
+                modulation[base + scale_slot * width + column];
+            row_output[column] = normalized * (1.0f + scale) + shift;
+        }
+    }
+}
+
+static void gate_ref(const float *residual, const float *branch,
+                     const float *modulation, const uint32_t *row_map,
+                     float *output, uint32_t rows, uint32_t width,
+                     uint32_t slots, uint32_t gate_slot) {
+    for (uint32_t row = 0; row < rows; row++) {
+        size_t base = (size_t)row_map[row] * slots * width;
+        for (uint32_t column = 0; column < width; column++) {
+            size_t index = (size_t)row * width + column;
+            float gate = modulation[base + gate_slot * width + column];
+            output[index] = residual[index] + branch[index] * gate;
+        }
+    }
+}
+
 static void rms_norm_ref(const float *input, const float *weight, float *output,
                          uint32_t rows, uint32_t width, float epsilon) {
     for (uint32_t row = 0; row < rows; row++) {
@@ -247,6 +288,113 @@ int main(void) {
         }
     }
 
+    const uint32_t adaln_rows = 4;
+    const uint32_t adaln_width = 64;
+    const uint32_t adaln_slots = 6;
+    const uint32_t adaln_shift = 0;
+    const uint32_t adaln_scale = 1;
+    const uint32_t adaln_gate = 2;
+    const size_t adaln_count = (size_t)adaln_rows * adaln_width;
+    const size_t adaln_mod_count = (size_t)adaln_slots * adaln_width;
+    float adaln_input_host[adaln_count];
+    float adaln_residual_host[adaln_count];
+    float adaln_branch_host[adaln_count];
+    float adaln_norm_host[adaln_width];
+    float adaln_mod_host[adaln_mod_count];
+    uint16_t adaln_input_bf16[adaln_count];
+    uint16_t adaln_residual_bf16[adaln_count];
+    uint16_t adaln_branch_bf16[adaln_count];
+    uint16_t adaln_norm_bf16[adaln_width];
+    uint16_t adaln_mod_bf16[adaln_mod_count];
+    uint16_t adaln_out_bf16[adaln_count];
+    uint16_t gate_out_bf16[adaln_count];
+    uint32_t row_map_host[adaln_rows];
+    float adaln_ref_out[adaln_count];
+    float gate_ref_out[adaln_count];
+
+    for (uint32_t row = 0; row < adaln_rows; row++) row_map_host[row] = 0;
+    for (uint32_t column = 0; column < adaln_width; column++) {
+        adaln_norm_host[column] = 0.75f + 0.01f * (float)column;
+        adaln_norm_bf16[column] = f32_to_bf16(adaln_norm_host[column]);
+    }
+    for (size_t slot = 0; slot < adaln_slots; slot++) {
+        for (uint32_t column = 0; column < adaln_width; column++) {
+            size_t index = slot * adaln_width + column;
+            adaln_mod_host[index] = sinf((float)index * 0.03f) * 0.1f;
+            adaln_mod_bf16[index] = f32_to_bf16(adaln_mod_host[index]);
+        }
+    }
+    for (size_t i = 0; i < adaln_count; i++) {
+        adaln_input_host[i] = cosf((float)i * 0.09f);
+        adaln_residual_host[i] = adaln_input_host[i];
+        adaln_branch_host[i] = sinf((float)i * 0.07f) * 0.5f;
+        adaln_input_bf16[i] = f32_to_bf16(adaln_input_host[i]);
+        adaln_residual_bf16[i] = f32_to_bf16(adaln_residual_host[i]);
+        adaln_branch_bf16[i] = f32_to_bf16(adaln_branch_host[i]);
+    }
+    adaln_ref(adaln_input_host, adaln_norm_host, adaln_mod_host, row_map_host,
+              adaln_ref_out, adaln_rows, adaln_width, adaln_slots, adaln_shift,
+              adaln_scale, 1e-5f);
+    gate_ref(adaln_residual_host, adaln_branch_host, adaln_mod_host,
+             row_map_host, gate_ref_out, adaln_rows, adaln_width, adaln_slots,
+             adaln_gate);
+
+    h3_gpu_tensor *adaln_in =
+        h3_gpu_tensor_from_bf16(gpu, adaln_input_bf16, adaln_count);
+    h3_gpu_tensor *adaln_norm =
+        h3_gpu_tensor_from_bf16(gpu, adaln_norm_bf16, adaln_width);
+    h3_gpu_tensor *adaln_mod =
+        h3_gpu_tensor_from_bf16(gpu, adaln_mod_bf16, adaln_mod_count);
+    h3_gpu_tensor *adaln_row_map =
+        h3_gpu_tensor_from_u32(gpu, row_map_host, adaln_rows);
+    h3_gpu_tensor *adaln_out = h3_gpu_tensor_new_bf16(gpu, adaln_count);
+    h3_gpu_tensor *gate_residual =
+        h3_gpu_tensor_from_bf16(gpu, adaln_residual_bf16, adaln_count);
+    h3_gpu_tensor *gate_branch =
+        h3_gpu_tensor_from_bf16(gpu, adaln_branch_bf16, adaln_count);
+    h3_gpu_tensor *gate_out = h3_gpu_tensor_new_bf16(gpu, adaln_count);
+    check(adaln_in && adaln_norm && adaln_mod && adaln_row_map && adaln_out &&
+              gate_residual && gate_branch && gate_out,
+          "adaln/gate tensor alloc");
+    if (adaln_in && adaln_norm && adaln_mod && adaln_row_map && adaln_out &&
+        gate_residual && gate_branch && gate_out) {
+        check(h3_gpu_adaln_bf16(gpu, adaln_out, adaln_in, adaln_norm, adaln_mod,
+                                adaln_row_map, adaln_rows, adaln_width,
+                                adaln_slots, adaln_shift, adaln_scale, 1e-5f),
+              "adaln");
+        check(h3_gpu_submit(gpu), "submit adaln");
+        check(h3_gpu_tensor_read_bf16(adaln_out, adaln_out_bf16, adaln_count),
+              "read adaln");
+        for (size_t i = 0; i < adaln_count; i++) {
+            float got = bf16_to_f32(adaln_out_bf16[i]);
+            if (fabsf(got - adaln_ref_out[i]) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: adaln mismatch at %zu got=%f expected=%f\n", i,
+                        got, adaln_ref_out[i]);
+                failures++;
+                break;
+            }
+        }
+
+        check(h3_gpu_gate_bf16(gpu, gate_out, gate_residual, gate_branch,
+                               adaln_mod, adaln_row_map, adaln_rows,
+                               adaln_width, adaln_slots, adaln_gate),
+              "gate");
+        check(h3_gpu_submit(gpu), "submit gate");
+        check(h3_gpu_tensor_read_bf16(gate_out, gate_out_bf16, adaln_count),
+              "read gate");
+        for (size_t i = 0; i < adaln_count; i++) {
+            float got = bf16_to_f32(gate_out_bf16[i]);
+            if (fabsf(got - gate_ref_out[i]) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: gate mismatch at %zu got=%f expected=%f\n", i,
+                        got, gate_ref_out[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
     h3_gpu_tensor_free(silu_in);
     h3_gpu_tensor_free(silu_out);
     h3_gpu_tensor_free(norm_in);
@@ -257,6 +405,14 @@ int main(void) {
     h3_gpu_tensor_free(linear_bias);
     h3_gpu_tensor_free(linear_out);
     h3_gpu_tensor_free(linear_out_bias);
+    h3_gpu_tensor_free(adaln_in);
+    h3_gpu_tensor_free(adaln_norm);
+    h3_gpu_tensor_free(adaln_mod);
+    h3_gpu_tensor_free(adaln_row_map);
+    h3_gpu_tensor_free(adaln_out);
+    h3_gpu_tensor_free(gate_residual);
+    h3_gpu_tensor_free(gate_branch);
+    h3_gpu_tensor_free(gate_out);
     h3_gpu_free(gpu);
 
     if (failures) {
