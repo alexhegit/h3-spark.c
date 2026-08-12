@@ -262,15 +262,6 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
     return h3_gpu_stub_impl(gpu, "h3_gpu_vae_encoder_group_norm_silu_f32");
 }
 
-int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                    const h3_gpu_tensor *input,
-                    const h3_gpu_tensor *fc1_weight,
-                    const h3_gpu_tensor *fc2_weight, uint32_t rows,
-                    uint32_t input_dim, uint32_t hidden_dim,
-                    uint32_t output_dim) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_mlp_bf16");
-}
-
 int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                         h3_gpu_tensor *activated,
                         const h3_gpu_tensor *input,
@@ -483,12 +474,6 @@ int h3_gpu_sdpa_bf16_head_major_output(
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale) {
     return h3_gpu_stub_impl(gpu, "h3_gpu_sdpa_bf16_head_major_output");
-}
-
-int h3_gpu_swiglu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                       const h3_gpu_tensor *fused, uint32_t rows,
-                       uint32_t width) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_swiglu_bf16");
 }
 
 int h3_gpu_embedding_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

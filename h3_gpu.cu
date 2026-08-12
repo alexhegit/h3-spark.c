@@ -853,6 +853,78 @@ int h3_gpu_gate_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_gate_bf16");
 }
 
+struct h3_swiglu_args {
+    uint32_t rows;
+    uint32_t width;
+};
+
+__global__ static void h3_swiglu_bf16_kernel(const uint16_t *fused,
+                                             uint16_t *output,
+                                             h3_swiglu_args args) {
+    uint32_t column = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t row = (uint32_t)blockIdx.y;
+    if (row >= args.rows || column >= args.width) return;
+    size_t base = ((size_t)row * args.width + column);
+    size_t fused_base = (size_t)row * args.width * 2u;
+    float gate = h3_bf16_bits_to_f32(fused[fused_base + column]);
+    float up = h3_bf16_bits_to_f32(fused[fused_base + args.width + column]);
+    output[base] = h3_f32_to_bf16_bits(gate / (1.0f + expf(-gate)) * up);
+}
+
+int h3_gpu_swiglu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *fused, uint32_t rows,
+                       uint32_t width) {
+    size_t fused_count = (size_t)rows * width * 2u;
+    size_t output_count = (size_t)rows * width;
+    if (!gpu || !output || !fused || output->dtype != H3_GPU_BF16 ||
+        fused->dtype != H3_GPU_BF16 || output->elements < output_count ||
+        fused->elements < fused_count || !rows || !width)
+        return h3_gpu_fail(gpu, "invalid SwiGLU request");
+    h3_swiglu_args args = {rows, width};
+    dim3 threads(256, 1, 1);
+    dim3 blocks((width + threads.x - 1) / threads.x, rows, 1);
+    h3_swiglu_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)fused->device, (uint16_t *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_swiglu_bf16");
+}
+
+int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *input,
+                    const h3_gpu_tensor *fc1_weight,
+                    const h3_gpu_tensor *fc2_weight, uint32_t rows,
+                    uint32_t input_dim, uint32_t hidden_dim,
+                    uint32_t output_dim) {
+    size_t fc1_count = (size_t)rows * hidden_dim * 2u;
+    size_t hidden_count = (size_t)rows * hidden_dim;
+    if (!gpu || !output || !input || !fc1_weight || !fc2_weight ||
+        output->dtype != H3_GPU_BF16 || input->dtype != H3_GPU_BF16 ||
+        fc1_weight->dtype != H3_GPU_BF16 || fc2_weight->dtype != H3_GPU_BF16 ||
+        output->elements < (size_t)rows * output_dim ||
+        input->elements < (size_t)rows * input_dim ||
+        fc1_weight->elements < (size_t)hidden_dim * 2u * input_dim ||
+        fc2_weight->elements < (size_t)output_dim * hidden_dim || !rows ||
+        !input_dim || !hidden_dim || !output_dim)
+        return h3_gpu_fail(gpu, "invalid MLP request");
+
+    h3_gpu_tensor *fc1 = h3_gpu_tensor_new_bf16(gpu, fc1_count);
+    h3_gpu_tensor *hidden = h3_gpu_tensor_new_bf16(gpu, hidden_count);
+    if (!fc1 || !hidden) {
+        h3_gpu_tensor_free(fc1);
+        h3_gpu_tensor_free(hidden);
+        return h3_gpu_fail(gpu, "MLP temp tensor allocation failed");
+    }
+
+    int ok = h3_gpu_linear_bf16(gpu, fc1, input, fc1_weight, NULL, rows,
+                                input_dim, hidden_dim * 2u) &&
+             h3_gpu_swiglu_bf16(gpu, hidden, fc1, rows, hidden_dim) &&
+             h3_gpu_linear_bf16(gpu, output, hidden, fc2_weight, NULL, rows,
+                                hidden_dim, output_dim);
+    h3_gpu_tensor_free(fc1);
+    h3_gpu_tensor_free(hidden);
+    return ok;
+}
+
 int h3_gpu_begin(h3_gpu *gpu) {
     if (!gpu) return 0;
     gpu->error[0] = '\0';

@@ -92,6 +92,19 @@ static void gate_ref(const float *residual, const float *branch,
     }
 }
 
+static void swiglu_ref(const float *fused, float *output, uint32_t rows,
+                       uint32_t width) {
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t column = 0; column < width; column++) {
+            size_t base = (size_t)row * width * 2u;
+            float gate = fused[base + column];
+            float up = fused[base + width + column];
+            output[(size_t)row * width + column] =
+                gate / (1.0f + expf(-gate)) * up;
+        }
+    }
+}
+
 static void rms_norm_ref(const float *input, const float *weight, float *output,
                          uint32_t rows, uint32_t width, float epsilon) {
     for (uint32_t row = 0; row < rows; row++) {
@@ -395,6 +408,111 @@ int main(void) {
         }
     }
 
+    const uint32_t swiglu_rows = 3;
+    const uint32_t swiglu_width = 32;
+    const size_t swiglu_fused_count = (size_t)swiglu_rows * swiglu_width * 2u;
+    const size_t swiglu_out_count = (size_t)swiglu_rows * swiglu_width;
+    float swiglu_fused_host[swiglu_fused_count];
+    uint16_t swiglu_fused_bf16[swiglu_fused_count];
+    uint16_t swiglu_out_bf16[swiglu_out_count];
+    float swiglu_ref_out[swiglu_out_count];
+    for (size_t i = 0; i < swiglu_fused_count; i++) {
+        swiglu_fused_host[i] = sinf((float)i * 0.13f);
+        swiglu_fused_bf16[i] = f32_to_bf16(swiglu_fused_host[i]);
+    }
+    swiglu_ref(swiglu_fused_host, swiglu_ref_out, swiglu_rows, swiglu_width);
+
+    h3_gpu_tensor *swiglu_fused =
+        h3_gpu_tensor_from_bf16(gpu, swiglu_fused_bf16, swiglu_fused_count);
+    h3_gpu_tensor *swiglu_out =
+        h3_gpu_tensor_new_bf16(gpu, swiglu_out_count);
+    check(swiglu_fused && swiglu_out, "swiglu tensor alloc");
+    if (swiglu_fused && swiglu_out) {
+        check(h3_gpu_swiglu_bf16(gpu, swiglu_out, swiglu_fused, swiglu_rows,
+                                 swiglu_width),
+              "swiglu");
+        check(h3_gpu_submit(gpu), "submit swiglu");
+        check(h3_gpu_tensor_read_bf16(swiglu_out, swiglu_out_bf16,
+                                      swiglu_out_count),
+              "read swiglu");
+        for (size_t i = 0; i < swiglu_out_count; i++) {
+            float got = bf16_to_f32(swiglu_out_bf16[i]);
+            if (fabsf(got - swiglu_ref_out[i]) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: swiglu mismatch at %zu got=%f expected=%f\n", i,
+                        got, swiglu_ref_out[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
+    const uint32_t mlp_rows = 2;
+    const uint32_t mlp_input_dim = 16;
+    const uint32_t mlp_hidden = 8;
+    const uint32_t mlp_out = 12;
+    const size_t mlp_input_count = (size_t)mlp_rows * mlp_input_dim;
+    const size_t mlp_fc1_count = (size_t)mlp_hidden * 2u * mlp_input_dim;
+    const size_t mlp_fc2_count = (size_t)mlp_out * mlp_hidden;
+    const size_t mlp_output_count = (size_t)mlp_rows * mlp_out;
+    float mlp_input_host[mlp_input_count];
+    float mlp_fc1_host[mlp_fc1_count];
+    float mlp_fc2_host[mlp_fc2_count];
+    uint16_t mlp_input_bf16[mlp_input_count];
+    uint16_t mlp_fc1_bf16[mlp_fc1_count];
+    uint16_t mlp_fc2_bf16[mlp_fc2_count];
+    uint16_t mlp_out_bf16[mlp_output_count];
+    float mlp_ref_out[mlp_output_count];
+    float mlp_fc1_fused[(size_t)mlp_rows * mlp_hidden * 2u];
+    float mlp_swiglu[(size_t)mlp_rows * mlp_hidden];
+
+    for (size_t i = 0; i < mlp_input_count; i++) {
+        mlp_input_host[i] = cosf((float)i * 0.2f);
+        mlp_input_bf16[i] = f32_to_bf16(mlp_input_host[i]);
+    }
+    for (size_t i = 0; i < mlp_fc1_count; i++) {
+        mlp_fc1_host[i] = sinf((float)i * 0.11f) * 0.2f;
+        mlp_fc1_bf16[i] = f32_to_bf16(mlp_fc1_host[i]);
+    }
+    for (size_t i = 0; i < mlp_fc2_count; i++) {
+        mlp_fc2_host[i] = cosf((float)i * 0.07f) * 0.3f;
+        mlp_fc2_bf16[i] = f32_to_bf16(mlp_fc2_host[i]);
+    }
+    linear_ref(mlp_input_host, mlp_fc1_host, NULL, mlp_fc1_fused, mlp_rows,
+               mlp_input_dim, mlp_hidden * 2u);
+    swiglu_ref(mlp_fc1_fused, mlp_swiglu, mlp_rows, mlp_hidden);
+    linear_ref(mlp_swiglu, mlp_fc2_host, NULL, mlp_ref_out, mlp_rows,
+               mlp_hidden, mlp_out);
+
+    h3_gpu_tensor *mlp_in =
+        h3_gpu_tensor_from_bf16(gpu, mlp_input_bf16, mlp_input_count);
+    h3_gpu_tensor *mlp_fc1 =
+        h3_gpu_tensor_from_bf16(gpu, mlp_fc1_bf16, mlp_fc1_count);
+    h3_gpu_tensor *mlp_fc2 =
+        h3_gpu_tensor_from_bf16(gpu, mlp_fc2_bf16, mlp_fc2_count);
+    h3_gpu_tensor *mlp_output =
+        h3_gpu_tensor_new_bf16(gpu, mlp_output_count);
+    check(mlp_in && mlp_fc1 && mlp_fc2 && mlp_output, "mlp tensor alloc");
+    if (mlp_in && mlp_fc1 && mlp_fc2 && mlp_output) {
+        check(h3_gpu_mlp_bf16(gpu, mlp_output, mlp_in, mlp_fc1, mlp_fc2,
+                              mlp_rows, mlp_input_dim, mlp_hidden, mlp_out),
+              "mlp");
+        check(h3_gpu_submit(gpu), "submit mlp");
+        check(h3_gpu_tensor_read_bf16(mlp_output, mlp_out_bf16,
+                                      mlp_output_count),
+              "read mlp");
+        for (size_t i = 0; i < mlp_output_count; i++) {
+            float got = bf16_to_f32(mlp_out_bf16[i]);
+            if (fabsf(got - mlp_ref_out[i]) >= 8e-2f) {
+                fprintf(stderr,
+                        "FAIL: mlp mismatch at %zu got=%f expected=%f\n", i,
+                        got, mlp_ref_out[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
     h3_gpu_tensor_free(silu_in);
     h3_gpu_tensor_free(silu_out);
     h3_gpu_tensor_free(norm_in);
@@ -413,6 +531,12 @@ int main(void) {
     h3_gpu_tensor_free(gate_residual);
     h3_gpu_tensor_free(gate_branch);
     h3_gpu_tensor_free(gate_out);
+    h3_gpu_tensor_free(swiglu_fused);
+    h3_gpu_tensor_free(swiglu_out);
+    h3_gpu_tensor_free(mlp_in);
+    h3_gpu_tensor_free(mlp_fc1);
+    h3_gpu_tensor_free(mlp_fc2);
+    h3_gpu_tensor_free(mlp_output);
     h3_gpu_free(gpu);
 
     if (failures) {
