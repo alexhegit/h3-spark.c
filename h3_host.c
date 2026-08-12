@@ -1,6 +1,8 @@
 #include "h3_host.h"
 
+#ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
+#endif
 
 #include <float.h>
 #include <limits.h>
@@ -527,6 +529,48 @@ void h3_rng_fill_normal(h3_rng *rng, float *values, size_t count) {
     }
 }
 
+#ifndef __APPLE__
+static float h3_sample_channel(const uint8_t *frame, int width, int height,
+                               int channel, float x, float y) {
+    if (x < 0.0f) x = 0.0f;
+    if (y < 0.0f) y = 0.0f;
+    if (x > (float)(width - 1)) x = (float)(width - 1);
+    if (y > (float)(height - 1)) y = (float)(height - 1);
+    int x0 = (int)x;
+    int y0 = (int)y;
+    int x1 = x0 < width - 1 ? x0 + 1 : x0;
+    int y1 = y0 < height - 1 ? y0 + 1 : y0;
+    float tx = x - (float)x0;
+    float ty = y - (float)y0;
+    float p00 = frame[((size_t)y0 * (size_t)width + (size_t)x0) * 3 + (size_t)channel];
+    float p10 = frame[((size_t)y0 * (size_t)width + (size_t)x1) * 3 + (size_t)channel];
+    float p01 = frame[((size_t)y1 * (size_t)width + (size_t)x0) * 3 + (size_t)channel];
+    float p11 = frame[((size_t)y1 * (size_t)width + (size_t)x1) * 3 + (size_t)channel];
+    float top = p00 + tx * (p10 - p00);
+    float bottom = p01 + tx * (p11 - p01);
+    return top + ty * (bottom - top);
+}
+
+static void h3_resize_rgb24_bilinear(const uint8_t *input, int input_width,
+                                     int input_height, uint8_t *output,
+                                     int output_width, int output_height) {
+    for (int y = 0; y < output_height; y++) {
+        float src_y = ((float)y + 0.5f) * (float)input_height /
+                      (float)output_height - 0.5f;
+        for (int x = 0; x < output_width; x++) {
+            float src_x = ((float)x + 0.5f) * (float)input_width /
+                          (float)output_width - 0.5f;
+            size_t dst = (size_t)(y * output_width + x) * 3;
+            for (int channel = 0; channel < 3; channel++) {
+                output[dst + (size_t)channel] = (uint8_t)(
+                    h3_sample_channel(input, input_width, input_height, channel,
+                                      src_x, src_y) + 0.5f);
+            }
+        }
+    }
+}
+#endif
+
 int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
                                  int input_width, int input_height,
                                  int output_width, int output_height,
@@ -551,6 +595,19 @@ int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
         *output = pixels;
         return 1;
     }
+#ifndef __APPLE__
+    size_t input_frame_bytes = input_area * 3;
+    size_t output_frame_bytes = output_area * 3;
+    for (int frame = 0; frame < frames; frame++) {
+        h3_resize_rgb24_bilinear(
+            input + (size_t)frame * input_frame_bytes,
+            input_width, input_height,
+            pixels + (size_t)frame * output_frame_bytes,
+            output_width, output_height);
+    }
+    *output = pixels;
+    return 1;
+#else
     if (input_area > SIZE_MAX / 4 || output_area > SIZE_MAX / 4) {
         free(pixels);
         return 0;
@@ -596,6 +653,7 @@ int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
     free(source_argb); free(output_argb);
     *output = pixels;
     return 1;
+#endif
 }
 
 static double h3_phi1(double value) {

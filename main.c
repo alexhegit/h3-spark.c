@@ -130,9 +130,15 @@ static void print_info(const h3_ctx *ctx) {
     printf("Device: %s (%s)\n", device->name, device->architecture);
     printf("  physical memory       %.1f GiB\n", gib(device->physical_memory));
     printf("  recommended GPU set   %.1f GiB\n", gib(device->recommended_working_set));
+#ifdef __APPLE__
     printf("  max Metal buffer      %.1f GiB\n", gib(device->max_buffer_length));
     printf("  Apple GPU family      %d\n", device->apple_gpu_family);
     printf("  Metal 4               %s\n", device->metal4 ? "yes" : "no");
+#else
+    printf("  max CUDA allocation   %.1f GiB\n", gib(device->max_buffer_length));
+    printf("  compute capability    sm_%d\n", device->apple_gpu_family);
+    printf("  tensor fast path      %s\n", device->metal4 ? "yes" : "no");
+#endif
     printf("  unified memory        %s\n", device->unified_memory ? "yes" : "no");
     printf("Native checkpoint inventory (header-only):\n");
     print_component("Qwen3-VL encoder", &model->text_encoder);

@@ -1,0 +1,73 @@
+# Linux / CUDA build for DGX Spark (h3-cuda Phase 0).
+# Usage: make -f Makefile.linux [target]
+
+CC := gcc
+NVCC := /usr/local/cuda/bin/nvcc
+CUDA_LIB := /usr/local/cuda/lib64
+
+CFLAGS := -std=c11 -O2 -Wall -Wextra -Wpedantic -MMD -MP -I. -D_GNU_SOURCE \
+	-I/usr/local/cuda/include
+NVCCFLAGS := -std=c++17 -O2 -Xcompiler -fPIC -I.
+LDFLAGS := -L$(CUDA_LIB) -Wl,-rpath,$(CUDA_LIB) -lcudart -lstdc++ -licuuc -lm -pthread
+
+LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
+	h3_dit_schedule.c h3_dit.c h3_video_vae.c h3_video_encoder.c \
+	h3_audio_vae.c h3_ffmpeg.c h3_terminal.c h3_vision_encoder.c \
+	h3_multimodal.c h3_device.c h3_cuda.c h3_tokenizer.c
+
+LIB_CUDA := h3_gpu.cu h3_gpu_stubs.c
+
+LIB_OBJ := $(LIB_C:.c=.o) h3_gpu.o h3_gpu_stubs.o
+CLI_OBJ := main.o h3_cli.o linenoise.o
+
+.PHONY: all test smoke probe clean
+
+all: h3
+
+h3: $(CLI_OBJ) $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+libh3_cuda.a: $(LIB_OBJ)
+	ar rcs $@ $^
+
+h3_tests: tests/test_h3.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+h3_cuda_smoke: tests/test_cuda_smoke.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+h3_cuda_probe: tools/h3_cuda_probe.o h3_cuda.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+test: h3_tests h3_cuda_smoke
+	./h3_tests
+	./h3_cuda_smoke
+
+smoke: h3_cuda_smoke
+	./h3_cuda_smoke
+
+probe: h3_cuda_probe
+	./h3_cuda_probe
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+h3_gpu.o: h3_gpu.cu
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+h3_gpu_stubs.o: h3_gpu_stubs.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+tests/%.o: tests/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+tools/%.o: tools/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+linenoise.o: CFLAGS += -Wno-conversion
+
+-include $(wildcard *.d tests/*.d tools/*.d)
+
+clean:
+	rm -f h3 h3_tests h3_cuda_smoke h3_cuda_probe libh3_cuda.a \
+		*.o *.d tests/*.o tests/*.d tools/*.o tools/*.d
