@@ -4,6 +4,7 @@ extern "C" {
 }
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -25,6 +26,7 @@ struct h3_gpu_tensor {
 
 struct h3_gpu {
     cudaStream_t stream;
+    cublasHandle_t cublas;
     int device;
     int fast_path;
     int tensor_fast_path;
@@ -86,6 +88,12 @@ static size_t h3_dtype_bytes(h3_gpu_dtype dtype) {
 static int h3_cuda_check(h3_gpu *gpu, cudaError_t status, const char *where) {
     if (status == cudaSuccess) return 1;
     return h3_gpu_fail(gpu, "%s: %s", where, cudaGetErrorString(status));
+}
+
+static int h3_cublas_check(h3_gpu *gpu, cublasStatus_t status,
+                           const char *where) {
+    if (status == CUBLAS_STATUS_SUCCESS) return 1;
+    return h3_gpu_fail(gpu, "%s: cuBLAS error %d", where, (int)status);
 }
 
 static h3_gpu_tensor *h3_tensor_alloc(h3_gpu *gpu, size_t elements,
@@ -150,6 +158,13 @@ h3_gpu *h3_gpu_create(const char *shader_source_path, char *error,
         free(gpu);
         return NULL;
     }
+    if (cublasCreate(&gpu->cublas) != CUBLAS_STATUS_SUCCESS) {
+        if (error && error_size) snprintf(error, error_size, "cublasCreate failed");
+        cudaStreamDestroy(gpu->stream);
+        free(gpu);
+        return NULL;
+    }
+    cublasSetStream(gpu->cublas, gpu->stream);
     cudaDeviceProp props;
     if (cudaGetDeviceProperties(&props, 0) == cudaSuccess) {
         gpu->fast_path = props.major >= 12 ? 1 : 0;
@@ -161,6 +176,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path, char *error,
 
 void h3_gpu_free(h3_gpu *gpu) {
     if (!gpu) return;
+    if (gpu->cublas) cublasDestroy(gpu->cublas);
     if (gpu->stream) cudaStreamDestroy(gpu->stream);
     free(gpu);
 }
@@ -624,6 +640,62 @@ int h3_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         (uint16_t *)output->device, args);
     gpu->stats.direct_dispatches++;
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_rms_norm_bf16");
+}
+
+__global__ static void h3_linear_add_bias_bf16_kernel(uint16_t *output,
+                                                      const uint16_t *bias,
+                                                      uint32_t rows,
+                                                      uint32_t output_dim) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t count = (size_t)rows * output_dim;
+    if (index >= count) return;
+    uint32_t column = (uint32_t)(index % output_dim);
+    float sum = h3_bf16_bits_to_f32(output[index]) +
+                h3_bf16_bits_to_f32(bias[column]);
+    output[index] = h3_f32_to_bf16_bits(sum);
+}
+
+int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *weight,
+                       const h3_gpu_tensor *bias, uint32_t rows,
+                       uint32_t input_dim, uint32_t output_dim) {
+    size_t input_count = (size_t)rows * input_dim;
+    size_t weight_count = (size_t)output_dim * input_dim;
+    size_t output_count = (size_t)rows * output_dim;
+    if (!gpu || !output || !input || !weight ||
+        output->dtype != H3_GPU_BF16 || input->dtype != H3_GPU_BF16 ||
+        weight->dtype != H3_GPU_BF16 ||
+        (bias && bias->dtype != H3_GPU_BF16) ||
+        output->elements < output_count || input->elements < input_count ||
+        weight->elements < weight_count ||
+        (bias && bias->elements < output_dim) || !rows || !input_dim ||
+        !output_dim)
+        return h3_gpu_fail(gpu, "invalid linear request");
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cublasStatus_t status = cublasGemmEx(
+        gpu->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)output_dim, (int)rows,
+        (int)input_dim, &alpha, weight->device, CUDA_R_16BF, (int)input_dim,
+        input->device, CUDA_R_16BF, (int)input_dim, &beta, output->device,
+        CUDA_R_16BF, (int)output_dim, CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT);
+    if (!h3_cublas_check(gpu, status, "cublasGemmEx linear")) return 0;
+    gpu->stats.direct_dispatches++;
+
+    if (bias) {
+        unsigned threads = 256;
+        unsigned blocks =
+            (unsigned)((output_count + threads - 1) / threads);
+        h3_linear_add_bias_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+            (uint16_t *)output->device, (const uint16_t *)bias->device, rows,
+            output_dim);
+        gpu->stats.direct_dispatches++;
+        return h3_cuda_check(gpu, cudaGetLastError(),
+                             "h3_linear_add_bias_bf16");
+    }
+    return 1;
 }
 
 int h3_gpu_begin(h3_gpu *gpu) {

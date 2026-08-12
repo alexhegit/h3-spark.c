@@ -262,14 +262,6 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
     return h3_gpu_stub_impl(gpu, "h3_gpu_vae_encoder_group_norm_silu_f32");
 }
 
-int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                       const h3_gpu_tensor *input,
-                       const h3_gpu_tensor *weight,
-                       const h3_gpu_tensor *bias, uint32_t rows,
-                       uint32_t input_dim, uint32_t output_dim) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_linear_bf16");
-}
-
 int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *input,
                     const h3_gpu_tensor *fc1_weight,

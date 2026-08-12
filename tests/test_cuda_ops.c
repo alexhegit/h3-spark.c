@@ -36,6 +36,21 @@ static float silu_ref(float value) {
     return value / (1.0f + expf(-value));
 }
 
+static void linear_ref(const float *input, const float *weight,
+                       const float *bias, float *output, uint32_t rows,
+                       uint32_t input_dim, uint32_t output_dim) {
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t column = 0; column < output_dim; column++) {
+            float sum = bias ? bias[column] : 0.0f;
+            for (uint32_t k = 0; k < input_dim; k++) {
+                sum = fmaf(input[(size_t)row * input_dim + k],
+                           weight[(size_t)column * input_dim + k], sum);
+            }
+            output[(size_t)row * output_dim + column] = sum;
+        }
+    }
+}
+
 static void rms_norm_ref(const float *input, const float *weight, float *output,
                          uint32_t rows, uint32_t width, float epsilon) {
     for (uint32_t row = 0; row < rows; row++) {
@@ -144,11 +159,104 @@ int main(void) {
         }
     }
 
+    const uint32_t linear_rows = 8;
+    const uint32_t linear_input_dim = 64;
+    const uint32_t linear_output_dim = 32;
+    const size_t linear_input_count = (size_t)linear_rows * linear_input_dim;
+    const size_t linear_weight_count = (size_t)linear_output_dim * linear_input_dim;
+    const size_t linear_output_count = (size_t)linear_rows * linear_output_dim;
+    float linear_input_host[linear_input_count];
+    float linear_weight_host[linear_weight_count];
+    float linear_bias_host[linear_output_dim];
+    uint16_t linear_input_bf16[linear_input_count];
+    uint16_t linear_weight_bf16[linear_weight_count];
+    uint16_t linear_bias_bf16[linear_output_dim];
+    uint16_t linear_out_bf16[linear_output_count];
+    float linear_ref_out[linear_output_count];
+    float linear_ref_bias_out[linear_output_count];
+
+    for (size_t i = 0; i < linear_input_count; i++) {
+        linear_input_host[i] = sinf((float)i * 0.11f);
+        linear_input_bf16[i] = f32_to_bf16(linear_input_host[i]);
+    }
+    for (size_t i = 0; i < linear_weight_count; i++) {
+        linear_weight_host[i] = cosf((float)i * 0.05f) * 0.25f;
+        linear_weight_bf16[i] = f32_to_bf16(linear_weight_host[i]);
+    }
+    for (uint32_t i = 0; i < linear_output_dim; i++) {
+        linear_bias_host[i] = 0.01f * (float)i;
+        linear_bias_bf16[i] = f32_to_bf16(linear_bias_host[i]);
+    }
+    linear_ref(linear_input_host, linear_weight_host, NULL, linear_ref_out,
+               linear_rows, linear_input_dim, linear_output_dim);
+    linear_ref(linear_input_host, linear_weight_host, linear_bias_host,
+               linear_ref_bias_out, linear_rows, linear_input_dim,
+               linear_output_dim);
+
+    h3_gpu_tensor *linear_in =
+        h3_gpu_tensor_from_bf16(gpu, linear_input_bf16, linear_input_count);
+    h3_gpu_tensor *linear_weight =
+        h3_gpu_tensor_from_bf16(gpu, linear_weight_bf16, linear_weight_count);
+    h3_gpu_tensor *linear_bias =
+        h3_gpu_tensor_from_bf16(gpu, linear_bias_bf16, linear_output_dim);
+    h3_gpu_tensor *linear_out =
+        h3_gpu_tensor_new_bf16(gpu, linear_output_count);
+    h3_gpu_tensor *linear_out_bias =
+        h3_gpu_tensor_new_bf16(gpu, linear_output_count);
+    check(linear_in && linear_weight && linear_bias && linear_out &&
+              linear_out_bias,
+          "linear tensor alloc");
+    if (linear_in && linear_weight && linear_bias && linear_out &&
+        linear_out_bias) {
+        check(h3_gpu_linear_bf16(gpu, linear_out, linear_in, linear_weight,
+                                 NULL, linear_rows, linear_input_dim,
+                                 linear_output_dim),
+              "linear");
+        check(h3_gpu_submit(gpu), "submit linear");
+        check(h3_gpu_tensor_read_bf16(linear_out, linear_out_bf16,
+                                      linear_output_count),
+              "read linear");
+        for (size_t i = 0; i < linear_output_count; i++) {
+            float got = bf16_to_f32(linear_out_bf16[i]);
+            if (fabsf(got - linear_ref_out[i]) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: linear mismatch at %zu got=%f expected=%f\n", i,
+                        got, linear_ref_out[i]);
+                failures++;
+                break;
+            }
+        }
+
+        check(h3_gpu_linear_bf16(gpu, linear_out_bias, linear_in, linear_weight,
+                                 linear_bias, linear_rows, linear_input_dim,
+                                 linear_output_dim),
+              "linear with bias");
+        check(h3_gpu_submit(gpu), "submit linear bias");
+        check(h3_gpu_tensor_read_bf16(linear_out_bias, linear_out_bf16,
+                                      linear_output_count),
+              "read linear bias");
+        for (size_t i = 0; i < linear_output_count; i++) {
+            float got = bf16_to_f32(linear_out_bf16[i]);
+            if (fabsf(got - linear_ref_bias_out[i]) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: linear bias mismatch at %zu got=%f expected=%f\n",
+                        i, got, linear_ref_bias_out[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
     h3_gpu_tensor_free(silu_in);
     h3_gpu_tensor_free(silu_out);
     h3_gpu_tensor_free(norm_in);
     h3_gpu_tensor_free(norm_weight);
     h3_gpu_tensor_free(norm_out);
+    h3_gpu_tensor_free(linear_in);
+    h3_gpu_tensor_free(linear_weight);
+    h3_gpu_tensor_free(linear_bias);
+    h3_gpu_tensor_free(linear_out);
+    h3_gpu_tensor_free(linear_out_bias);
     h3_gpu_free(gpu);
 
     if (failures) {

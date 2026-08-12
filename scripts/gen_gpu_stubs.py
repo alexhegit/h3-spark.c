@@ -24,6 +24,7 @@ IMPLEMENTED = {
     "h3_gpu_cast_f32_to_bf16", "h3_gpu_cast_bf16_to_f32",
     "h3_gpu_copy_bf16", "h3_gpu_copy_f32", "h3_gpu_add_bf16",
     "h3_gpu_silu_bf16", "h3_gpu_rms_norm_bf16",
+    "h3_gpu_linear_bf16",
     "h3_gpu_cuda_set_error",
 }
 
