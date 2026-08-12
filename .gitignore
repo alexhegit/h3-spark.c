@@ -26,5 +26,8 @@ h3_real_dit_test
 h3_semantic_dit_test
 h3_real_video_vae_test
 h3_semantic_vae_test
+h3_cuda_smoke
+h3_cuda_probe
+libh3_cuda.a
 libh3.a
 .DS_Store
