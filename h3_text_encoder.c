@@ -792,6 +792,20 @@ int h3_text_encode_bf16(const char *weight_directory,
         output, error, error_size);
 }
 
+int h3_text_encode_layers_bf16(
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const uint32_t *token_ids, size_t token_count,
+                        int layer_count,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size) {
+    return text_encode_bf16_impl(
+        weight_directory, shader_source_path, token_ids, token_count,
+        NULL, 0, NULL, NULL, layer_count, progress, progress_opaque,
+        output, error, error_size);
+}
+
 int h3_text_encode_multimodal_bf16(
                         const char *weight_directory,
                         const char *shader_source_path,

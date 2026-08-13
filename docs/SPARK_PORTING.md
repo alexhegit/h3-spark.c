@@ -103,11 +103,26 @@ DGX Spark (Grace Blackwell GB10 Superchip):
 ### Spark-specific constraints
 
 - **Memory bandwidth (273 GB/s)** is likely tighter than M5 Max unified memory;
-  int8 quantization and `--ssd-streaming` may matter more, not less.
+  **runtime INT8** (same algorithm as Metal) and `--ssd-streaming` may matter
+  more, not less.
 - **140 W TDP** — thermal throttling is a real concern, as on Mac; fused kernels
   that reduce dispatch count and global memory traffic remain important.
 - **Integrated GPU** — not a datacenter H100; peak throughput depends on
   kernel efficiency, not library defaults.
+
+### GB10 compute features (planning assumption)
+
+| Feature | GB10 (sm_12.1) | h3-cuda use |
+|---------|----------------|-------------|
+| BF16 Tensor Core | yes | Phase 1 default path; matches official checkpoint |
+| INT8 MMA / WMMA | yes | **Phase 2** — mirror Metal dynamic-int8 path |
+| FP8 (E4M3/E5M2) | yes | **Optional spike only** after INT8 parity; not a substitute |
+| INT4 | hardware/ecosystem exists | **Out of scope** — Metal does not use INT4 |
+
+`h3_gpu_has_int8_mlp()` already returns true on sm ≥ 12; all int8 APIs are still
+stubs until Phase 2. Do **not** load Comfy/community `int8_convrot`, `fp8_scaled`,
+or `nvfp4_awq` weights — h3 quantizes from the **official BF16 checkpoint at load
+time**, same as Metal.
 
 ## What does not port directly
 
@@ -192,6 +207,8 @@ certain wide shapes; CUDA tests should assert the equivalent fallback fired.
 | **TileLang** | Requires Python + TVM + PyTorch; changes the product shape even though it supports Linux AArch64 and SM120. Useful only as an offline SM120 GEMM spike, not as the shipping backend. |
 | **TensorRT / cuDNN** | Large, version-coupled runtime; conflicts with “minimal dependencies”. |
 | **Mechanical Metal → CUDA translation** | MSL and MPSGraph have no portable equivalent; fusion layouts must be re-designed. |
+| **Comfy / community quantized weights** | `int8_convrot`, `fp8_scaled`, `nvfp4_awq` use different layouts; h3 loads official BF16 and quantizes at runtime like Metal. |
+| **INT4 / MVFP8 as Phase 1 shortcut** | Metal production path is dynamic INT8; FP8/INT4 need separate parity tracks. |
 
 ## Recommended architecture: h3-cuda
 
@@ -300,17 +317,42 @@ via the generalized fast-path probe.
 Performance comes from **custom fusion** plus selective fallbacks. The Metal
 side has **83 kernels** and **five MPSGraph cache families**; CUDA must cover both.
 
-### P0 — DiT hot path (first useful inference)
+**Revised sequencing:** BF16 numerical parity first, then INT8 performance path
+aligned with Metal. FP8/INT4 are not shortcuts for Phase 1.
+
+### P0 — DiT BF16 parity (first milestone)
 
 | Work item | Notes |
 |-----------|-------|
-| BF16 linear / MLP | Tiled GEMM; cuBLASLt as oracle only |
-| int8 QKV + MLP + attention output | WMMA / Blackwell MMA (sm_120); gates mirror `h3_gpu_has_int8_mlp()` |
-| SDPA / GQA | Custom flash-attention-style kernel (DiT + Qwen shapes) |
-| SwiGLU | Fused FC1 epilogue |
-| **`test_real_dit_block`** | Recommended **first vertical slice** — real block 0 vs MLX fixture |
+| BF16 linear / MLP / SwiGLU / AdaLN / gate | cuBLASLt as wide-GEMM oracle only |
+| SDPA / GQA / QKV+RoPE | Custom flash-attention-style kernel |
+| Embedding, layer norms, patch projections | Match Metal rounding boundaries |
+| **`test_real_dit_block`** | **Gate:** complete block 0 forward vs MLX fixture |
 
-### P1 — fusion kernels (competitive speed)
+INT8 is **not** part of P0. Ship BF16 block parity before enabling default int8
+gates in `h3_dit.c`.
+
+### P1 — Metal-aligned INT8 (default fast path on GB10)
+
+Same algorithm as `h3_shaders.metal`, not Comfy pre-quantized weights:
+
+| Work item | Metal reference |
+|-----------|-----------------|
+| `h3_gpu_quantize_weight_int8` | Load-time BF16 → INT8 + per-output-channel F32 scale |
+| `h3_gpu_quantize_bf16_int8_*` | Dynamic activation quant (row / group / head-major) |
+| `h3_gpu_linear_int8_bf16`, `h3_gpu_mlp_int8_bf16` | 128×128 tiled int8 GEMM |
+| `h3_gpu_grouped_qkv_linear_rope_int8` | Fused QKV + RMS + RoPE epilogue |
+| `h3_gpu_gate_adaln_quantize_int8` | Fused AdaLN + activation quant |
+| `h3_gpu_linear_int8_head_major_bf16` | SDPA → row-major int8 without BF16 transpose |
+
+Gates: `h3_gpu_has_int8_mlp()` (already true on GB10); retain all `--use-slower-*`
+and `H3_DISABLE_*` oracles for A/B vs BF16 path. Still incompatible with
+`--ssd-streaming` (same as Metal).
+
+**Optional P1b (later):** FP8 GEMM via cuBLASLt on Blackwell — separate benchmark
+track; does not replace INT8 parity work.
+
+### P2 — fusion kernels (competitive speed)
 
 | Kernel family | Metal diagnostic flag |
 |---------------|----------------------|
@@ -325,7 +367,7 @@ Port the **~40 `H3_DISABLE_*` / `H3_NAX*` environment variables** read in
 `h3_dit.c` and `h3_gpu.m` so each fusion has a CUDA oracle for regression and
 `tests/bench_dit.c` A/B remains meaningful.
 
-### P2 — full pipeline modules
+### P3 — full pipeline modules
 
 | Module | Primary GPU ops | Approx GPU calls |
 |--------|-----------------|-----------------:|
@@ -414,28 +456,32 @@ Keep **`make test`** structure; add CUDA parity runners alongside Metal names:
 
 ## Implementation phases
 
-### Phase 0 — Scaffold (≈1 week)
+### Phase 0 — Scaffold ✅
 
-- [ ] `Makefile.linux`, `h3_cuda.c` probe, `h3_tokenizer.c` smoke test
-- [ ] `h3_gpu.cu`: context, streams, tensor alloc/free, BF16 copy/cast
-- [ ] vImage replacement in `h3_host.c`; `test_h3.c` resize passes
-- [ ] `./h3 --info -d ./MiniMax-H3` prints CUDA device
+- [x] `Makefile.linux`, `h3_cuda.c` probe, `h3_device.c`, `h3_tokenizer.c`
+- [x] `h3_gpu.cu`: context, streams, tensor alloc, BF16 copy/cast/add
+- [x] vImage replacement in `h3_host.c`; `test_h3.c` passes
+- [ ] `./h3 --info -d ./MiniMax-H3` (needs official BF16 weights on disk)
 
-### Phase 1 — DiT block parity (≈3–4 weeks)
+**Weights:** download `MiniMaxAI/MiniMax-H3` original checkpoint `FL2VA/*`
+(BF16 safetensors shards). Not Comfy-Org repack, not int8/fp8/nvfp4 variants.
 
-- [ ] Implement P0 ops behind `h3_gpu.h`
-- [ ] `h3_cuda_tests` / adapted `test_bf16.c` vs `misc/fixtures/`
-- [ ] **`test_real_dit_block`** — complete block 0 forward vs MLX golden
+### Phase 1 — DiT BF16 block parity (current)
+
+- [x] Partial P0 BF16 ops (silu, rms_norm, linear, adaln, gate, swiglu, mlp, gelu, embedding)
+- [ ] Remaining P0: SDPA, QKV+RoPE, conv paths, full block forward
+- [ ] **`test_real_dit_block`** — block 0 vs MLX golden
 - [ ] cuBLASLt oracle for wide GEMM shapes covered by MPSGraph on Mac
 
-### Phase 2 — Performance path (≈4–6 weeks)
+### Phase 2 — Metal-aligned INT8 (GB10 default fast path)
 
-- [ ] int8 QKV / MLP / attention-output (default when `metal4`-equivalent set)
-- [ ] P1 fusion kernels + `H3_DISABLE_*` parity
+- [ ] Runtime quant + int8 GEMM stack (see P1 table above)
+- [ ] P2 fusion kernels + `H3_DISABLE_*` parity
 - [ ] Zero-copy / SSD streaming on NVMe
 - [ ] `tests/bench_dit.c` A/B on Spark; `--profile` phase breakdown
+- [ ] Optional: FP8 spike (cuBLASLt), not blocking release
 
-### Phase 3 — Full pipeline (≈3–4 weeks)
+### Phase 3 — Full pipeline
 
 - [ ] Text + vision encoders, audio/video VAE conv paths
 - [ ] `h3_generate()` end-to-end; interactive CLI
