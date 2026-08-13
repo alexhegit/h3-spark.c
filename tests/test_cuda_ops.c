@@ -1317,6 +1317,104 @@ int main(void) {
         }
     }
 
+    enum {
+        TP_FULL_ROWS = 6,
+        TP_REDUCED_ROWS = 4,
+        TP_BASELINE_ROWS = 2,
+        TP_WIDTH = 4,
+        TP_PADDING = 4
+    };
+    const float tp_input_values[TP_FULL_ROWS * TP_WIDTH] = {
+        1.0f, 2.0f, 3.0f, 4.0f,       10.0f, 12.0f, 14.0f, 16.0f,
+        14.0f, 16.0f, 18.0f, 20.0f,   -8.0f, -4.0f, 0.0f, 4.0f,
+        -4.0f, 0.0f, 4.0f, 8.0f,      20.0f, 21.0f, 22.0f, 23.0f,
+    };
+    const float tp_pooled_values[TP_REDUCED_ROWS * TP_WIDTH] = {
+        1.0f, 2.0f, 3.0f, 4.0f,  12.0f, 14.0f, 16.0f, 18.0f,
+        -6.0f, -2.0f, 2.0f, 6.0f, 20.0f, 21.0f, 22.0f, 23.0f,
+    };
+    const float tp_processed_values[TP_REDUCED_ROWS * TP_WIDTH] = {
+        2.0f, 3.0f, 4.0f, 5.0f,  14.0f, 12.0f, 20.0f, 14.0f,
+        -5.0f, 0.0f, 5.0f, 10.0f, 30.0f, 31.0f, 32.0f, 33.0f,
+    };
+    const float tp_expanded_values[TP_FULL_ROWS * TP_WIDTH] = {
+        2.0f, 3.0f, 4.0f, 5.0f,  12.0f, 10.0f, 18.0f, 12.0f,
+        16.0f, 14.0f, 22.0f, 16.0f, -7.0f, -2.0f, 3.0f, 8.0f,
+        -3.0f, 2.0f, 7.0f, 12.0f, 30.0f, 31.0f, 32.0f, 33.0f,
+    };
+    const uint32_t tp_pairs[TP_REDUCED_ROWS * 2] = {0, 0, 1, 2, 3, 4, 5, 5};
+    const uint32_t tp_baseline_indices[TP_REDUCED_ROWS] = {
+        UINT32_MAX, 0, 1, UINT32_MAX};
+    const uint32_t tp_parents[TP_FULL_ROWS] = {0, 1, 1, 2, 2, 3};
+    uint16_t tp_input_bf16[TP_PADDING + TP_FULL_ROWS * TP_WIDTH];
+    uint16_t tp_processed_bf16[TP_REDUCED_ROWS * TP_WIDTH];
+    uint16_t tp_expected_pooled[TP_REDUCED_ROWS * TP_WIDTH];
+    uint16_t tp_expected_expanded[TP_FULL_ROWS * TP_WIDTH];
+    for (size_t i = 0; i < TP_PADDING; i++)
+        tp_input_bf16[i] = f32_to_bf16(-99.0f);
+    for (size_t i = 0; i < (size_t)TP_FULL_ROWS * TP_WIDTH; i++) {
+        tp_input_bf16[TP_PADDING + i] = f32_to_bf16(tp_input_values[i]);
+        tp_expected_expanded[i] = f32_to_bf16(tp_expanded_values[i]);
+    }
+    for (size_t i = 0; i < (size_t)TP_REDUCED_ROWS * TP_WIDTH; i++) {
+        tp_processed_bf16[i] = f32_to_bf16(tp_processed_values[i]);
+        tp_expected_pooled[i] = f32_to_bf16(tp_pooled_values[i]);
+    }
+    h3_gpu_tensor *tp_input = h3_gpu_tensor_from_bf16(
+        gpu, tp_input_bf16, TP_PADDING + TP_FULL_ROWS * TP_WIDTH);
+    h3_gpu_tensor *tp_pairs_t =
+        h3_gpu_tensor_from_u32(gpu, tp_pairs, TP_REDUCED_ROWS * 2);
+    h3_gpu_tensor *tp_baseline_idx = h3_gpu_tensor_from_u32(
+        gpu, tp_baseline_indices, TP_REDUCED_ROWS);
+    h3_gpu_tensor *tp_pooled = h3_gpu_tensor_new_bf16(
+        gpu, (TP_REDUCED_ROWS + TP_BASELINE_ROWS) * TP_WIDTH);
+    h3_gpu_tensor *tp_original = h3_gpu_tensor_new_bf16(
+        gpu, TP_PADDING + TP_FULL_ROWS * TP_WIDTH);
+    h3_gpu_tensor *tp_processed = h3_gpu_tensor_from_bf16(
+        gpu, tp_processed_bf16, TP_REDUCED_ROWS * TP_WIDTH);
+    h3_gpu_tensor *tp_parents_t =
+        h3_gpu_tensor_from_u32(gpu, tp_parents, TP_FULL_ROWS);
+    h3_gpu_tensor *tp_expanded = h3_gpu_tensor_new_bf16(
+        gpu, TP_FULL_ROWS * TP_WIDTH);
+    check(tp_input && tp_pairs_t && tp_baseline_idx && tp_pooled &&
+              tp_original && tp_processed && tp_parents_t && tp_expanded,
+          "token pool tensor alloc");
+    if (tp_input && tp_pairs_t && tp_baseline_idx && tp_pooled &&
+        tp_original && tp_processed && tp_parents_t && tp_expanded) {
+        check(h3_gpu_token_pool_bf16(
+                  gpu, tp_pooled, tp_input, TP_PADDING, tp_original,
+                  TP_PADDING, tp_pooled, TP_REDUCED_ROWS * TP_WIDTH,
+                  tp_baseline_idx, tp_pairs_t, TP_FULL_ROWS, TP_REDUCED_ROWS,
+                  TP_BASELINE_ROWS, TP_WIDTH),
+              "token_pool");
+        check(h3_gpu_submit(gpu), "submit token_pool");
+        uint16_t tp_got_pooled[TP_REDUCED_ROWS * TP_WIDTH];
+        check(h3_gpu_tensor_read_bf16(tp_pooled, tp_got_pooled,
+                                      TP_REDUCED_ROWS * TP_WIDTH),
+              "read token_pool");
+        if (memcmp(tp_got_pooled, tp_expected_pooled, sizeof(tp_got_pooled)) !=
+            0) {
+            fprintf(stderr, "FAIL: token_pool mismatch\n");
+            failures++;
+        }
+        check(h3_gpu_token_expand_delta_bf16(
+                  gpu, tp_expanded, tp_original, TP_PADDING, tp_processed,
+                  tp_pooled, TP_REDUCED_ROWS * TP_WIDTH, tp_baseline_idx,
+                  tp_parents_t, TP_FULL_ROWS, TP_REDUCED_ROWS,
+                  TP_BASELINE_ROWS, TP_WIDTH, 1, 1.0f),
+              "token_expand_delta");
+        check(h3_gpu_submit(gpu), "submit token_expand_delta");
+        uint16_t tp_got_expanded[TP_FULL_ROWS * TP_WIDTH];
+        check(h3_gpu_tensor_read_bf16(tp_expanded, tp_got_expanded,
+                                      TP_FULL_ROWS * TP_WIDTH),
+              "read token_expand_delta");
+        if (memcmp(tp_got_expanded, tp_expected_expanded,
+                   sizeof(tp_got_expanded)) != 0) {
+            fprintf(stderr, "FAIL: token_expand_delta mismatch\n");
+            failures++;
+        }
+    }
+
     h3_gpu_tensor_free(silu_in);
     h3_gpu_tensor_free(silu_out);
     h3_gpu_tensor_free(norm_in);
@@ -1378,6 +1476,14 @@ int main(void) {
     h3_gpu_tensor_free(silu_mul_gate);
     h3_gpu_tensor_free(silu_mul_up);
     h3_gpu_tensor_free(silu_mul_out);
+    h3_gpu_tensor_free(tp_input);
+    h3_gpu_tensor_free(tp_pairs_t);
+    h3_gpu_tensor_free(tp_baseline_idx);
+    h3_gpu_tensor_free(tp_pooled);
+    h3_gpu_tensor_free(tp_original);
+    h3_gpu_tensor_free(tp_processed);
+    h3_gpu_tensor_free(tp_parents_t);
+    h3_gpu_tensor_free(tp_expanded);
     h3_gpu_free(gpu);
 
     if (failures) {

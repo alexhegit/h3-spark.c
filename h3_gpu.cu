@@ -481,6 +481,38 @@ __global__ static void h3_add_bf16_kernel(const uint16_t *left,
     }
 }
 
+__global__ static void h3_sub_bf16_kernel(const uint16_t *left,
+                                          const uint16_t *right,
+                                          uint16_t *output, size_t count) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) {
+        float difference = h3_bf16_bits_to_f32(left[index]) -
+                           h3_bf16_bits_to_f32(right[index]);
+        output[index] = h3_f32_to_bf16_bits(difference);
+    }
+}
+
+struct h3_euler_args {
+    uint32_t sample_offset;
+    uint32_t elements;
+    float delta;
+    float ratio;
+};
+
+__global__ static void h3_euler_bf16_kernel(float *sample, const uint16_t *last,
+                                          const uint16_t *previous,
+                                          h3_euler_args args) {
+    uint32_t index = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= args.elements) return;
+    float last_value = h3_bf16_bits_to_f32(last[index]);
+    float velocity = fmaf(args.ratio,
+                          last_value - h3_bf16_bits_to_f32(previous[index]),
+                          last_value);
+    uint32_t sample_index = args.sample_offset + index;
+    sample[sample_index] =
+        fmaf(args.delta, velocity, sample[sample_index]);
+}
+
 int h3_gpu_copy_bf16(h3_gpu *gpu, h3_gpu_tensor *destination,
                      size_t destination_offset, const h3_gpu_tensor *source,
                      size_t source_offset, size_t elements) {
@@ -560,6 +592,44 @@ int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         (uint16_t *)output->device, elements);
     gpu->stats.direct_dispatches++;
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_add_bf16");
+}
+
+int h3_gpu_sub_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *left, const h3_gpu_tensor *right,
+                    uint32_t elements) {
+    if (!gpu || !output || !left || !right || output->dtype != H3_GPU_BF16 ||
+        left->dtype != H3_GPU_BF16 || right->dtype != H3_GPU_BF16 ||
+        output->elements < elements || left->elements < elements ||
+        right->elements < elements)
+        return h3_gpu_fail(gpu, "invalid BF16 sub request");
+    unsigned threads = 256;
+    unsigned blocks = (unsigned)(((size_t)elements + threads - 1) / threads);
+    h3_sub_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)left->device, (const uint16_t *)right->device,
+        (uint16_t *)output->device, elements);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_sub_bf16");
+}
+
+int h3_gpu_euler_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
+                      size_t sample_offset, const h3_gpu_tensor *last,
+                      const h3_gpu_tensor *previous, uint32_t elements,
+                      float delta, float ratio) {
+    if (!gpu || !sample || !last || !previous ||
+        sample->dtype != H3_GPU_F32 || last->dtype != H3_GPU_BF16 ||
+        previous->dtype != H3_GPU_BF16 ||
+        sample->elements < sample_offset + elements ||
+        last->elements < elements || previous->elements < elements)
+        return h3_gpu_fail(gpu, "invalid Euler request");
+    h3_euler_args args = {
+        (uint32_t)sample_offset, elements, delta, ratio};
+    unsigned threads = 256;
+    unsigned blocks = (unsigned)(((size_t)elements + threads - 1) / threads);
+    h3_euler_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (float *)sample->device, (const uint16_t *)last->device,
+        (const uint16_t *)previous->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_euler_bf16");
 }
 
 __global__ static void h3_silu_bf16_kernel(const uint16_t *input,
@@ -1577,6 +1647,404 @@ int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         (uint16_t *)output->device, elements);
     gpu->stats.direct_dispatches++;
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_silu_mul_bf16");
+}
+
+struct h3_token_pool_args {
+    uint32_t input_offset;
+    uint32_t original_offset;
+    uint32_t baseline_offset;
+    uint32_t rows;
+    uint32_t width;
+};
+
+__global__ static void h3_token_pool_bf16_kernel(
+    const uint16_t *input, const uint32_t *pairs, uint16_t *output,
+    uint16_t *baseline, const uint32_t *baseline_indices, uint16_t *original,
+    h3_token_pool_args args) {
+    uint32_t column = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t row = (uint32_t)blockIdx.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint32_t first_row = pairs[row * 2u];
+    uint32_t second_row = pairs[row * 2u + 1u];
+    uint16_t first =
+        input[args.input_offset + first_row * args.width + column];
+    original[args.original_offset + first_row * args.width + column] = first;
+    uint16_t pooled = first;
+    if (first_row != second_row) {
+        uint16_t second =
+            input[args.input_offset + second_row * args.width + column];
+        original[args.original_offset + second_row * args.width + column] =
+            second;
+        pooled = h3_f32_to_bf16_bits(
+            (h3_bf16_bits_to_f32(first) + h3_bf16_bits_to_f32(second)) *
+            0.5f);
+    }
+    output[row * args.width + column] = pooled;
+    uint32_t baseline_index = baseline_indices[row];
+    if (baseline_index != 0xffffffffu) {
+        baseline[args.baseline_offset + baseline_index * args.width + column] =
+            pooled;
+    }
+}
+
+int h3_gpu_token_pool_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input, size_t input_offset,
+                           h3_gpu_tensor *original, size_t original_offset,
+                           h3_gpu_tensor *baseline, size_t baseline_offset,
+                           const h3_gpu_tensor *baseline_indices,
+                           const h3_gpu_tensor *pairs, uint32_t input_rows,
+                           uint32_t rows, uint32_t baseline_rows,
+                           uint32_t width) {
+    size_t elements = (size_t)rows * width;
+    size_t input_elements = (size_t)input_rows * width;
+    size_t baseline_elements = (size_t)baseline_rows * width;
+    if (!gpu || !output || !input || !original || !baseline ||
+        !baseline_indices || !pairs || output->dtype != H3_GPU_BF16 ||
+        input->dtype != H3_GPU_BF16 || original->dtype != H3_GPU_BF16 ||
+        baseline->dtype != H3_GPU_BF16 ||
+        baseline_indices->dtype != H3_GPU_U32 ||
+        pairs->dtype != H3_GPU_U32 || !input_rows || !rows ||
+        rows > input_rows || baseline_rows > rows || !width ||
+        output->elements < elements ||
+        input->elements < input_offset + input_elements ||
+        original->elements < original_offset + input_elements ||
+        baseline->elements < baseline_offset + baseline_elements ||
+        baseline_indices->elements < rows || pairs->elements < (size_t)rows * 2)
+        return h3_gpu_fail(gpu, "invalid token pool request");
+    h3_token_pool_args args = {
+        (uint32_t)input_offset, (uint32_t)original_offset,
+        (uint32_t)baseline_offset, rows, width};
+    dim3 threads(256, 1, 1);
+    dim3 blocks((width + threads.x - 1) / threads.x, rows, 1);
+    h3_token_pool_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)input->device, (const uint32_t *)pairs->device,
+        (uint16_t *)output->device, (uint16_t *)baseline->device,
+        (const uint32_t *)baseline_indices->device,
+        (uint16_t *)original->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_token_pool_bf16");
+}
+
+struct h3_token_pool_adaln_args {
+    uint32_t input_offset;
+    uint32_t original_offset;
+    uint32_t baseline_offset;
+    uint32_t rows;
+    uint32_t width;
+    uint32_t slots;
+    uint32_t shift_slot;
+    uint32_t scale_slot;
+    float epsilon;
+};
+
+__global__ static void h3_token_pool_adaln_bf16_kernel(
+    const uint16_t *input, const uint32_t *pairs, uint16_t *residual,
+    uint16_t *baseline, const uint32_t *baseline_indices, uint16_t *original,
+    const uint16_t *weight, const uint16_t *modulation, const uint32_t *row_map,
+    uint16_t *output, h3_token_pool_adaln_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.rows) return;
+    extern __shared__ unsigned char shared_raw[];
+    float *reductions = (float *)shared_raw;
+    uint16_t *pooled_values =
+        (uint16_t *)(shared_raw + threads * sizeof(float));
+    uint32_t first_row = pairs[row * 2u];
+    uint32_t second_row = pairs[row * 2u + 1u];
+    uint32_t baseline_index = baseline_indices[row];
+    float local_sum = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        uint16_t first =
+            input[args.input_offset + first_row * args.width + column];
+        original[args.original_offset + first_row * args.width + column] =
+            first;
+        uint16_t pooled = first;
+        if (first_row != second_row) {
+            uint16_t second =
+                input[args.input_offset + second_row * args.width + column];
+            original[args.original_offset + second_row * args.width + column] =
+                second;
+            pooled = h3_f32_to_bf16_bits(
+                (h3_bf16_bits_to_f32(first) + h3_bf16_bits_to_f32(second)) *
+                0.5f);
+        }
+        uint32_t destination = row * args.width + column;
+        residual[destination] = pooled;
+        pooled_values[column] = pooled;
+        if (baseline_index != 0xffffffffu) {
+            baseline[args.baseline_offset + baseline_index * args.width +
+                     column] = pooled;
+        }
+        float value = h3_bf16_bits_to_f32(pooled);
+        local_sum = fmaf(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float inverse =
+        rsqrtf(reductions[0] / (float)args.width + args.epsilon);
+    size_t base = (size_t)row_map[row] * args.slots * args.width;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float normalized = h3_bf16_bits_to_f32(pooled_values[column]) *
+                           inverse * h3_bf16_bits_to_f32(weight[column]);
+        float shift = h3_bf16_bits_to_f32(
+            modulation[base + args.shift_slot * args.width + column]);
+        float scale = h3_bf16_bits_to_f32(
+            modulation[base + args.scale_slot * args.width + column]);
+        output[row * args.width + column] = h3_f32_to_bf16_bits(
+            normalized * (1.0f + scale) + shift);
+    }
+}
+
+int h3_gpu_token_pool_adaln_bf16(
+    h3_gpu *gpu, h3_gpu_tensor *residual, h3_gpu_tensor *output,
+    const h3_gpu_tensor *input, size_t input_offset, h3_gpu_tensor *original,
+    size_t original_offset, h3_gpu_tensor *baseline, size_t baseline_offset,
+    const h3_gpu_tensor *baseline_indices, const h3_gpu_tensor *pairs,
+    const h3_gpu_tensor *norm_weight, const h3_gpu_tensor *modulation,
+    const h3_gpu_tensor *row_map, uint32_t input_rows, uint32_t rows,
+    uint32_t baseline_rows, uint32_t width, uint32_t slots,
+    uint32_t shift_slot, uint32_t scale_slot, float epsilon) {
+    size_t elements = (size_t)rows * width;
+    size_t input_elements = (size_t)input_rows * width;
+    size_t baseline_elements = (size_t)baseline_rows * width;
+    if (!gpu || !residual || !output || !input || !original || !baseline ||
+        !baseline_indices || !pairs || !norm_weight || !modulation ||
+        !row_map || width > 5376u || !input_rows || !rows || rows > input_rows ||
+        baseline_rows > rows || shift_slot >= slots || scale_slot >= slots ||
+        residual->dtype != H3_GPU_BF16 || output->dtype != H3_GPU_BF16 ||
+        input->dtype != H3_GPU_BF16 || original->dtype != H3_GPU_BF16 ||
+        baseline->dtype != H3_GPU_BF16 ||
+        norm_weight->dtype != H3_GPU_BF16 ||
+        modulation->dtype != H3_GPU_BF16 ||
+        baseline_indices->dtype != H3_GPU_U32 ||
+        pairs->dtype != H3_GPU_U32 || row_map->dtype != H3_GPU_U32 ||
+        residual->elements < elements || output->elements < elements ||
+        input->elements < input_offset + input_elements ||
+        original->elements < original_offset + input_elements ||
+        baseline->elements < baseline_offset + baseline_elements ||
+        norm_weight->elements < width || row_map->elements < rows ||
+        pairs->elements < (size_t)rows * 2 ||
+        baseline_indices->elements < rows)
+        return h3_gpu_fail(gpu, "invalid fused token pool AdaLN request");
+    h3_token_pool_adaln_args args = {
+        (uint32_t)input_offset, (uint32_t)original_offset,
+        (uint32_t)baseline_offset, rows, width, slots,
+        shift_slot, scale_slot, epsilon};
+    unsigned threads = 256;
+    size_t shared_bytes =
+        threads * sizeof(float) + (size_t)width * sizeof(uint16_t);
+    h3_token_pool_adaln_bf16_kernel<<<rows, threads, shared_bytes,
+                                      gpu->stream>>>(
+        (const uint16_t *)input->device, (const uint32_t *)pairs->device,
+        (uint16_t *)residual->device, (uint16_t *)baseline->device,
+        (const uint32_t *)baseline_indices->device,
+        (uint16_t *)original->device, (const uint16_t *)norm_weight->device,
+        (const uint16_t *)modulation->device,
+        (const uint32_t *)row_map->device, (uint16_t *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_token_pool_adaln_bf16");
+}
+
+struct h3_token_expand_args {
+    uint32_t original_offset;
+    uint32_t baseline_offset;
+    uint32_t rows;
+    uint32_t width;
+    uint32_t exact_prefix_rows;
+    float update_scale;
+};
+
+__global__ static void h3_token_expand_delta_bf16_kernel(
+    const uint16_t *original, const uint16_t *reduced,
+    const uint16_t *baseline, const uint32_t *baseline_indices,
+    const uint32_t *parents, uint16_t *output, h3_token_expand_args args) {
+    uint32_t column = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t row = (uint32_t)blockIdx.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint32_t parent = parents[row];
+    uint32_t destination = row * args.width + column;
+    uint32_t reduced_index = parent * args.width + column;
+    if (row < args.exact_prefix_rows) {
+        output[destination] = reduced[reduced_index];
+        return;
+    }
+    uint32_t baseline_row = baseline_indices[parent];
+    if (baseline_row == 0xffffffffu) {
+        output[destination] = reduced[reduced_index];
+        return;
+    }
+    uint32_t baseline_index =
+        args.baseline_offset + baseline_row * args.width + column;
+    float update = h3_bf16_bits_to_f32(reduced[reduced_index]) -
+                   h3_bf16_bits_to_f32(baseline[baseline_index]);
+    output[destination] = h3_f32_to_bf16_bits(
+        h3_bf16_bits_to_f32(original[args.original_offset + destination]) +
+        args.update_scale * update);
+}
+
+int h3_gpu_token_expand_delta_bf16(
+    h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *original,
+    size_t original_offset, const h3_gpu_tensor *reduced,
+    const h3_gpu_tensor *baseline, size_t baseline_offset,
+    const h3_gpu_tensor *baseline_indices, const h3_gpu_tensor *parents,
+    uint32_t rows, uint32_t reduced_rows, uint32_t baseline_rows,
+    uint32_t width, uint32_t exact_prefix_rows, float update_scale) {
+    size_t elements = (size_t)rows * width;
+    size_t reduced_elements = (size_t)reduced_rows * width;
+    size_t baseline_elements = (size_t)baseline_rows * width;
+    if (!gpu || !output || !original || !reduced || !baseline ||
+        !baseline_indices || !parents || output->dtype != H3_GPU_BF16 ||
+        original->dtype != H3_GPU_BF16 || reduced->dtype != H3_GPU_BF16 ||
+        baseline->dtype != H3_GPU_BF16 ||
+        baseline_indices->dtype != H3_GPU_U32 ||
+        parents->dtype != H3_GPU_U32 || !rows || !reduced_rows || !width ||
+        exact_prefix_rows > rows || output->elements < elements ||
+        original->elements < original_offset + elements ||
+        reduced->elements < reduced_elements ||
+        baseline->elements < baseline_offset + baseline_elements ||
+        baseline_indices->elements < reduced_rows || parents->elements < rows)
+        return h3_gpu_fail(gpu, "invalid token expand delta request");
+    h3_token_expand_args args = {
+        (uint32_t)original_offset, (uint32_t)baseline_offset,
+        rows, width, exact_prefix_rows, update_scale};
+    dim3 threads(256, 1, 1);
+    dim3 blocks((width + threads.x - 1) / threads.x, rows, 1);
+    h3_token_expand_delta_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)original->device, (const uint16_t *)reduced->device,
+        (const uint16_t *)baseline->device,
+        (const uint32_t *)baseline_indices->device,
+        (const uint32_t *)parents->device, (uint16_t *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_token_expand_delta_bf16");
+}
+
+struct h3_token_expand_adaln_args {
+    uint32_t original_offset;
+    uint32_t baseline_offset;
+    uint32_t rows;
+    uint32_t width;
+    uint32_t exact_prefix_rows;
+    uint32_t slots;
+    uint32_t shift_slot;
+    uint32_t scale_slot;
+    float update_scale;
+    float epsilon;
+};
+
+__global__ static void h3_token_expand_adaln_bf16_kernel(
+    const uint16_t *original, const uint16_t *reduced,
+    const uint16_t *baseline, const uint32_t *baseline_indices,
+    const uint32_t *parents, uint16_t *residual, const uint16_t *weight,
+    const uint16_t *modulation, const uint32_t *row_map, uint16_t *output,
+    h3_token_expand_adaln_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.rows) return;
+    extern __shared__ unsigned char shared_raw[];
+    float *reductions = (float *)shared_raw;
+    uint16_t *restored_values =
+        (uint16_t *)(shared_raw + threads * sizeof(float));
+    uint32_t parent = parents[row];
+    uint32_t baseline_row = baseline_indices[parent];
+    bool direct = row < args.exact_prefix_rows ||
+                    baseline_row == 0xffffffffu;
+    float local_sum = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        uint32_t destination = row * args.width + column;
+        uint32_t reduced_index = parent * args.width + column;
+        uint16_t restored = reduced[reduced_index];
+        if (!direct) {
+            uint32_t baseline_index =
+                args.baseline_offset + baseline_row * args.width + column;
+            float update = h3_bf16_bits_to_f32(restored) -
+                           h3_bf16_bits_to_f32(baseline[baseline_index]);
+            restored = h3_f32_to_bf16_bits(
+                h3_bf16_bits_to_f32(
+                    original[args.original_offset + destination]) +
+                args.update_scale * update);
+        }
+        restored_values[column] = restored;
+        residual[destination] = restored;
+        float value = h3_bf16_bits_to_f32(restored);
+        local_sum = fmaf(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float inverse =
+        rsqrtf(reductions[0] / (float)args.width + args.epsilon);
+    size_t base = (size_t)row_map[row] * args.slots * args.width;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float normalized = h3_bf16_bits_to_f32(restored_values[column]) *
+                           inverse * h3_bf16_bits_to_f32(weight[column]);
+        float shift = h3_bf16_bits_to_f32(
+            modulation[base + args.shift_slot * args.width + column]);
+        float scale = h3_bf16_bits_to_f32(
+            modulation[base + args.scale_slot * args.width + column]);
+        output[row * args.width + column] = h3_f32_to_bf16_bits(
+            normalized * (1.0f + scale) + shift);
+    }
+}
+
+int h3_gpu_token_expand_adaln_bf16(
+    h3_gpu *gpu, h3_gpu_tensor *residual, h3_gpu_tensor *output,
+    const h3_gpu_tensor *original, size_t original_offset,
+    const h3_gpu_tensor *reduced, const h3_gpu_tensor *baseline,
+    size_t baseline_offset, const h3_gpu_tensor *baseline_indices,
+    const h3_gpu_tensor *parents, const h3_gpu_tensor *norm_weight,
+    const h3_gpu_tensor *modulation, const h3_gpu_tensor *row_map,
+    uint32_t rows, uint32_t reduced_rows, uint32_t baseline_rows,
+    uint32_t width, uint32_t exact_prefix_rows, float update_scale,
+    uint32_t slots, uint32_t shift_slot, uint32_t scale_slot,
+    float epsilon) {
+    size_t elements = (size_t)rows * width;
+    size_t reduced_elements = (size_t)reduced_rows * width;
+    size_t baseline_elements = (size_t)baseline_rows * width;
+    if (!gpu || !residual || !output || !original || !reduced || !baseline ||
+        !baseline_indices || !parents || !norm_weight || !modulation ||
+        !row_map || width > 5376u || !rows || !reduced_rows || !width ||
+        exact_prefix_rows > rows || shift_slot >= slots ||
+        scale_slot >= slots || residual->dtype != H3_GPU_BF16 ||
+        output->dtype != H3_GPU_BF16 || original->dtype != H3_GPU_BF16 ||
+        reduced->dtype != H3_GPU_BF16 || baseline->dtype != H3_GPU_BF16 ||
+        norm_weight->dtype != H3_GPU_BF16 ||
+        modulation->dtype != H3_GPU_BF16 ||
+        baseline_indices->dtype != H3_GPU_U32 ||
+        parents->dtype != H3_GPU_U32 || row_map->dtype != H3_GPU_U32 ||
+        residual->elements < elements || output->elements < elements ||
+        original->elements < original_offset + elements ||
+        reduced->elements < reduced_elements ||
+        baseline->elements < baseline_offset + baseline_elements ||
+        norm_weight->elements < width || row_map->elements < rows ||
+        baseline_indices->elements < reduced_rows || parents->elements < rows)
+        return h3_gpu_fail(gpu, "invalid fused token expand AdaLN request");
+    h3_token_expand_adaln_args args = {
+        (uint32_t)original_offset, (uint32_t)baseline_offset,
+        rows, width, exact_prefix_rows, slots, shift_slot, scale_slot,
+        update_scale, epsilon};
+    unsigned threads = 256;
+    size_t shared_bytes =
+        threads * sizeof(float) + (size_t)width * sizeof(uint16_t);
+    h3_token_expand_adaln_bf16_kernel<<<rows, threads, shared_bytes,
+                                        gpu->stream>>>(
+        (const uint16_t *)original->device, (const uint16_t *)reduced->device,
+        (const uint16_t *)baseline->device,
+        (const uint32_t *)baseline_indices->device,
+        (const uint32_t *)parents->device, (uint16_t *)residual->device,
+        (const uint16_t *)norm_weight->device,
+        (const uint16_t *)modulation->device,
+        (const uint32_t *)row_map->device, (uint16_t *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_token_expand_adaln_bf16");
 }
 
 int h3_gpu_begin(h3_gpu *gpu) {

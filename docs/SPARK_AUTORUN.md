@@ -63,8 +63,8 @@ make -f Makefile.linux tokenizer_test # full vocab parity (needs MiniMax-H3 toke
 - [x] `tests/test_cuda_ops.c` — numerical checks vs CPU oracle
 - [x] `tests/test_cuda_dit_block_smoke.c` — block-0 + optional 50-block step (no MLX fixture)
 - [x] `tests/test_cuda_text_smoke.c` — Qwen layer-0 + optional 50-layer (no MLX fixture)
-- [x] Stubs remaining: **45**
-- [ ] Token expand/pool, conv VAE paths
+- [x] Stubs remaining: **39**
+- [ ] patch_linear, conv/VAE paths
 - [ ] `test_real_dit_block` (needs MLX golden fixture — optional)
 
 ### Tokenizer

@@ -22,7 +22,7 @@ IMPLEMENTED = {
     "h3_gpu_submit", "h3_gpu_error", "h3_gpu_get_stats",
     "h3_gpu_profile_set_label", "h3_gpu_profile_mark",
     "h3_gpu_cast_f32_to_bf16", "h3_gpu_cast_bf16_to_f32",
-    "h3_gpu_copy_bf16", "h3_gpu_copy_f32", "h3_gpu_add_bf16",
+    "h3_gpu_copy_bf16", "h3_gpu_copy_f32", "h3_gpu_add_bf16", "h3_gpu_sub_bf16",
     "h3_gpu_silu_bf16", "h3_gpu_rms_norm_bf16",
     "h3_gpu_linear_f32", "h3_gpu_silu_f32",
     "h3_gpu_linear_bf16",
@@ -34,6 +34,9 @@ IMPLEMENTED = {
     "h3_gpu_sdpa_bf16", "h3_gpu_sdpa_bf16_head_major_output",
     "h3_gpu_head_rms_norm_bf16", "h3_gpu_rope_text_bf16",
     "h3_gpu_gqa_causal_bf16", "h3_gpu_silu_mul_bf16",
+    "h3_gpu_token_pool_bf16", "h3_gpu_token_pool_adaln_bf16",
+    "h3_gpu_token_expand_delta_bf16", "h3_gpu_token_expand_adaln_bf16",
+    "h3_gpu_euler_bf16",
     "h3_gpu_cuda_set_error",
 }
 
