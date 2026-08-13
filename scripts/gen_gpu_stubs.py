@@ -36,6 +36,9 @@ IMPLEMENTED = {
     "h3_gpu_gqa_causal_bf16", "h3_gpu_silu_mul_bf16",
     "h3_gpu_token_pool_bf16", "h3_gpu_token_pool_adaln_bf16",
     "h3_gpu_token_expand_delta_bf16", "h3_gpu_token_expand_adaln_bf16",
+    "h3_gpu_patch_linear_bf16", "h3_gpu_patch_linear_bf16_offset",
+    "h3_gpu_patch_linear_bf16_map",
+    "h3_gpu_gate_adaln_bf16", "h3_gpu_adaln_linear_bf16",
     "h3_gpu_euler_bf16",
     "h3_gpu_cuda_set_error",
 }

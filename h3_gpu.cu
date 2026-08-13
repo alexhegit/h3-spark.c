@@ -2047,6 +2047,404 @@ int h3_gpu_token_expand_adaln_bf16(
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_token_expand_adaln_bf16");
 }
 
+struct h3_linear_tiled_args {
+    uint32_t rows;
+    uint32_t input_dim;
+    uint32_t output_dim;
+    uint32_t has_bias;
+    uint32_t input_offset;
+    uint32_t output_offset;
+};
+
+__global__ static void h3_linear_f32_tiled_bf16_kernel(
+    const float *input, const float *weight, const float *bias,
+    uint16_t *output, h3_linear_tiled_args args) {
+    __shared__ float input_tile[16][16];
+    __shared__ float weight_tile[16][16];
+    uint32_t row = blockIdx.y * 16u + threadIdx.y;
+    uint32_t column = blockIdx.x * 16u + threadIdx.x;
+    float sum = args.has_bias && column < args.output_dim ?
+                    bias[column] : 0.0f;
+    uint32_t tile_count = (args.input_dim + 15u) / 16u;
+    for (uint32_t tile = 0; tile < tile_count; tile++) {
+        uint32_t input_k = tile * 16u + threadIdx.x;
+        input_tile[threadIdx.y][threadIdx.x] =
+            row < args.rows && input_k < args.input_dim ?
+                input[args.input_offset + row * args.input_dim + input_k] :
+                0.0f;
+        uint32_t weight_k = tile * 16u + threadIdx.y;
+        weight_tile[threadIdx.y][threadIdx.x] =
+            column < args.output_dim && weight_k < args.input_dim ?
+                weight[(size_t)column * args.input_dim + weight_k] : 0.0f;
+        __syncthreads();
+        for (uint32_t k = 0; k < 16u; k++) {
+            sum = fmaf(input_tile[threadIdx.y][k], weight_tile[k][threadIdx.x],
+                       sum);
+        }
+        __syncthreads();
+    }
+    if (row < args.rows && column < args.output_dim) {
+        output[args.output_offset + row * args.output_dim + column] =
+            h3_f32_to_bf16_bits(sum);
+    }
+}
+
+__global__ static void h3_linear_f32_tiled_bf16_map_kernel(
+    const float *input, const float *weight, const float *bias,
+    uint16_t *output, const uint32_t *row_map, h3_linear_tiled_args args) {
+    __shared__ float input_tile[16][16];
+    __shared__ float weight_tile[16][16];
+    __shared__ uint32_t output_rows[16];
+    uint32_t row = blockIdx.y * 16u + threadIdx.y;
+    uint32_t column = blockIdx.x * 16u + threadIdx.x;
+    if (threadIdx.x == 0) {
+        output_rows[threadIdx.y] = row < args.rows ? row_map[row] : 0u;
+    }
+    __syncthreads();
+    float sum = args.has_bias && column < args.output_dim ?
+                    bias[column] : 0.0f;
+    uint32_t tile_count = (args.input_dim + 15u) / 16u;
+    for (uint32_t tile = 0; tile < tile_count; tile++) {
+        uint32_t input_k = tile * 16u + threadIdx.x;
+        input_tile[threadIdx.y][threadIdx.x] =
+            row < args.rows && input_k < args.input_dim ?
+                input[row * args.input_dim + input_k] : 0.0f;
+        uint32_t weight_k = tile * 16u + threadIdx.y;
+        weight_tile[threadIdx.y][threadIdx.x] =
+            column < args.output_dim && weight_k < args.input_dim ?
+                weight[(size_t)column * args.input_dim + weight_k] : 0.0f;
+        __syncthreads();
+        for (uint32_t k = 0; k < 16u; k++) {
+            sum = fmaf(input_tile[threadIdx.y][k], weight_tile[k][threadIdx.x],
+                       sum);
+        }
+        __syncthreads();
+    }
+    if (row < args.rows && column < args.output_dim) {
+        output[output_rows[threadIdx.y] * args.output_dim + column] =
+            h3_f32_to_bf16_bits(sum);
+    }
+}
+
+static int h3_patch_shape_ok(uint32_t input_dim, uint32_t output_dim) {
+    return output_dim == 5376u && (input_dim == 32u || input_dim == 96u);
+}
+
+static int h3_gpu_patch_linear_bf16_offset_impl(
+    h3_gpu *gpu, h3_gpu_tensor *output, size_t output_offset,
+    const h3_gpu_tensor *input, size_t input_offset,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *bias, uint32_t rows,
+    uint32_t input_dim, uint32_t output_dim) {
+    size_t input_count = (size_t)rows * input_dim;
+    size_t weight_count = (size_t)output_dim * input_dim;
+    size_t output_count = (size_t)rows * output_dim;
+    if (!gpu || !output || !input || !weight ||
+        output->dtype != H3_GPU_BF16 || input->dtype != H3_GPU_F32 ||
+        weight->dtype != H3_GPU_F32 ||
+        (bias && bias->dtype != H3_GPU_F32) ||
+        !h3_patch_shape_ok(input_dim, output_dim) || !rows ||
+        output->elements < output_offset + output_count ||
+        input->elements < input_offset + input_count ||
+        weight->elements < weight_count ||
+        (bias && bias->elements < output_dim))
+        return h3_gpu_fail(gpu, "invalid patch linear request");
+    h3_linear_tiled_args args = {rows, input_dim, output_dim,
+                                 bias ? 1u : 0u, (uint32_t)input_offset,
+                                 (uint32_t)output_offset};
+    dim3 threads(16, 16, 1);
+    dim3 blocks((output_dim + 15u) / 16u, (rows + 15u) / 16u, 1);
+    h3_linear_f32_tiled_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)input->device, (const float *)weight->device,
+        bias ? (const float *)bias->device : (const float *)input->device,
+        (uint16_t *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_patch_linear_bf16");
+}
+
+int h3_gpu_patch_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *weight,
+                             const h3_gpu_tensor *bias, uint32_t rows,
+                             uint32_t input_dim, uint32_t output_dim) {
+    return h3_gpu_patch_linear_bf16_offset_impl(
+        gpu, output, 0, input, 0, weight, bias, rows, input_dim, output_dim);
+}
+
+int h3_gpu_patch_linear_bf16_offset(
+    h3_gpu *gpu, h3_gpu_tensor *output, size_t output_offset,
+    const h3_gpu_tensor *input, size_t input_offset,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *bias, uint32_t rows,
+    uint32_t input_dim, uint32_t output_dim) {
+    return h3_gpu_patch_linear_bf16_offset_impl(
+        gpu, output, output_offset, input, input_offset, weight, bias, rows,
+        input_dim, output_dim);
+}
+
+int h3_gpu_patch_linear_bf16_map(
+    h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *bias,
+    const h3_gpu_tensor *row_map, uint32_t output_rows, uint32_t rows,
+    uint32_t input_dim, uint32_t output_dim) {
+    size_t input_count = (size_t)rows * input_dim;
+    size_t weight_count = (size_t)output_dim * input_dim;
+    size_t output_count = (size_t)output_rows * output_dim;
+    if (!gpu || !output || !input || !weight || !row_map ||
+        output->dtype != H3_GPU_BF16 || input->dtype != H3_GPU_F32 ||
+        weight->dtype != H3_GPU_F32 ||
+        (bias && bias->dtype != H3_GPU_F32) ||
+        row_map->dtype != H3_GPU_U32 ||
+        !h3_patch_shape_ok(input_dim, output_dim) || !rows ||
+        output->elements < output_count || input->elements < input_count ||
+        weight->elements < weight_count ||
+        row_map->elements < rows || (bias && bias->elements < output_dim))
+        return h3_gpu_fail(gpu, "invalid mapped patch linear request");
+    h3_linear_tiled_args args = {rows, input_dim, output_dim,
+                                 bias ? 1u : 0u, 0u, 0u};
+    dim3 threads(16, 16, 1);
+    dim3 blocks((output_dim + 15u) / 16u, (rows + 15u) / 16u, 1);
+    h3_linear_f32_tiled_bf16_map_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)input->device, (const float *)weight->device,
+        bias ? (const float *)bias->device : (const float *)input->device,
+        (uint16_t *)output->device, (const uint32_t *)row_map->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_patch_linear_bf16_map");
+}
+
+struct h3_gate_adaln_args {
+    uint32_t rows;
+    uint32_t width;
+    uint32_t slots;
+    uint32_t gate_slot;
+    uint32_t shift_slot;
+    uint32_t scale_slot;
+    float epsilon;
+};
+
+__global__ static void h3_gate_adaln_bf16_kernel(
+    const uint16_t *residual, const uint16_t *branch,
+    const uint16_t *gate_modulation, const uint32_t *row_map,
+    const uint16_t *weight, const uint16_t *norm_modulation,
+    uint16_t *gated_residual, uint16_t *output, h3_gate_adaln_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.rows) return;
+    extern __shared__ unsigned char shared_raw[];
+    float *reductions = (float *)shared_raw;
+    uint16_t *gated_values =
+        (uint16_t *)(shared_raw + threads * sizeof(float));
+    size_t base = (size_t)row_map[row] * args.slots * args.width;
+    float local_sum = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        size_t index = (size_t)row * args.width + column;
+        float gate = h3_bf16_bits_to_f32(
+            gate_modulation[base + args.gate_slot * args.width + column]);
+        uint16_t gated = h3_f32_to_bf16_bits(
+            h3_bf16_bits_to_f32(residual[index]) +
+            h3_bf16_bits_to_f32(branch[index]) * gate);
+        gated_residual[index] = gated;
+        gated_values[column] = gated;
+        float value = h3_bf16_bits_to_f32(gated);
+        local_sum = fmaf(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float inverse =
+        rsqrtf(reductions[0] / (float)args.width + args.epsilon);
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float normalized = h3_bf16_bits_to_f32(gated_values[column]) *
+                           inverse * h3_bf16_bits_to_f32(weight[column]);
+        float shift = h3_bf16_bits_to_f32(
+            norm_modulation[base + args.shift_slot * args.width + column]);
+        float scale = h3_bf16_bits_to_f32(
+            norm_modulation[base + args.scale_slot * args.width + column]);
+        output[row * args.width + column] = h3_f32_to_bf16_bits(
+            normalized * (1.0f + scale) + shift);
+    }
+}
+
+int h3_gpu_gate_adaln_bf16(
+    h3_gpu *gpu, h3_gpu_tensor *gated_residual, h3_gpu_tensor *output,
+    const h3_gpu_tensor *residual, const h3_gpu_tensor *branch,
+    const h3_gpu_tensor *norm_weight, const h3_gpu_tensor *gate_modulation,
+    const h3_gpu_tensor *norm_modulation, const h3_gpu_tensor *row_map,
+    uint32_t rows, uint32_t width, uint32_t slots, uint32_t gate_slot,
+    uint32_t shift_slot, uint32_t scale_slot, float epsilon) {
+    size_t elements = (size_t)rows * width;
+    if (!gpu || !gated_residual || !output || !residual || !branch ||
+        !norm_weight || !gate_modulation || !norm_modulation || !row_map ||
+        width > 5376u || gate_slot >= slots || shift_slot >= slots ||
+        scale_slot >= slots || !rows || !width ||
+        gated_residual->dtype != H3_GPU_BF16 || output->dtype != H3_GPU_BF16 ||
+        residual->dtype != H3_GPU_BF16 || branch->dtype != H3_GPU_BF16 ||
+        norm_weight->dtype != H3_GPU_BF16 ||
+        gate_modulation->dtype != H3_GPU_BF16 ||
+        norm_modulation->dtype != H3_GPU_BF16 ||
+        row_map->dtype != H3_GPU_U32 || gated_residual->elements < elements ||
+        output->elements < elements || residual->elements < elements ||
+        branch->elements < elements || norm_weight->elements < width ||
+        row_map->elements < rows)
+        return h3_gpu_fail(gpu, "invalid fused gate AdaLN request");
+    h3_gate_adaln_args args = {rows, width, slots, gate_slot, shift_slot,
+                               scale_slot, epsilon};
+    unsigned threads = 256;
+    size_t shared_bytes =
+        threads * sizeof(float) + (size_t)width * sizeof(uint16_t);
+    h3_gate_adaln_bf16_kernel<<<rows, threads, shared_bytes, gpu->stream>>>(
+        (const uint16_t *)residual->device, (const uint16_t *)branch->device,
+        (const uint16_t *)gate_modulation->device,
+        (const uint32_t *)row_map->device, (const uint16_t *)norm_weight->device,
+        (const uint16_t *)norm_modulation->device,
+        (uint16_t *)gated_residual->device, (uint16_t *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_gate_adaln_bf16");
+}
+
+struct h3_rms_inverse_args {
+    uint32_t rows;
+    uint32_t width;
+    float epsilon;
+    size_t input_offset;
+};
+
+__global__ static void h3_rms_inverse_bf16_kernel(
+    const uint16_t *input, float *inverse, h3_rms_inverse_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.rows) return;
+    extern __shared__ float reductions[];
+    const uint16_t *row_input =
+        input + args.input_offset + (size_t)row * args.width;
+    float local_sum = 0.0f;
+    for (uint32_t k = tid; k < args.width; k += threads) {
+        float value = h3_bf16_bits_to_f32(row_input[k]);
+        local_sum = fmaf(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        inverse[row] =
+            rsqrtf(reductions[0] / (float)args.width + args.epsilon);
+    }
+}
+
+struct h3_adaln_linear_args {
+    uint32_t rows;
+    uint32_t width;
+    uint32_t output_dim;
+    uint32_t slots;
+    uint32_t shift_slot;
+    uint32_t scale_slot;
+    uint32_t has_bias;
+    size_t input_offset;
+};
+
+__global__ static void h3_adaln_linear_bf16_kernel(
+    const uint16_t *input, const float *inverse, const uint16_t *norm_weight,
+    const uint16_t *modulation, const uint32_t *row_map,
+    const uint16_t *weight, const uint16_t *bias, uint16_t *output,
+    h3_adaln_linear_args args) {
+    __shared__ uint16_t input_tile[16][16];
+    __shared__ float weight_tile[16][16];
+    uint32_t row = blockIdx.y * 16u + threadIdx.y;
+    uint32_t column = blockIdx.x * 16u + threadIdx.x;
+    float sum = args.has_bias && column < args.output_dim ?
+                    h3_bf16_bits_to_f32(bias[column]) : 0.0f;
+    size_t base = row < args.rows ?
+                      (size_t)row_map[row] * args.slots * args.width : 0;
+    uint32_t tile_count = (args.width + 15u) / 16u;
+    for (uint32_t tile = 0; tile < tile_count; tile++) {
+        uint32_t input_k = tile * 16u + threadIdx.x;
+        uint16_t normalized = 0;
+        if (row < args.rows && input_k < args.width) {
+            float value = h3_bf16_bits_to_f32(
+                input[args.input_offset + row * args.width + input_k]);
+            float shift = h3_bf16_bits_to_f32(
+                modulation[base + args.shift_slot * args.width + input_k]);
+            float scale = h3_bf16_bits_to_f32(
+                modulation[base + args.scale_slot * args.width + input_k]);
+            float normed = value * inverse[row] *
+                             h3_bf16_bits_to_f32(norm_weight[input_k]);
+            normalized = h3_f32_to_bf16_bits(normed * (1.0f + scale) + shift);
+        }
+        input_tile[threadIdx.y][threadIdx.x] = normalized;
+        uint32_t weight_k = tile * 16u + threadIdx.y;
+        weight_tile[threadIdx.y][threadIdx.x] =
+            column < args.output_dim && weight_k < args.width ?
+                h3_bf16_bits_to_f32(
+                    weight[(size_t)column * args.width + weight_k]) :
+                0.0f;
+        __syncthreads();
+        for (uint32_t k = 0; k < 16u; k++) {
+            sum = fmaf(h3_bf16_bits_to_f32(input_tile[threadIdx.y][k]),
+                       weight_tile[k][threadIdx.x], sum);
+        }
+        __syncthreads();
+    }
+    if (row < args.rows && column < args.output_dim) {
+        output[row * args.output_dim + column] = h3_f32_to_bf16_bits(sum);
+    }
+}
+
+int h3_gpu_adaln_linear_bf16(
+    h3_gpu *gpu, h3_gpu_tensor *output, h3_gpu_tensor *inverse,
+    const h3_gpu_tensor *input, size_t input_offset,
+    const h3_gpu_tensor *norm_weight, const h3_gpu_tensor *modulation,
+    const h3_gpu_tensor *row_map, const h3_gpu_tensor *weight,
+    const h3_gpu_tensor *bias, uint32_t rows, uint32_t width,
+    uint32_t output_dim, uint32_t slots, uint32_t shift_slot,
+    uint32_t scale_slot, float epsilon) {
+    size_t input_count = (size_t)rows * width;
+    size_t weight_count = (size_t)output_dim * width;
+    size_t output_count = (size_t)rows * output_dim;
+    if (!gpu || !output || !inverse || !input || !norm_weight ||
+        !modulation || !row_map || !weight ||
+        shift_slot >= slots || scale_slot >= slots || !rows || !width ||
+        output->dtype != H3_GPU_BF16 || input->dtype != H3_GPU_BF16 ||
+        inverse->dtype != H3_GPU_F32 || norm_weight->dtype != H3_GPU_BF16 ||
+        modulation->dtype != H3_GPU_BF16 || weight->dtype != H3_GPU_BF16 ||
+        row_map->dtype != H3_GPU_U32 ||
+        (bias && bias->dtype != H3_GPU_BF16) ||
+        output->elements < output_count ||
+        input->elements < input_offset + input_count ||
+        inverse->elements < rows || norm_weight->elements < width ||
+        row_map->elements < rows || weight->elements < weight_count ||
+        (bias && bias->elements < output_dim))
+        return h3_gpu_fail(gpu, "invalid fused AdaLN linear request");
+    h3_rms_inverse_args inv_args = {rows, width, epsilon, input_offset};
+    unsigned inv_threads = 256;
+    h3_rms_inverse_bf16_kernel<<<rows, inv_threads,
+                                 inv_threads * sizeof(float),
+                                 gpu->stream>>>(
+        (const uint16_t *)input->device, (float *)inverse->device, inv_args);
+    gpu->stats.direct_dispatches++;
+    if (!h3_cuda_check(gpu, cudaGetLastError(), "h3_rms_inverse_bf16"))
+        return 0;
+    h3_adaln_linear_args args = {rows, width, output_dim, slots, shift_slot,
+                                 scale_slot, bias ? 1u : 0u, input_offset};
+    dim3 threads(16, 16, 1);
+    dim3 blocks((output_dim + 15u) / 16u, (rows + 15u) / 16u, 1);
+    h3_adaln_linear_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)input->device, (const float *)inverse->device,
+        (const uint16_t *)norm_weight->device,
+        (const uint16_t *)modulation->device,
+        (const uint32_t *)row_map->device, (const uint16_t *)weight->device,
+        bias ? (const uint16_t *)bias->device :
+               (const uint16_t *)input->device,
+        (uint16_t *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_adaln_linear_bf16");
+}
+
 int h3_gpu_begin(h3_gpu *gpu) {
     if (!gpu) return 0;
     gpu->error[0] = '\0';

@@ -1415,6 +1415,190 @@ int main(void) {
         }
     }
 
+    enum { GA_ROWS = 6, GA_WIDTH = 4, GA_SLOTS = 2, GA_HEAD = 3 };
+    float ga_input_host[GA_ROWS * GA_WIDTH];
+    float ga_branch_host[GA_ROWS * GA_WIDTH];
+    float ga_norm_host[GA_WIDTH];
+    float ga_mod_host[GA_SLOTS * GA_WIDTH];
+    uint32_t ga_row_map[GA_ROWS] = {0, 1, 0, 1, 0, 1};
+    uint16_t ga_input_bf16[GA_ROWS * GA_WIDTH];
+    uint16_t ga_branch_bf16[GA_ROWS * GA_WIDTH];
+    uint16_t ga_norm_bf16[GA_WIDTH];
+    uint16_t ga_mod_bf16[GA_SLOTS * GA_WIDTH];
+    uint16_t ga_out_bf16[GA_ROWS * GA_WIDTH];
+    float ga_gate_ref_f32[GA_ROWS * GA_WIDTH];
+    float ga_out_ref_f32[GA_ROWS * GA_WIDTH];
+    float ga_head_weight_host[GA_HEAD * GA_WIDTH];
+    float ga_head_bias_host[GA_HEAD];
+    uint16_t ga_head_weight_bf16[GA_HEAD * GA_WIDTH];
+    uint16_t ga_head_bias_bf16[GA_HEAD];
+    uint16_t ga_head_ref[GA_ROWS * GA_HEAD];
+    uint16_t ga_head_out_bf16[GA_ROWS * GA_HEAD];
+    float ga_adaln_host[GA_ROWS * GA_WIDTH];
+    float ga_head_ref_f32[GA_ROWS * GA_HEAD];
+    for (size_t i = 0; i < (size_t)GA_ROWS * GA_WIDTH; i++) {
+        ga_input_host[i] = sinf((float)i * 0.19f);
+        ga_branch_host[i] = cosf((float)i * 0.23f) * 0.5f;
+        ga_input_bf16[i] = f32_to_bf16(ga_input_host[i]);
+        ga_branch_bf16[i] = f32_to_bf16(ga_branch_host[i]);
+    }
+    for (uint32_t i = 0; i < GA_WIDTH; i++) {
+        ga_norm_host[i] = 0.8f + 0.05f * (float)i;
+        ga_norm_bf16[i] = f32_to_bf16(ga_norm_host[i]);
+    }
+    for (size_t i = 0; i < (size_t)GA_SLOTS * GA_WIDTH; i++) {
+        ga_mod_host[i] = sinf((float)i * 0.31f) * 0.25f;
+        ga_mod_bf16[i] = f32_to_bf16(ga_mod_host[i]);
+    }
+    gate_ref(ga_input_host, ga_branch_host, ga_mod_host, ga_row_map,
+             ga_gate_ref_f32, GA_ROWS, GA_WIDTH, GA_SLOTS, 0);
+    adaln_ref(ga_gate_ref_f32, ga_norm_host, ga_mod_host, ga_row_map,
+              ga_out_ref_f32, GA_ROWS, GA_WIDTH, GA_SLOTS, 0, 1, 1e-5f);
+    uint16_t ga_out_ref[GA_ROWS * GA_WIDTH];
+    for (size_t i = 0; i < (size_t)GA_ROWS * GA_WIDTH; i++)
+        ga_out_ref[i] = f32_to_bf16(ga_out_ref_f32[i]);
+    for (size_t i = 0; i < (size_t)GA_HEAD * GA_WIDTH; i++) {
+        ga_head_weight_host[i] = ((float)((int)(i % 7) - 3)) * 0.125f;
+        ga_head_weight_bf16[i] = f32_to_bf16(ga_head_weight_host[i]);
+    }
+    for (uint32_t i = 0; i < GA_HEAD; i++) {
+        ga_head_bias_host[i] = (float)i * 0.0625f;
+        ga_head_bias_bf16[i] = f32_to_bf16(ga_head_bias_host[i]);
+    }
+    adaln_ref(ga_input_host, ga_norm_host, ga_mod_host, ga_row_map,
+              ga_adaln_host, GA_ROWS, GA_WIDTH, GA_SLOTS, 0, 1, 1e-5f);
+    linear_ref(ga_adaln_host, ga_head_weight_host, ga_head_bias_host,
+               ga_head_ref_f32, GA_ROWS, GA_WIDTH, GA_HEAD);
+    for (size_t i = 0; i < (size_t)GA_ROWS * GA_HEAD; i++)
+        ga_head_ref[i] = f32_to_bf16(ga_head_ref_f32[i]);
+    h3_gpu_tensor *ga_residual =
+        h3_gpu_tensor_from_bf16(gpu, ga_input_bf16, GA_ROWS * GA_WIDTH);
+    h3_gpu_tensor *ga_branch =
+        h3_gpu_tensor_from_bf16(gpu, ga_branch_bf16, GA_ROWS * GA_WIDTH);
+    h3_gpu_tensor *ga_norm =
+        h3_gpu_tensor_from_bf16(gpu, ga_norm_bf16, GA_WIDTH);
+    h3_gpu_tensor *ga_mod =
+        h3_gpu_tensor_from_bf16(gpu, ga_mod_bf16, GA_SLOTS * GA_WIDTH);
+    h3_gpu_tensor *ga_map =
+        h3_gpu_tensor_from_u32(gpu, ga_row_map, GA_ROWS);
+    h3_gpu_tensor *ga_gate_res =
+        h3_gpu_tensor_new_bf16(gpu, GA_ROWS * GA_WIDTH);
+    h3_gpu_tensor *ga_out = h3_gpu_tensor_new_bf16(gpu, GA_ROWS * GA_WIDTH);
+    h3_gpu_tensor *ga_head_weight =
+        h3_gpu_tensor_from_bf16(gpu, ga_head_weight_bf16, GA_HEAD * GA_WIDTH);
+    h3_gpu_tensor *ga_head_bias =
+        h3_gpu_tensor_from_bf16(gpu, ga_head_bias_bf16, GA_HEAD);
+    h3_gpu_tensor *ga_inverse = h3_gpu_tensor_new_f32(gpu, GA_ROWS);
+    h3_gpu_tensor *ga_head_out =
+        h3_gpu_tensor_new_bf16(gpu, GA_ROWS * GA_HEAD);
+    if (ga_residual && ga_branch && ga_norm && ga_mod && ga_map &&
+        ga_gate_res && ga_out && ga_head_weight && ga_head_bias &&
+        ga_inverse && ga_head_out) {
+        check(h3_gpu_gate_adaln_bf16(
+                  gpu, ga_gate_res, ga_out, ga_residual, ga_branch, ga_norm,
+                  ga_mod, ga_mod, ga_map, GA_ROWS, GA_WIDTH, GA_SLOTS, 0, 0, 1,
+                  1e-5f),
+              "gate_adaln");
+        check(h3_gpu_adaln_linear_bf16(
+                  gpu, ga_head_out, ga_inverse, ga_residual, 0, ga_norm,
+                  ga_mod, ga_map, ga_head_weight, ga_head_bias, GA_ROWS,
+                  GA_WIDTH, GA_HEAD, GA_SLOTS, 0, 1, 1e-5f),
+              "adaln_linear");
+        check(h3_gpu_submit(gpu), "submit gate_adaln/adaln_linear");
+        check(h3_gpu_tensor_read_bf16(ga_out, ga_out_bf16, GA_ROWS * GA_WIDTH),
+              "read gate_adaln");
+        check(h3_gpu_tensor_read_bf16(ga_head_out, ga_head_out_bf16,
+                                      GA_ROWS * GA_HEAD),
+              "read adaln_linear");
+        for (size_t i = 0; i < (size_t)GA_ROWS * GA_WIDTH; i++) {
+            float got = bf16_to_f32(ga_out_bf16[i]);
+            float want = bf16_to_f32(ga_out_ref[i]);
+            if (fabsf(got - want) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: gate_adaln mismatch at %zu got=%f expected=%f\n",
+                        i, got, want);
+                failures++;
+                break;
+            }
+        }
+        for (size_t i = 0; i < (size_t)GA_ROWS * GA_HEAD; i++) {
+            float got = bf16_to_f32(ga_head_out_bf16[i]);
+            float want = bf16_to_f32(ga_head_ref[i]);
+            if (fabsf(got - want) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: adaln_linear mismatch at %zu got=%f expected=%f\n",
+                        i, got, want);
+                failures++;
+                break;
+            }
+        }
+    }
+
+    const uint32_t patch_rows = 1;
+    const uint32_t patch_in_dim = 32;
+    const uint32_t patch_out_dim = 5376;
+    const size_t patch_in_count = (size_t)patch_rows * patch_in_dim;
+    const size_t patch_w_count = (size_t)patch_out_dim * patch_in_dim;
+    const size_t patch_out_count = (size_t)patch_rows * patch_out_dim;
+    float *patch_in_host = (float *)malloc(patch_in_count * sizeof(float));
+    float *patch_w_host = (float *)malloc(patch_w_count * sizeof(float));
+    float *patch_b_host = (float *)malloc(patch_out_dim * sizeof(float));
+    float *patch_f32_host = (float *)malloc(patch_out_count * sizeof(float));
+    uint16_t *patch_ref_bf16 = (uint16_t *)malloc(patch_out_count * sizeof(uint16_t));
+    uint16_t *patch_out_bf16 = (uint16_t *)malloc(patch_out_count * sizeof(uint16_t));
+    if (patch_in_host && patch_w_host && patch_b_host && patch_f32_host &&
+        patch_ref_bf16 && patch_out_bf16) {
+        for (size_t i = 0; i < patch_in_count; i++)
+            patch_in_host[i] = sinf((float)i * 0.11f);
+        for (size_t i = 0; i < patch_w_count; i++)
+            patch_w_host[i] = cosf((float)i * 0.07f) * 0.01f;
+        for (size_t i = 0; i < patch_out_dim; i++)
+            patch_b_host[i] = sinf((float)i * 0.03f) * 0.001f;
+        linear_ref(patch_in_host, patch_w_host, patch_b_host, patch_f32_host,
+                   patch_rows, patch_in_dim, patch_out_dim);
+        for (size_t i = 0; i < patch_out_count; i++)
+            patch_ref_bf16[i] = f32_to_bf16(patch_f32_host[i]);
+        h3_gpu_tensor *patch_in_t =
+            h3_gpu_tensor_from_f32(gpu, patch_in_host, patch_in_count);
+        h3_gpu_tensor *patch_w =
+            h3_gpu_tensor_from_f32(gpu, patch_w_host, patch_w_count);
+        h3_gpu_tensor *patch_b =
+            h3_gpu_tensor_from_f32(gpu, patch_b_host, patch_out_dim);
+        h3_gpu_tensor *patch_out_t =
+            h3_gpu_tensor_new_bf16(gpu, patch_out_count);
+        if (patch_in_t && patch_w && patch_b && patch_out_t) {
+            check(h3_gpu_patch_linear_bf16(
+                      gpu, patch_out_t, patch_in_t, patch_w, patch_b,
+                      patch_rows, patch_in_dim, patch_out_dim),
+                  "patch_linear");
+            check(h3_gpu_submit(gpu), "submit patch_linear");
+            check(h3_gpu_tensor_read_bf16(patch_out_t, patch_out_bf16,
+                                          patch_out_count),
+                  "read patch_linear");
+            for (size_t i = 0; i < patch_out_count; i++) {
+                float got = bf16_to_f32(patch_out_bf16[i]);
+                float want = bf16_to_f32(patch_ref_bf16[i]);
+                if (fabsf(got - want) >= 5e-2f) {
+                    fprintf(stderr,
+                            "FAIL: patch_linear mismatch at %zu got=%f expected=%f\n",
+                            i, got, want);
+                    failures++;
+                    break;
+                }
+            }
+        }
+        h3_gpu_tensor_free(patch_in_t);
+        h3_gpu_tensor_free(patch_w);
+        h3_gpu_tensor_free(patch_b);
+        h3_gpu_tensor_free(patch_out_t);
+    }
+    free(patch_in_host);
+    free(patch_w_host);
+    free(patch_b_host);
+    free(patch_f32_host);
+    free(patch_ref_bf16);
+    free(patch_out_bf16);
+
     h3_gpu_tensor_free(silu_in);
     h3_gpu_tensor_free(silu_out);
     h3_gpu_tensor_free(norm_in);
@@ -1484,6 +1668,17 @@ int main(void) {
     h3_gpu_tensor_free(tp_processed);
     h3_gpu_tensor_free(tp_parents_t);
     h3_gpu_tensor_free(tp_expanded);
+    h3_gpu_tensor_free(ga_residual);
+    h3_gpu_tensor_free(ga_branch);
+    h3_gpu_tensor_free(ga_norm);
+    h3_gpu_tensor_free(ga_mod);
+    h3_gpu_tensor_free(ga_map);
+    h3_gpu_tensor_free(ga_gate_res);
+    h3_gpu_tensor_free(ga_out);
+    h3_gpu_tensor_free(ga_head_weight);
+    h3_gpu_tensor_free(ga_head_bias);
+    h3_gpu_tensor_free(ga_inverse);
+    h3_gpu_tensor_free(ga_head_out);
     h3_gpu_free(gpu);
 
     if (failures) {
