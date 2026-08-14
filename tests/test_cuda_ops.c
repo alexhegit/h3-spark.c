@@ -178,6 +178,41 @@ static void grouped_qkv_rope_ref(const float *qkv, const float *q_weight,
     }
 }
 
+static void vision_qkv_rope_ref(const float *qkv, const float *rope_cos,
+                                const float *rope_sin, float *query,
+                                float *key, float *value, uint32_t sequence,
+                                uint32_t heads, uint32_t head_dim,
+                                uint32_t rope_half) {
+    uint32_t inner = heads * head_dim;
+    for (uint32_t row = 0; row < sequence; row++) {
+        for (uint32_t head = 0; head < heads; head++) {
+            size_t row_base = (size_t)row * inner * 3u;
+            size_t q_base = row_base + (size_t)head * head_dim;
+            size_t k_base = row_base + inner + (size_t)head * head_dim;
+            size_t v_base = row_base + inner * 2u + (size_t)head * head_dim;
+            for (uint32_t dimension = 0; dimension < head_dim; dimension++) {
+                uint32_t pair = dimension < rope_half ? dimension + rope_half
+                                                     : dimension - rope_half;
+                float c = rope_cos[row * rope_half + (dimension % rope_half)];
+                float s = rope_sin[row * rope_half + (dimension % rope_half)];
+                float q0 = qkv[q_base + dimension];
+                float k0 = qkv[k_base + dimension];
+                float q1 = qkv[q_base + pair];
+                float k1 = qkv[k_base + pair];
+                float qr =
+                    dimension < rope_half ? q0 * c - q1 * s : q0 * c + q1 * s;
+                float kr =
+                    dimension < rope_half ? k0 * c - k1 * s : k0 * c + k1 * s;
+                size_t output_index =
+                    ((size_t)row * heads + head) * head_dim + dimension;
+                query[output_index] = qr;
+                key[output_index] = kr;
+                value[output_index] = qkv[v_base + dimension];
+            }
+        }
+    }
+}
+
 static void sdpa_ref(const float *query, const float *key, const float *value,
                      float *output, uint32_t sequence, uint32_t heads,
                      uint32_t head_dim, float scale) {
@@ -345,6 +380,84 @@ static void rms_norm_ref(const float *input, const float *weight, float *output,
     }
 }
 
+static void layer_norm_ref(const float *input, const float *weight,
+                           const float *bias, float *output, uint32_t rows,
+                           uint32_t width, float epsilon) {
+    for (uint32_t row = 0; row < rows; row++) {
+        const float *row_input = input + (size_t)row * width;
+        float *row_output = output + (size_t)row * width;
+        float sum = 0.0f;
+        for (uint32_t column = 0; column < width; column++)
+            sum += row_input[column];
+        float mean = sum / (float)width;
+        float sq_sum = 0.0f;
+        for (uint32_t column = 0; column < width; column++) {
+            float centered = row_input[column] - mean;
+            sq_sum = fmaf(centered, centered, sq_sum);
+        }
+        float inverse = 1.0f / sqrtf(sq_sum / (float)width + epsilon);
+        for (uint32_t column = 0; column < width; column++) {
+            float normalized = (row_input[column] - mean) * inverse;
+            row_output[column] =
+                fmaf(normalized, weight[column], bias[column]);
+        }
+    }
+}
+
+static void text_qk_rope_ref(const float *query_input, const float *key_input,
+                             const float *q_weight, const float *k_weight,
+                             const float *rope_cos, const float *rope_sin,
+                             float *query_output, float *key_output,
+                             uint32_t sequence, uint32_t query_heads,
+                             uint32_t kv_heads, uint32_t head_dim,
+                             float epsilon) {
+    uint32_t half_dim = head_dim / 2u;
+    for (uint32_t row = 0; row < sequence; row++) {
+        for (uint32_t head = 0; head < query_heads; head++) {
+            size_t q_base = ((size_t)row * query_heads + head) * head_dim;
+            float q_sum = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                float value = query_input[q_base + d];
+                q_sum = fmaf(value, value, q_sum);
+            }
+            float q_inverse = 1.0f / sqrtf(q_sum / (float)head_dim + epsilon);
+            for (uint32_t dimension = 0; dimension < head_dim; dimension++) {
+                uint32_t pair = dimension < half_dim ? dimension + half_dim
+                                                     : dimension - half_dim;
+                float c = rope_cos[row * half_dim + (dimension % half_dim)];
+                float s = rope_sin[row * half_dim + (dimension % half_dim)];
+                float q0 = query_input[q_base + dimension] * q_inverse *
+                           q_weight[dimension];
+                float q1 = query_input[q_base + pair] * q_inverse *
+                           q_weight[pair];
+                query_output[q_base + dimension] =
+                    dimension < half_dim ? q0 * c - q1 * s : q0 * c + q1 * s;
+            }
+        }
+        for (uint32_t head = 0; head < kv_heads; head++) {
+            size_t k_base = ((size_t)row * kv_heads + head) * head_dim;
+            float k_sum = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                float value = key_input[k_base + d];
+                k_sum = fmaf(value, value, k_sum);
+            }
+            float k_inverse = 1.0f / sqrtf(k_sum / (float)head_dim + epsilon);
+            for (uint32_t dimension = 0; dimension < head_dim; dimension++) {
+                uint32_t pair = dimension < half_dim ? dimension + half_dim
+                                                     : dimension - half_dim;
+                float c = rope_cos[row * half_dim + (dimension % half_dim)];
+                float s = rope_sin[row * half_dim + (dimension % half_dim)];
+                float k0 = key_input[k_base + dimension] * k_inverse *
+                           k_weight[dimension];
+                float k1 = key_input[k_base + pair] * k_inverse *
+                           k_weight[pair];
+                key_output[k_base + dimension] =
+                    dimension < half_dim ? k0 * c - k1 * s : k0 * c + k1 * s;
+            }
+        }
+    }
+}
+
 int main(void) {
     char error[256];
     h3_gpu *gpu = h3_gpu_create(NULL, error, sizeof(error));
@@ -429,6 +542,39 @@ int main(void) {
                 fprintf(stderr,
                         "FAIL: rms_norm mismatch at %zu got=%f expected=%f\n",
                         i, got, norm_ref[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
+    float layer_norm_bias_host[width];
+    uint16_t layer_norm_bias_bf16[width];
+    float layer_norm_ref_out[count];
+    for (uint32_t column = 0; column < width; column++) {
+        layer_norm_bias_host[column] = -0.01f + 0.005f * (float)column;
+        layer_norm_bias_bf16[column] = f32_to_bf16(layer_norm_bias_host[column]);
+    }
+    layer_norm_ref(norm_host, weight_host, layer_norm_bias_host,
+                   layer_norm_ref_out, rows, width, epsilon);
+    h3_gpu_tensor *layer_norm_out = h3_gpu_tensor_new_bf16(gpu, count);
+    h3_gpu_tensor *layer_norm_bias =
+        h3_gpu_tensor_from_bf16(gpu, layer_norm_bias_bf16, width);
+    check(layer_norm_out && layer_norm_bias, "layer_norm tensor alloc");
+    if (layer_norm_out && layer_norm_bias) {
+        check(h3_gpu_layer_norm_bf16(gpu, layer_norm_out, norm_in, norm_weight,
+                                     layer_norm_bias, rows, width, epsilon),
+              "layer_norm");
+        check(h3_gpu_submit(gpu), "submit layer_norm");
+        uint16_t layer_norm_out_bf16[count];
+        check(h3_gpu_tensor_read_bf16(layer_norm_out, layer_norm_out_bf16, count),
+              "read layer_norm");
+        for (size_t i = 0; i < count; i++) {
+            float got = bf16_to_f32(layer_norm_out_bf16[i]);
+            if (fabsf(got - layer_norm_ref_out[i]) >= 2e-2f) {
+                fprintf(stderr,
+                        "FAIL: layer_norm mismatch at %zu got=%f expected=%f\n",
+                        i, got, layer_norm_ref_out[i]);
                 failures++;
                 break;
             }
@@ -1035,6 +1181,100 @@ int main(void) {
         }
     }
 
+    const uint32_t vision_sequence = 3;
+    const uint32_t vision_heads = 2;
+    const uint32_t vision_head_dim = 8;
+    const uint32_t vision_rope_half = vision_head_dim / 2u;
+    const size_t vision_inner = (size_t)vision_heads * vision_head_dim;
+    const size_t vision_qkv_count = (size_t)vision_sequence * vision_inner * 3u;
+    const size_t vision_out_count = (size_t)vision_sequence * vision_inner;
+    const size_t vision_rope_count = (size_t)vision_sequence * vision_rope_half;
+    float vision_qkv_host[vision_qkv_count];
+    float vision_rope_cos_host[vision_rope_count];
+    float vision_rope_sin_host[vision_rope_count];
+    uint16_t vision_qkv_bf16[vision_qkv_count];
+    uint16_t vision_rope_cos_bf16[vision_rope_count];
+    uint16_t vision_rope_sin_bf16[vision_rope_count];
+    uint16_t vision_query_bf16[vision_out_count];
+    uint16_t vision_key_bf16[vision_out_count];
+    uint16_t vision_value_bf16[vision_out_count];
+    float vision_query_ref[vision_out_count];
+    float vision_key_ref[vision_out_count];
+    float vision_value_ref[vision_out_count];
+    for (size_t i = 0; i < vision_qkv_count; i++) {
+        vision_qkv_host[i] = sinf((float)i * 0.29f);
+        vision_qkv_bf16[i] = f32_to_bf16(vision_qkv_host[i]);
+    }
+    for (size_t i = 0; i < vision_rope_count; i++) {
+        vision_rope_cos_host[i] = cosf((float)i * 0.37f);
+        vision_rope_sin_host[i] = sinf((float)i * 0.37f);
+        vision_rope_cos_bf16[i] = f32_to_bf16(vision_rope_cos_host[i]);
+        vision_rope_sin_bf16[i] = f32_to_bf16(vision_rope_sin_host[i]);
+    }
+    vision_qkv_rope_ref(vision_qkv_host, vision_rope_cos_host,
+                        vision_rope_sin_host, vision_query_ref, vision_key_ref,
+                        vision_value_ref, vision_sequence, vision_heads,
+                        vision_head_dim, vision_rope_half);
+    h3_gpu_tensor *vision_qkv =
+        h3_gpu_tensor_from_bf16(gpu, vision_qkv_bf16, vision_qkv_count);
+    h3_gpu_tensor *vision_rope_cos =
+        h3_gpu_tensor_from_bf16(gpu, vision_rope_cos_bf16, vision_rope_count);
+    h3_gpu_tensor *vision_rope_sin =
+        h3_gpu_tensor_from_bf16(gpu, vision_rope_sin_bf16, vision_rope_count);
+    h3_gpu_tensor *vision_query =
+        h3_gpu_tensor_new_bf16(gpu, vision_out_count);
+    h3_gpu_tensor *vision_key =
+        h3_gpu_tensor_new_bf16(gpu, vision_out_count);
+    h3_gpu_tensor *vision_value =
+        h3_gpu_tensor_new_bf16(gpu, vision_out_count);
+    check(vision_qkv && vision_rope_cos && vision_rope_sin && vision_query &&
+              vision_key && vision_value,
+          "vision_qkv_rope tensor alloc");
+    if (vision_qkv && vision_rope_cos && vision_rope_sin && vision_query &&
+        vision_key && vision_value) {
+        check(h3_gpu_vision_qkv_rope_bf16(
+                  gpu, vision_query, vision_key, vision_value, vision_qkv,
+                  vision_rope_cos, vision_rope_sin, vision_sequence,
+                  vision_heads, vision_head_dim, vision_rope_half),
+              "vision_qkv_rope");
+        check(h3_gpu_submit(gpu), "submit vision_qkv_rope");
+        check(h3_gpu_tensor_read_bf16(vision_query, vision_query_bf16,
+                                      vision_out_count),
+              "read vision query");
+        check(h3_gpu_tensor_read_bf16(vision_key, vision_key_bf16,
+                                      vision_out_count),
+              "read vision key");
+        check(h3_gpu_tensor_read_bf16(vision_value, vision_value_bf16,
+                                      vision_out_count),
+              "read vision value");
+        for (size_t i = 0; i < vision_out_count; i++) {
+            float got_q = bf16_to_f32(vision_query_bf16[i]);
+            float got_k = bf16_to_f32(vision_key_bf16[i]);
+            float got_v = bf16_to_f32(vision_value_bf16[i]);
+            if (fabsf(got_q - vision_query_ref[i]) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: vision query mismatch at %zu got=%f expected=%f\n",
+                        i, got_q, vision_query_ref[i]);
+                failures++;
+                break;
+            }
+            if (fabsf(got_k - vision_key_ref[i]) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: vision key mismatch at %zu got=%f expected=%f\n",
+                        i, got_k, vision_key_ref[i]);
+                failures++;
+                break;
+            }
+            if (fabsf(got_v - vision_value_ref[i]) >= 1e-2f) {
+                fprintf(stderr,
+                        "FAIL: vision value mismatch at %zu got=%f expected=%f\n",
+                        i, got_v, vision_value_ref[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
     const uint32_t sdpa_sequence = 4;
     const uint32_t sdpa_heads = 2;
     const uint32_t sdpa_head_dim = 8;
@@ -1212,6 +1452,118 @@ int main(void) {
                 fprintf(stderr,
                         "FAIL: rope_text key mismatch at %zu got=%f expected=%f\n",
                         i, got, text_rope_k_ref[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
+    const uint32_t qk_rope_sequence = 3;
+    const uint32_t qk_rope_q_heads = 4;
+    const uint32_t qk_rope_kv_heads = 2;
+    const uint32_t qk_rope_head_dim = 8;
+    const float qk_rope_epsilon = 1e-5f;
+    const size_t qk_rope_q_count =
+        (size_t)qk_rope_sequence * qk_rope_q_heads * qk_rope_head_dim;
+    const size_t qk_rope_kv_count =
+        (size_t)qk_rope_sequence * qk_rope_kv_heads * qk_rope_head_dim;
+    const size_t qk_rope_table_count =
+        (size_t)qk_rope_sequence * (qk_rope_head_dim / 2u);
+    float qk_rope_q_host[qk_rope_q_count];
+    float qk_rope_k_host[qk_rope_kv_count];
+    float qk_rope_q_weight_host[qk_rope_head_dim];
+    float qk_rope_k_weight_host[qk_rope_head_dim];
+    float qk_rope_cos_host[qk_rope_table_count];
+    float qk_rope_sin_host[qk_rope_table_count];
+    uint16_t qk_rope_q_bf16[qk_rope_q_count];
+    uint16_t qk_rope_k_bf16[qk_rope_kv_count];
+    uint16_t qk_rope_q_weight_bf16[qk_rope_head_dim];
+    uint16_t qk_rope_k_weight_bf16[qk_rope_head_dim];
+    uint16_t qk_rope_cos_bf16[qk_rope_table_count];
+    uint16_t qk_rope_sin_bf16[qk_rope_table_count];
+    uint16_t qk_rope_q_out_bf16[qk_rope_q_count];
+    uint16_t qk_rope_k_out_bf16[qk_rope_kv_count];
+    float qk_rope_q_ref[qk_rope_q_count];
+    float qk_rope_k_ref[qk_rope_kv_count];
+    float qk_rope_q_out_ref[qk_rope_q_count];
+    float qk_rope_k_out_ref[qk_rope_kv_count];
+    for (size_t i = 0; i < qk_rope_q_count; i++) {
+        qk_rope_q_host[i] = sinf((float)i * 0.19f);
+        qk_rope_q_bf16[i] = f32_to_bf16(qk_rope_q_host[i]);
+        qk_rope_q_ref[i] = qk_rope_q_host[i];
+    }
+    for (size_t i = 0; i < qk_rope_kv_count; i++) {
+        qk_rope_k_host[i] = cosf((float)i * 0.23f);
+        qk_rope_k_bf16[i] = f32_to_bf16(qk_rope_k_host[i]);
+        qk_rope_k_ref[i] = qk_rope_k_host[i];
+    }
+    for (uint32_t d = 0; d < qk_rope_head_dim; d++) {
+        qk_rope_q_weight_host[d] = 0.8f + 0.02f * (float)d;
+        qk_rope_k_weight_host[d] = 0.7f + 0.03f * (float)d;
+        qk_rope_q_weight_bf16[d] = f32_to_bf16(qk_rope_q_weight_host[d]);
+        qk_rope_k_weight_bf16[d] = f32_to_bf16(qk_rope_k_weight_host[d]);
+    }
+    for (size_t i = 0; i < qk_rope_table_count; i++) {
+        qk_rope_cos_host[i] = cosf((float)i * 0.41f);
+        qk_rope_sin_host[i] = sinf((float)i * 0.41f);
+        qk_rope_cos_bf16[i] = f32_to_bf16(qk_rope_cos_host[i]);
+        qk_rope_sin_bf16[i] = f32_to_bf16(qk_rope_sin_host[i]);
+    }
+    text_qk_rope_ref(qk_rope_q_ref, qk_rope_k_ref, qk_rope_q_weight_host,
+                     qk_rope_k_weight_host, qk_rope_cos_host, qk_rope_sin_host,
+                     qk_rope_q_out_ref, qk_rope_k_out_ref, qk_rope_sequence,
+                     qk_rope_q_heads, qk_rope_kv_heads, qk_rope_head_dim,
+                     qk_rope_epsilon);
+    h3_gpu_tensor *qk_rope_q_in =
+        h3_gpu_tensor_from_bf16(gpu, qk_rope_q_bf16, qk_rope_q_count);
+    h3_gpu_tensor *qk_rope_k_in =
+        h3_gpu_tensor_from_bf16(gpu, qk_rope_k_bf16, qk_rope_kv_count);
+    h3_gpu_tensor *qk_rope_q_weight =
+        h3_gpu_tensor_from_bf16(gpu, qk_rope_q_weight_bf16, qk_rope_head_dim);
+    h3_gpu_tensor *qk_rope_k_weight =
+        h3_gpu_tensor_from_bf16(gpu, qk_rope_k_weight_bf16, qk_rope_head_dim);
+    h3_gpu_tensor *qk_rope_cos =
+        h3_gpu_tensor_from_bf16(gpu, qk_rope_cos_bf16, qk_rope_table_count);
+    h3_gpu_tensor *qk_rope_sin =
+        h3_gpu_tensor_from_bf16(gpu, qk_rope_sin_bf16, qk_rope_table_count);
+    h3_gpu_tensor *qk_rope_q_out =
+        h3_gpu_tensor_new_bf16(gpu, qk_rope_q_count);
+    h3_gpu_tensor *qk_rope_k_out =
+        h3_gpu_tensor_new_bf16(gpu, qk_rope_kv_count);
+    check(qk_rope_q_in && qk_rope_k_in && qk_rope_q_weight && qk_rope_k_weight &&
+              qk_rope_cos && qk_rope_sin && qk_rope_q_out && qk_rope_k_out,
+          "text_qk_rope tensor alloc");
+    if (qk_rope_q_in && qk_rope_k_in && qk_rope_q_weight && qk_rope_k_weight &&
+        qk_rope_cos && qk_rope_sin && qk_rope_q_out && qk_rope_k_out) {
+        check(h3_gpu_text_qk_rope_bf16(
+                  gpu, qk_rope_q_out, qk_rope_k_out, qk_rope_q_in, qk_rope_k_in,
+                  qk_rope_q_weight, qk_rope_k_weight, qk_rope_cos, qk_rope_sin,
+                  qk_rope_sequence, qk_rope_q_heads, qk_rope_kv_heads,
+                  qk_rope_head_dim, qk_rope_epsilon),
+              "text_qk_rope");
+        check(h3_gpu_submit(gpu), "submit text_qk_rope");
+        check(h3_gpu_tensor_read_bf16(qk_rope_q_out, qk_rope_q_out_bf16,
+                                      qk_rope_q_count),
+              "read text_qk_rope query");
+        check(h3_gpu_tensor_read_bf16(qk_rope_k_out, qk_rope_k_out_bf16,
+                                      qk_rope_kv_count),
+              "read text_qk_rope key");
+        for (size_t i = 0; i < qk_rope_q_count; i++) {
+            float got = bf16_to_f32(qk_rope_q_out_bf16[i]);
+            if (fabsf(got - qk_rope_q_out_ref[i]) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: text_qk_rope query mismatch at %zu got=%f expected=%f\n",
+                        i, got, qk_rope_q_out_ref[i]);
+                failures++;
+                break;
+            }
+        }
+        for (size_t i = 0; i < qk_rope_kv_count; i++) {
+            float got = bf16_to_f32(qk_rope_k_out_bf16[i]);
+            if (fabsf(got - qk_rope_k_out_ref[i]) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: text_qk_rope key mismatch at %zu got=%f expected=%f\n",
+                        i, got, qk_rope_k_out_ref[i]);
                 failures++;
                 break;
             }

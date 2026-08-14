@@ -735,6 +735,148 @@ int h3_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_rms_norm_bf16");
 }
 
+__global__ static void h3_layer_norm_bf16_kernel(const uint16_t *input,
+                                                 const uint16_t *weight,
+                                                 const uint16_t *bias,
+                                                 uint16_t *output,
+                                                 h3_rms_norm_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.rows) return;
+
+    extern __shared__ float reductions[];
+    const uint16_t *row_input = input + (size_t)row * args.width;
+    float local_sum = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        local_sum += h3_bf16_bits_to_f32(row_input[column]);
+    }
+    reductions[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float mean = reductions[0] / (float)args.width;
+    __syncthreads();
+    float local_square = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float centered = h3_bf16_bits_to_f32(row_input[column]) - mean;
+        local_square = fmaf(centered, centered, local_square);
+    }
+    reductions[tid] = local_square;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float inverse =
+        rsqrtf(reductions[0] / (float)args.width + args.epsilon);
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float normalized =
+            (h3_bf16_bits_to_f32(row_input[column]) - mean) * inverse;
+        float value = fmaf(normalized, h3_bf16_bits_to_f32(weight[column]),
+                           h3_bf16_bits_to_f32(bias[column]));
+        output[(size_t)row * args.width + column] = h3_f32_to_bf16_bits(value);
+    }
+}
+
+int h3_gpu_layer_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *bias, uint32_t rows,
+                           uint32_t width, float epsilon) {
+    size_t count = (size_t)rows * width;
+    if (!gpu || !output || !input || !weight || !bias ||
+        output->dtype != H3_GPU_BF16 || input->dtype != H3_GPU_BF16 ||
+        weight->dtype != H3_GPU_BF16 || bias->dtype != H3_GPU_BF16 ||
+        output->elements < count || input->elements < count ||
+        weight->elements < width || bias->elements < width || !rows || !width)
+        return h3_gpu_fail(gpu, "invalid LayerNorm request");
+    h3_rms_norm_args args = {rows, width, epsilon};
+    unsigned threads = 256;
+    h3_layer_norm_bf16_kernel<<<rows, threads, threads * sizeof(float),
+                                  gpu->stream>>>(
+        (const uint16_t *)input->device, (const uint16_t *)weight->device,
+        (const uint16_t *)bias->device, (uint16_t *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_layer_norm_bf16");
+}
+
+struct h3_vision_qkv_rope_args {
+    uint32_t sequence;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t rope_half;
+};
+
+__global__ static void h3_vision_qkv_rope_bf16_kernel(
+    const uint16_t *qkv, const uint16_t *rope_cos, const uint16_t *rope_sin,
+    uint16_t *query, uint16_t *key, uint16_t *value,
+    h3_vision_qkv_rope_args args) {
+    uint32_t dimension = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t head = (uint32_t)blockIdx.y;
+    uint32_t row = (uint32_t)blockIdx.z;
+    if (dimension >= args.head_dim || head >= args.heads ||
+        row >= args.sequence)
+        return;
+    uint32_t inner = args.heads * args.head_dim;
+    size_t row_base = (size_t)row * inner * 3u;
+    size_t q_base = row_base + (size_t)head * args.head_dim;
+    size_t k_base = row_base + inner + (size_t)head * args.head_dim;
+    size_t v_base = row_base + inner * 2u + (size_t)head * args.head_dim;
+    uint32_t half_dim = args.rope_half;
+    uint32_t pair =
+        dimension < half_dim ? dimension + half_dim : dimension - half_dim;
+    float c = h3_bf16_bits_to_f32(
+        rope_cos[row * half_dim + (dimension % half_dim)]);
+    float s = h3_bf16_bits_to_f32(
+        rope_sin[row * half_dim + (dimension % half_dim)]);
+    float q0 = h3_bf16_bits_to_f32(qkv[q_base + dimension]);
+    float k0 = h3_bf16_bits_to_f32(qkv[k_base + dimension]);
+    float q1 = h3_bf16_bits_to_f32(qkv[q_base + pair]);
+    float k1 = h3_bf16_bits_to_f32(qkv[k_base + pair]);
+    float qr =
+        dimension < half_dim ? q0 * c - q1 * s : q0 * c + q1 * s;
+    float kr =
+        dimension < half_dim ? k0 * c - k1 * s : k0 * c + k1 * s;
+    size_t output_index =
+        ((size_t)row * args.heads + head) * args.head_dim + dimension;
+    query[output_index] = h3_f32_to_bf16_bits(qr);
+    key[output_index] = h3_f32_to_bf16_bits(kr);
+    value[output_index] = qkv[v_base + dimension];
+}
+
+int h3_gpu_vision_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                                h3_gpu_tensor *key, h3_gpu_tensor *value,
+                                const h3_gpu_tensor *qkv,
+                                const h3_gpu_tensor *rope_cos,
+                                const h3_gpu_tensor *rope_sin,
+                                uint32_t sequence, uint32_t heads,
+                                uint32_t head_dim, uint32_t rope_half) {
+    size_t inner = (size_t)heads * head_dim;
+    size_t count = (size_t)sequence * inner;
+    size_t rope_count = (size_t)sequence * rope_half;
+    if (!gpu || !query || !key || !value || !qkv || !rope_cos || !rope_sin ||
+        query->dtype != H3_GPU_BF16 || key->dtype != H3_GPU_BF16 ||
+        value->dtype != H3_GPU_BF16 || qkv->dtype != H3_GPU_BF16 ||
+        rope_cos->dtype != H3_GPU_BF16 || rope_sin->dtype != H3_GPU_BF16 ||
+        qkv->elements < count * 3u || rope_cos->elements < rope_count ||
+        rope_sin->elements < rope_count || query->elements < count ||
+        key->elements < count || value->elements < count || !sequence ||
+        !heads || !head_dim || rope_half * 2u != head_dim)
+        return h3_gpu_fail(gpu, "invalid vision QKV/RoPE request");
+    h3_vision_qkv_rope_args args = {sequence, heads, head_dim, rope_half};
+    dim3 threads(head_dim, 1, 1);
+    dim3 blocks(1, heads, sequence);
+    h3_vision_qkv_rope_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)qkv->device, (const uint16_t *)rope_cos->device,
+        (const uint16_t *)rope_sin->device, (uint16_t *)query->device,
+        (uint16_t *)key->device, (uint16_t *)value->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_vision_qkv_rope_bf16");
+}
+
 __global__ static void h3_linear_add_bias_bf16_kernel(uint16_t *output,
                                                       const uint16_t *bias,
                                                       uint32_t rows,
@@ -1531,6 +1673,112 @@ int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
         (const float *)rope_sin_f32->device, args);
     gpu->stats.direct_dispatches++;
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_rope_text_bf16");
+}
+
+struct h3_text_qk_rope_args {
+    uint32_t sequence;
+    uint32_t query_heads;
+    uint32_t kv_heads;
+    uint32_t head_dim;
+    float epsilon;
+};
+
+__global__ static void h3_text_qk_rope_bf16_kernel(
+    const uint16_t *query_input, const uint16_t *key_input,
+    const uint16_t *q_weight, const uint16_t *k_weight,
+    const uint16_t *rope_cos, const uint16_t *rope_sin,
+    uint16_t *query_output, uint16_t *key_output,
+    h3_text_qk_rope_args args) {
+    uint32_t dimension = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t head = (uint32_t)blockIdx.y;
+    uint32_t row = (uint32_t)blockIdx.z;
+    if (dimension >= args.head_dim || head >= args.query_heads ||
+        row >= args.sequence)
+        return;
+    uint32_t half_dim = args.head_dim / 2u;
+    uint32_t pair =
+        dimension < half_dim ? dimension + half_dim : dimension - half_dim;
+    float c = h3_bf16_bits_to_f32(
+        rope_cos[row * half_dim + (dimension % half_dim)]);
+    float s = h3_bf16_bits_to_f32(
+        rope_sin[row * half_dim + (dimension % half_dim)]);
+
+    size_t q_base = ((size_t)row * args.query_heads + head) * args.head_dim;
+    float q_sum = 0.0f;
+    for (uint32_t d = 0; d < args.head_dim; d++) {
+        float value = h3_bf16_bits_to_f32(query_input[q_base + d]);
+        q_sum = fmaf(value, value, q_sum);
+    }
+    float q_inverse = rsqrtf(q_sum / (float)args.head_dim + args.epsilon);
+    float q0 = h3_bf16_bits_to_f32(query_input[q_base + dimension]) *
+               q_inverse * h3_bf16_bits_to_f32(q_weight[dimension]);
+    float q1 = h3_bf16_bits_to_f32(query_input[q_base + pair]) * q_inverse *
+               h3_bf16_bits_to_f32(q_weight[pair]);
+    float q_rotated =
+        dimension < half_dim ? q0 * c - q1 * s : q0 * c + q1 * s;
+    query_output[q_base + dimension] = h3_f32_to_bf16_bits(q_rotated);
+
+    if (head < args.kv_heads) {
+        size_t k_base = ((size_t)row * args.kv_heads + head) * args.head_dim;
+        float k_sum = 0.0f;
+        for (uint32_t d = 0; d < args.head_dim; d++) {
+            float value = h3_bf16_bits_to_f32(key_input[k_base + d]);
+            k_sum = fmaf(value, value, k_sum);
+        }
+        float k_inverse = rsqrtf(k_sum / (float)args.head_dim + args.epsilon);
+        float k0 = h3_bf16_bits_to_f32(key_input[k_base + dimension]) *
+                   k_inverse * h3_bf16_bits_to_f32(k_weight[dimension]);
+        float k1 = h3_bf16_bits_to_f32(key_input[k_base + pair]) * k_inverse *
+                   h3_bf16_bits_to_f32(k_weight[pair]);
+        float k_rotated =
+            dimension < half_dim ? k0 * c - k1 * s : k0 * c + k1 * s;
+        key_output[k_base + dimension] = h3_f32_to_bf16_bits(k_rotated);
+    }
+}
+
+int h3_gpu_text_qk_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query_output,
+                             h3_gpu_tensor *key_output,
+                             const h3_gpu_tensor *query_input,
+                             const h3_gpu_tensor *key_input,
+                             const h3_gpu_tensor *q_norm,
+                             const h3_gpu_tensor *k_norm,
+                             const h3_gpu_tensor *rope_cos,
+                             const h3_gpu_tensor *rope_sin,
+                             uint32_t sequence, uint32_t query_heads,
+                             uint32_t kv_heads, uint32_t head_dim,
+                             float epsilon) {
+    size_t query_count = (size_t)sequence * query_heads * head_dim;
+    size_t key_count = (size_t)sequence * kv_heads * head_dim;
+    size_t rope_count = (size_t)sequence * (head_dim / 2u);
+    if (!gpu || !query_output || !key_output || !query_input || !key_input ||
+        !q_norm || !k_norm || !rope_cos || !rope_sin ||
+        query_output->dtype != H3_GPU_BF16 ||
+        key_output->dtype != H3_GPU_BF16 ||
+        query_input->dtype != H3_GPU_BF16 ||
+        key_input->dtype != H3_GPU_BF16 || q_norm->dtype != H3_GPU_BF16 ||
+        k_norm->dtype != H3_GPU_BF16 || rope_cos->dtype != H3_GPU_BF16 ||
+        rope_sin->dtype != H3_GPU_BF16 ||
+        query_output->elements < query_count ||
+        key_output->elements < key_count ||
+        query_input->elements < query_count ||
+        key_input->elements < key_count || q_norm->elements < head_dim ||
+        k_norm->elements < head_dim || rope_cos->elements < rope_count ||
+        rope_sin->elements < rope_count || !sequence || !query_heads ||
+        !kv_heads || !head_dim || head_dim % 2u || query_heads % kv_heads)
+        return h3_gpu_fail(gpu, "invalid text QK/RoPE request");
+    h3_text_qk_rope_args args = {sequence, query_heads, kv_heads, head_dim,
+                                 epsilon};
+    dim3 threads(head_dim, 1, 1);
+    dim3 blocks(1, query_heads, sequence);
+    h3_text_qk_rope_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)query_input->device,
+        (const uint16_t *)key_input->device,
+        (const uint16_t *)q_norm->device, (const uint16_t *)k_norm->device,
+        (const uint16_t *)rope_cos->device, (const uint16_t *)rope_sin->device,
+        (uint16_t *)query_output->device, (uint16_t *)key_output->device,
+        args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_gpu_text_qk_rope_bf16");
 }
 
 struct h3_gqa_args {

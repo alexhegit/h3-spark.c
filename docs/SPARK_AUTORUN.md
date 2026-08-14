@@ -19,8 +19,8 @@ GB10 `sm_121` already sets `h3_gpu_has_int8_mlp()=true`; int8 kernels are stubs 
 ## Gate commands
 
 ```bash
-make -f Makefile.linux test          # h3_tests + cuda smoke/ops + dit/text smoke
-make -f Makefile.linux test-step      # 50-block DiT step + 50-layer Qwen (~minutes)
+make -f Makefile.linux test          # h3_tests + cuda smoke/ops + dit/text/tokenizer smoke
+make -f Makefile.linux test-step      # 50-block DiT step + 50-layer Qwen + dit forward
 make -f Makefile.linux probe          # CUDA device probe (GB10 sm_121)
 make -f Makefile.linux h3             # full CLI binary
 H3_MODEL_ROOT=/path/to/MiniMax-H3 make -f Makefile.linux test
@@ -37,27 +37,30 @@ sub, euler.
 
 Text encoder: head_rms_norm, rope_text (F32 tables), gqa_causal, silu_mul.
 
+Vision prep: layer_norm_bf16, text_qk_rope_bf16, vision_qkv_rope_bf16.
+
 - [x] `tests/test_cuda_ops.c` — CPU oracle for all above
 - [x] `tests/test_cuda_dit_block_smoke.c` — block-0 + 50-block step
 - [x] `tests/test_cuda_text_smoke.c` — Qwen layer-0 + optional 50-layer
-- [x] Stubs remaining: **34**
-- [ ] `text_qk_rope_bf16` (refiner), `layer_norm_bf16` (vision)
-- [ ] Full `h3_dit` forward smoke via production API
+- [x] `tests/test_cuda_dit_forward_smoke.c` — production `h3_dit_forward` (25/50 blocks)
+- [x] Tokenizer smoke in `make test`
+- [x] Stubs remaining: **31**
 - [ ] Phase 2 INT8 stack
 
 ### Tokenizer
 
 - [x] Full `h3_tokenizer.c` BPE port
-- [ ] Tokenizer smoke in `make test` — symlink `MiniMax-H3/tokenizer/tokenizer.json`
+- [x] Tokenizer smoke in `make test`
 
 ## Commits (autoloop)
 
 ```
+d7b6b1e DiT forward smoke (25/50 blocks)
+5dcff89 patch_linear, gate_adaln, adaln_linear
 cfc365e Token pool/expand + sub/euler
 de4e1c3 DiT attention + Qwen text ops + weight smokes
-2773758 GELU + embedding
 ```
 
 ---
 
-*Last updated: 2026-08-13*
+*Last updated: 2026-08-14*

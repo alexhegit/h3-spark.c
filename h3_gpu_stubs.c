@@ -282,25 +282,6 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_gpu_stub_impl(gpu, "h3_gpu_mlp_int8_bf16");
 }
 
-int h3_gpu_layer_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                           const h3_gpu_tensor *input,
-                           const h3_gpu_tensor *weight,
-                           const h3_gpu_tensor *bias, uint32_t rows,
-                           uint32_t width, float epsilon) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_layer_norm_bf16");
-}
-
-int h3_gpu_vision_qkv_rope_bf16(
-                     h3_gpu *gpu, h3_gpu_tensor *query,
-                     h3_gpu_tensor *key, h3_gpu_tensor *value,
-                     const h3_gpu_tensor *qkv,
-                     const h3_gpu_tensor *rope_cos,
-                     const h3_gpu_tensor *rope_sin, uint32_t sequence,
-                     uint32_t heads, uint32_t head_dim,
-                     uint32_t rope_half) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_vision_qkv_rope_bf16");
-}
-
 int h3_gpu_gate_adaln_quantize_int8(
                      h3_gpu *gpu, h3_gpu_tensor *gated_residual,
                      h3_gpu_tensor *quantized_output,
@@ -339,20 +320,5 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int use_slower_scalar_qkv_rms,
                                  int use_slower_uncached_int8_scales) {
     return h3_gpu_stub_impl(gpu, "h3_gpu_grouped_qkv_linear_rope_int8");
-}
-
-int h3_gpu_text_qk_rope_bf16(h3_gpu *gpu,
-                             h3_gpu_tensor *query_output,
-                             h3_gpu_tensor *key_output,
-                             const h3_gpu_tensor *query_input,
-                             const h3_gpu_tensor *key_input,
-                             const h3_gpu_tensor *q_norm,
-                             const h3_gpu_tensor *k_norm,
-                             const h3_gpu_tensor *rope_cos,
-                             const h3_gpu_tensor *rope_sin,
-                             uint32_t sequence, uint32_t query_heads,
-                             uint32_t kv_heads, uint32_t head_dim,
-                             float epsilon) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_text_qk_rope_bf16");
 }
 
