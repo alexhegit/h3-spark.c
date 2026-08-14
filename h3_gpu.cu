@@ -2693,6 +2693,113 @@ int h3_gpu_adaln_linear_bf16(
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_adaln_linear_bf16");
 }
 
+struct h3_scale_add_args {
+    uint32_t rows;
+    uint32_t width;
+};
+
+__global__ static void h3_scale_add_f32_kernel(const float *residual,
+                                               const float *branch,
+                                               const float *scale, float *output,
+                                               h3_scale_add_args args) {
+    uint32_t column = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t row = (uint32_t)blockIdx.y;
+    if (row >= args.rows || column >= args.width) return;
+    size_t index = (size_t)row * args.width + column;
+    output[index] = residual[index] + branch[index] * scale[column];
+}
+
+int h3_gpu_scale_add_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *residual,
+                         const h3_gpu_tensor *branch,
+                         const h3_gpu_tensor *scale, uint32_t rows,
+                         uint32_t width) {
+    size_t count = (size_t)rows * width;
+    if (!gpu || !output || !residual || !branch || !scale ||
+        output->dtype != H3_GPU_F32 || residual->dtype != H3_GPU_F32 ||
+        branch->dtype != H3_GPU_F32 || scale->dtype != H3_GPU_F32 ||
+        output->elements < count || residual->elements < count ||
+        branch->elements < count || scale->elements < width || !rows || !width)
+        return h3_gpu_fail(gpu, "invalid scale-add request");
+    h3_scale_add_args args = {rows, width};
+    dim3 threads(256, 1, 1);
+    dim3 blocks((width + 255u) / 256u, rows, 1);
+    h3_scale_add_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)residual->device, (const float *)branch->device,
+        (const float *)scale->device, (float *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_scale_add_f32");
+}
+
+struct h3_add_scaled_args {
+    uint32_t elements;
+    float left_scale;
+    float right_scale;
+};
+
+__global__ static void h3_add_scaled_f32_kernel(const float *left,
+                                                const float *right,
+                                                float *output,
+                                                h3_add_scaled_args args) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= args.elements) return;
+    output[index] =
+        left[index] * args.left_scale + right[index] * args.right_scale;
+}
+
+int h3_gpu_add_scaled_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *left,
+                          const h3_gpu_tensor *right, float left_scale,
+                          float right_scale, uint32_t elements) {
+    if (!gpu || !output || !left || !right ||
+        output->dtype != H3_GPU_F32 || left->dtype != H3_GPU_F32 ||
+        right->dtype != H3_GPU_F32 || output->elements < elements ||
+        left->elements < elements || right->elements < elements || !elements)
+        return h3_gpu_fail(gpu, "invalid add-scaled request");
+    h3_add_scaled_args args = {elements, left_scale, right_scale};
+    unsigned threads = 256;
+    unsigned blocks =
+        (unsigned)(((size_t)elements + threads - 1) / threads);
+    h3_add_scaled_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)left->device, (const float *)right->device,
+        (float *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_add_scaled_f32");
+}
+
+struct h3_clip_args {
+    uint32_t elements;
+    float minimum;
+    float maximum;
+};
+
+__global__ static void h3_clip_f32_kernel(const float *input, float *output,
+                                          h3_clip_args args) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= args.elements) return;
+    float value = input[index];
+    if (value < args.minimum) value = args.minimum;
+    if (value > args.maximum) value = args.maximum;
+    output[index] = value;
+}
+
+int h3_gpu_clip_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *input, uint32_t elements,
+                    float minimum, float maximum) {
+    if (!gpu || !output || !input || output->dtype != H3_GPU_F32 ||
+        input->dtype != H3_GPU_F32 || output->elements < elements ||
+        input->elements < elements || !elements || minimum > maximum)
+        return h3_gpu_fail(gpu, "invalid clip request");
+    h3_clip_args args = {elements, minimum, maximum};
+    unsigned threads = 256;
+    unsigned blocks =
+        (unsigned)(((size_t)elements + threads - 1) / threads);
+    h3_clip_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)input->device, (float *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_clip_f32");
+}
+
 int h3_gpu_begin(h3_gpu *gpu) {
     if (!gpu) return 0;
     gpu->error[0] = '\0';

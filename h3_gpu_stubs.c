@@ -57,14 +57,6 @@ int h3_gpu_swiglu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_gpu_stub_impl(gpu, "h3_gpu_swiglu_f32");
 }
 
-int h3_gpu_scale_add_f32(h3_gpu *gpu, h3_gpu_tensor *output,
-                         const h3_gpu_tensor *residual,
-                         const h3_gpu_tensor *branch,
-                         const h3_gpu_tensor *scale, uint32_t rows,
-                         uint32_t width) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_scale_add_f32");
-}
-
 int h3_gpu_layer_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                           const h3_gpu_tensor *input,
                           const h3_gpu_tensor *weight,
@@ -123,13 +115,6 @@ int h3_gpu_weight_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_gpu_stub_impl(gpu, "h3_gpu_weight_norm_f32");
 }
 
-int h3_gpu_add_scaled_f32(h3_gpu *gpu, h3_gpu_tensor *output,
-                          const h3_gpu_tensor *left,
-                          const h3_gpu_tensor *right, float left_scale,
-                          float right_scale, uint32_t elements) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_add_scaled_f32");
-}
-
 int h3_gpu_alias_free_snake_f32(
                           h3_gpu *gpu, h3_gpu_tensor *output,
                           const h3_gpu_tensor *input,
@@ -181,12 +166,6 @@ int h3_gpu_geglu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *gate,
                      const h3_gpu_tensor *linear, uint32_t elements) {
     return h3_gpu_stub_impl(gpu, "h3_gpu_geglu_f32");
-}
-
-int h3_gpu_clip_f32(h3_gpu *gpu, h3_gpu_tensor *output,
-                    const h3_gpu_tensor *input, uint32_t elements,
-                    float minimum, float maximum) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_clip_f32");
 }
 
 int h3_gpu_vae_encoder_pad_f32(

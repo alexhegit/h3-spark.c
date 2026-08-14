@@ -1077,6 +1077,117 @@ int main(void) {
         }
     }
 
+    const uint32_t f32_elem_count = 64;
+    float f32_left_host[f32_elem_count];
+    float f32_right_host[f32_elem_count];
+    float f32_scale_host[8];
+    float f32_clip_host[f32_elem_count];
+    float f32_add_scaled_ref[f32_elem_count];
+    float f32_scale_add_ref[f32_elem_count];
+    float f32_clip_ref[f32_elem_count];
+    for (uint32_t i = 0; i < f32_elem_count; i++) {
+        f32_left_host[i] = sinf((float)i * 0.13f);
+        f32_right_host[i] = cosf((float)i * 0.09f);
+        f32_clip_host[i] = sinf((float)i * 0.41f) * 3.0f;
+        f32_add_scaled_ref[i] = f32_left_host[i] * 0.25f + f32_right_host[i] * 0.75f;
+        f32_clip_ref[i] = f32_clip_host[i];
+        if (f32_clip_ref[i] < -1.0f) f32_clip_ref[i] = -1.0f;
+        if (f32_clip_ref[i] > 1.0f) f32_clip_ref[i] = 1.0f;
+    }
+    for (uint32_t i = 0; i < 8u; i++)
+        f32_scale_host[i] = 0.5f + 0.05f * (float)i;
+    const uint32_t scale_add_rows = 8;
+    const uint32_t scale_add_width = 8;
+    for (uint32_t row = 0; row < scale_add_rows; row++) {
+        for (uint32_t column = 0; column < scale_add_width; column++) {
+            size_t index = (size_t)row * scale_add_width + column;
+            f32_scale_add_ref[index] =
+                f32_left_host[index] + f32_right_host[index] * f32_scale_host[column];
+        }
+    }
+    h3_gpu_tensor *f32_left_t =
+        h3_gpu_tensor_from_f32(gpu, f32_left_host, f32_elem_count);
+    h3_gpu_tensor *f32_right_t =
+        h3_gpu_tensor_from_f32(gpu, f32_right_host, f32_elem_count);
+    h3_gpu_tensor *f32_out_t = h3_gpu_tensor_new_f32(gpu, f32_elem_count);
+    check(f32_left_t && f32_right_t && f32_out_t, "f32 elementwise alloc");
+    if (f32_left_t && f32_right_t && f32_out_t) {
+        check(h3_gpu_add_scaled_f32(gpu, f32_out_t, f32_left_t, f32_right_t,
+                                    0.25f, 0.75f, f32_elem_count),
+              "add_scaled_f32");
+        check(h3_gpu_submit(gpu), "submit add_scaled_f32");
+        float f32_add_scaled_out[f32_elem_count];
+        check(h3_gpu_tensor_read_f32(f32_out_t, f32_add_scaled_out,
+                                     f32_elem_count),
+              "read add_scaled_f32");
+        for (uint32_t i = 0; i < f32_elem_count; i++) {
+            if (fabsf(f32_add_scaled_out[i] - f32_add_scaled_ref[i]) >= 1e-5f) {
+                fprintf(stderr,
+                        "FAIL: add_scaled_f32 mismatch at %u got=%f expected=%f\n",
+                        i, f32_add_scaled_out[i], f32_add_scaled_ref[i]);
+                failures++;
+                break;
+            }
+        }
+        h3_gpu_tensor *f32_clip_in_t =
+            h3_gpu_tensor_from_f32(gpu, f32_clip_host, f32_elem_count);
+        check(f32_clip_in_t, "clip_f32 input alloc");
+        if (f32_clip_in_t) {
+            check(h3_gpu_clip_f32(gpu, f32_out_t, f32_clip_in_t, f32_elem_count,
+                                  -1.0f, 1.0f),
+                  "clip_f32");
+            check(h3_gpu_submit(gpu), "submit clip_f32");
+            float f32_clip_out[f32_elem_count];
+            check(h3_gpu_tensor_read_f32(f32_out_t, f32_clip_out, f32_elem_count),
+                  "read clip_f32");
+            for (uint32_t i = 0; i < f32_elem_count; i++) {
+                if (fabsf(f32_clip_out[i] - f32_clip_ref[i]) >= 1e-6f) {
+                    fprintf(stderr,
+                            "FAIL: clip_f32 mismatch at %u got=%f expected=%f\n",
+                            i, f32_clip_out[i], f32_clip_ref[i]);
+                    failures++;
+                    break;
+                }
+            }
+            h3_gpu_tensor_free(f32_clip_in_t);
+        }
+        h3_gpu_tensor *f32_residual_t =
+            h3_gpu_tensor_from_f32(gpu, f32_left_host, scale_add_rows * scale_add_width);
+        h3_gpu_tensor *f32_branch_t =
+            h3_gpu_tensor_from_f32(gpu, f32_right_host, scale_add_rows * scale_add_width);
+        h3_gpu_tensor *f32_scale_t =
+            h3_gpu_tensor_from_f32(gpu, f32_scale_host, scale_add_width);
+        h3_gpu_tensor *f32_scale_add_out =
+            h3_gpu_tensor_new_f32(gpu, (size_t)scale_add_rows * scale_add_width);
+        check(f32_residual_t && f32_branch_t && f32_scale_t && f32_scale_add_out,
+              "scale_add_f32 alloc");
+        if (f32_residual_t && f32_branch_t && f32_scale_t && f32_scale_add_out) {
+            check(h3_gpu_scale_add_f32(gpu, f32_scale_add_out, f32_residual_t,
+                                       f32_branch_t, f32_scale_t,
+                                       scale_add_rows, scale_add_width),
+                  "scale_add_f32");
+            check(h3_gpu_submit(gpu), "submit scale_add_f32");
+            float f32_scale_add_out_host[scale_add_rows * scale_add_width];
+            check(h3_gpu_tensor_read_f32(
+                      f32_scale_add_out, f32_scale_add_out_host,
+                      (size_t)scale_add_rows * scale_add_width),
+                  "read scale_add_f32");
+            for (size_t i = 0; i < (size_t)scale_add_rows * scale_add_width; i++) {
+                if (fabsf(f32_scale_add_out_host[i] - f32_scale_add_ref[i]) >= 1e-5f) {
+                    fprintf(stderr,
+                            "FAIL: scale_add_f32 mismatch at %zu got=%f expected=%f\n",
+                            i, f32_scale_add_out_host[i], f32_scale_add_ref[i]);
+                    failures++;
+                    break;
+                }
+            }
+            h3_gpu_tensor_free(f32_scale_add_out);
+        }
+        h3_gpu_tensor_free(f32_residual_t);
+        h3_gpu_tensor_free(f32_branch_t);
+        h3_gpu_tensor_free(f32_scale_t);
+    }
+
     const uint32_t qkv_sequence = 3;
     const uint32_t qkv_heads = 2;
     const uint32_t qkv_head_dim = 8;

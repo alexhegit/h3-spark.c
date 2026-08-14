@@ -44,7 +44,7 @@ Vision prep: layer_norm_bf16, text_qk_rope_bf16, vision_qkv_rope_bf16.
 - [x] `tests/test_cuda_text_smoke.c` — Qwen layer-0 + optional 50-layer
 - [x] `tests/test_cuda_dit_forward_smoke.c` — production `h3_dit_forward` (25/50 blocks)
 - [x] Tokenizer smoke in `make test`
-- [x] Stubs remaining: **31**
+- [x] Stubs remaining: **28**
 - [ ] Phase 2 INT8 stack
 
 ### Tokenizer
