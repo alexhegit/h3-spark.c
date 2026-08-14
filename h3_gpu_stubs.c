@@ -51,20 +51,6 @@ int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_gpu_stub_impl(gpu, "h3_gpu_sdpa_f32");
 }
 
-int h3_gpu_swiglu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
-                      const h3_gpu_tensor *fused, uint32_t rows,
-                      uint32_t width) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_swiglu_f32");
-}
-
-int h3_gpu_layer_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
-                          const h3_gpu_tensor *input,
-                          const h3_gpu_tensor *weight,
-                          const h3_gpu_tensor *bias, uint32_t rows,
-                          uint32_t width, float epsilon) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_layer_norm_f32");
-}
-
 int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
                               h3_gpu_tensor *key, h3_gpu_tensor *value,
                               const h3_gpu_tensor *qkv,
@@ -160,12 +146,6 @@ int h3_gpu_audio_attention_pool_f32(h3_gpu *gpu,
                        uint32_t length, uint32_t heads,
                        uint32_t head_dim, uint32_t output_dim) {
     return h3_gpu_stub_impl(gpu, "h3_gpu_audio_attention_pool_f32");
-}
-
-int h3_gpu_geglu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
-                     const h3_gpu_tensor *gate,
-                     const h3_gpu_tensor *linear, uint32_t elements) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_geglu_f32");
 }
 
 int h3_gpu_vae_encoder_pad_f32(

@@ -37,6 +37,8 @@ sub, euler.
 
 Text encoder: head_rms_norm, rope_text (F32 tables), gqa_causal, silu_mul.
 
+Audio/VAE prep (F32): scale_add, add_scaled, clip, layer_norm, swiglu, geglu.
+
 Vision prep: layer_norm_bf16, text_qk_rope_bf16, vision_qkv_rope_bf16.
 
 - [x] `tests/test_cuda_ops.c` — CPU oracle for all above

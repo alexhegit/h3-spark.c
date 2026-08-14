@@ -2731,6 +2731,129 @@ int h3_gpu_scale_add_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_scale_add_f32");
 }
 
+__global__ static void h3_layer_norm_f32_kernel(const float *input,
+                                                const float *weight,
+                                                const float *bias, float *output,
+                                                h3_rms_norm_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.rows) return;
+
+    extern __shared__ float reductions[];
+    const float *row_input = input + (size_t)row * args.width;
+    float local_sum = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads)
+        local_sum += row_input[column];
+    reductions[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float mean = reductions[0] / (float)args.width;
+    __syncthreads();
+    float local_square = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float centered = row_input[column] - mean;
+        local_square = fmaf(centered, centered, local_square);
+    }
+    reductions[tid] = local_square;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float inverse =
+        rsqrtf(reductions[0] / (float)args.width + args.epsilon);
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        output[(size_t)row * args.width + column] =
+            (row_input[column] - mean) * inverse * weight[column] +
+            bias[column];
+    }
+}
+
+int h3_gpu_layer_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input,
+                          const h3_gpu_tensor *weight,
+                          const h3_gpu_tensor *bias, uint32_t rows,
+                          uint32_t width, float epsilon) {
+    size_t count = (size_t)rows * width;
+    if (!gpu || !output || !input || !weight || !bias ||
+        output->dtype != H3_GPU_F32 || input->dtype != H3_GPU_F32 ||
+        weight->dtype != H3_GPU_F32 || bias->dtype != H3_GPU_F32 ||
+        output->elements < count || input->elements < count ||
+        weight->elements < width || bias->elements < width || !rows || !width)
+        return h3_gpu_fail(gpu, "invalid F32 LayerNorm request");
+    h3_rms_norm_args args = {rows, width, epsilon};
+    unsigned threads = 256;
+    h3_layer_norm_f32_kernel<<<rows, threads, threads * sizeof(float),
+                                 gpu->stream>>>(
+        (const float *)input->device, (const float *)weight->device,
+        (const float *)bias->device, (float *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_layer_norm_f32");
+}
+
+__global__ static void h3_swiglu_f32_kernel(const float *fused, float *output,
+                                            h3_swiglu_args args) {
+    uint32_t column = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t row = (uint32_t)blockIdx.y;
+    if (row >= args.rows || column >= args.width) return;
+    size_t base = (size_t)row * args.width + column;
+    size_t fused_base = (size_t)row * args.width * 2u;
+    float gate = fused[fused_base + column];
+    float up = fused[fused_base + args.width + column];
+    output[base] = gate / (1.0f + expf(-gate)) * up;
+}
+
+int h3_gpu_swiglu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *fused, uint32_t rows,
+                      uint32_t width) {
+    size_t fused_count = (size_t)rows * width * 2u;
+    size_t output_count = (size_t)rows * width;
+    if (!gpu || !output || !fused || output->dtype != H3_GPU_F32 ||
+        fused->dtype != H3_GPU_F32 || output->elements < output_count ||
+        fused->elements < fused_count || !rows || !width)
+        return h3_gpu_fail(gpu, "invalid F32 SwiGLU request");
+    h3_swiglu_args args = {rows, width};
+    dim3 threads(256, 1, 1);
+    dim3 blocks((width + threads.x - 1) / threads.x, rows, 1);
+    h3_swiglu_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)fused->device, (float *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_swiglu_f32");
+}
+
+__global__ static void h3_geglu_f32_kernel(const float *gate, const float *linear,
+                                         float *output, uint32_t count) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    float x = gate[index];
+    float cube = x * x * x;
+    float inner = 0.7978845608028654f * (x + 0.044715f * cube);
+    float gelu = 0.5f * x * (1.0f + tanhf(inner));
+    output[index] = gelu * linear[index];
+}
+
+int h3_gpu_geglu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *gate, const h3_gpu_tensor *linear,
+                     uint32_t elements) {
+    if (!gpu || !output || !gate || !linear ||
+        output->dtype != H3_GPU_F32 || gate->dtype != H3_GPU_F32 ||
+        linear->dtype != H3_GPU_F32 || output->elements < elements ||
+        gate->elements < elements || linear->elements < elements || !elements)
+        return h3_gpu_fail(gpu, "invalid GeGLU request");
+    unsigned threads = 256;
+    unsigned blocks =
+        (unsigned)(((size_t)elements + threads - 1) / threads);
+    h3_geglu_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)gate->device, (const float *)linear->device,
+        (float *)output->device, elements);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_geglu_f32");
+}
+
 struct h3_add_scaled_args {
     uint32_t elements;
     float left_scale;

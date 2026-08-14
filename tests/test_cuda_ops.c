@@ -1188,6 +1188,128 @@ int main(void) {
         h3_gpu_tensor_free(f32_scale_t);
     }
 
+    const uint32_t f32_ln_rows = 4;
+    const uint32_t f32_ln_width = 64;
+    const size_t f32_ln_count = (size_t)f32_ln_rows * f32_ln_width;
+    float f32_ln_in_host[f32_ln_count];
+    float f32_ln_weight_host[f32_ln_width];
+    float f32_ln_bias_host[f32_ln_width];
+    float f32_ln_ref[f32_ln_count];
+    for (uint32_t column = 0; column < f32_ln_width; column++) {
+        f32_ln_weight_host[column] = 0.5f + 0.01f * (float)column;
+        f32_ln_bias_host[column] = -0.01f + 0.005f * (float)column;
+    }
+    for (uint32_t row = 0; row < f32_ln_rows; row++) {
+        for (uint32_t column = 0; column < f32_ln_width; column++) {
+            size_t index = (size_t)row * f32_ln_width + column;
+            f32_ln_in_host[index] = sinf((float)index * 0.07f);
+        }
+    }
+    layer_norm_ref(f32_ln_in_host, f32_ln_weight_host, f32_ln_bias_host,
+                   f32_ln_ref, f32_ln_rows, f32_ln_width, 1e-5f);
+    h3_gpu_tensor *f32_ln_in =
+        h3_gpu_tensor_from_f32(gpu, f32_ln_in_host, f32_ln_count);
+    h3_gpu_tensor *f32_ln_weight =
+        h3_gpu_tensor_from_f32(gpu, f32_ln_weight_host, f32_ln_width);
+    h3_gpu_tensor *f32_ln_bias =
+        h3_gpu_tensor_from_f32(gpu, f32_ln_bias_host, f32_ln_width);
+    h3_gpu_tensor *f32_ln_out = h3_gpu_tensor_new_f32(gpu, f32_ln_count);
+    check(f32_ln_in && f32_ln_weight && f32_ln_bias && f32_ln_out,
+          "layer_norm_f32 alloc");
+    if (f32_ln_in && f32_ln_weight && f32_ln_bias && f32_ln_out) {
+        check(h3_gpu_layer_norm_f32(gpu, f32_ln_out, f32_ln_in, f32_ln_weight,
+                                    f32_ln_bias, f32_ln_rows, f32_ln_width,
+                                    1e-5f),
+              "layer_norm_f32");
+        check(h3_gpu_submit(gpu), "submit layer_norm_f32");
+        float f32_ln_out_host[f32_ln_count];
+        check(h3_gpu_tensor_read_f32(f32_ln_out, f32_ln_out_host, f32_ln_count),
+              "read layer_norm_f32");
+        for (size_t i = 0; i < f32_ln_count; i++) {
+            if (fabsf(f32_ln_out_host[i] - f32_ln_ref[i]) >= 1e-4f) {
+                fprintf(stderr,
+                        "FAIL: layer_norm_f32 mismatch at %zu got=%f expected=%f\n",
+                        i, f32_ln_out_host[i], f32_ln_ref[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
+    const uint32_t f32_swiglu_rows = 4;
+    const uint32_t f32_swiglu_width = 32;
+    const size_t f32_swiglu_fused_count =
+        (size_t)f32_swiglu_rows * f32_swiglu_width * 2u;
+    const size_t f32_swiglu_out_count =
+        (size_t)f32_swiglu_rows * f32_swiglu_width;
+    float f32_swiglu_fused_host[f32_swiglu_fused_count];
+    float f32_swiglu_ref[f32_swiglu_out_count];
+    for (size_t i = 0; i < f32_swiglu_fused_count; i++)
+        f32_swiglu_fused_host[i] = sinf((float)i * 0.11f);
+    swiglu_ref(f32_swiglu_fused_host, f32_swiglu_ref, f32_swiglu_rows,
+               f32_swiglu_width);
+    h3_gpu_tensor *f32_swiglu_fused =
+        h3_gpu_tensor_from_f32(gpu, f32_swiglu_fused_host, f32_swiglu_fused_count);
+    h3_gpu_tensor *f32_swiglu_out =
+        h3_gpu_tensor_new_f32(gpu, f32_swiglu_out_count);
+    check(f32_swiglu_fused && f32_swiglu_out, "swiglu_f32 alloc");
+    if (f32_swiglu_fused && f32_swiglu_out) {
+        check(h3_gpu_swiglu_f32(gpu, f32_swiglu_out, f32_swiglu_fused,
+                                f32_swiglu_rows, f32_swiglu_width),
+              "swiglu_f32");
+        check(h3_gpu_submit(gpu), "submit swiglu_f32");
+        float f32_swiglu_out_host[f32_swiglu_out_count];
+        check(h3_gpu_tensor_read_f32(f32_swiglu_out, f32_swiglu_out_host,
+                                     f32_swiglu_out_count),
+              "read swiglu_f32");
+        for (size_t i = 0; i < f32_swiglu_out_count; i++) {
+            if (fabsf(f32_swiglu_out_host[i] - f32_swiglu_ref[i]) >= 1e-4f) {
+                fprintf(stderr,
+                        "FAIL: swiglu_f32 mismatch at %zu got=%f expected=%f\n",
+                        i, f32_swiglu_out_host[i], f32_swiglu_ref[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
+    const uint32_t f32_geglu_count = 64;
+    float f32_geglu_gate_host[f32_geglu_count];
+    float f32_geglu_linear_host[f32_geglu_count];
+    float f32_geglu_ref[f32_geglu_count];
+    for (uint32_t i = 0; i < f32_geglu_count; i++) {
+        f32_geglu_gate_host[i] = sinf((float)i * 0.17f);
+        f32_geglu_linear_host[i] = cosf((float)i * 0.13f);
+        f32_geglu_ref[i] =
+            gelu_ref(f32_geglu_gate_host[i], 1) * f32_geglu_linear_host[i];
+    }
+    h3_gpu_tensor *f32_geglu_gate =
+        h3_gpu_tensor_from_f32(gpu, f32_geglu_gate_host, f32_geglu_count);
+    h3_gpu_tensor *f32_geglu_linear =
+        h3_gpu_tensor_from_f32(gpu, f32_geglu_linear_host, f32_geglu_count);
+    h3_gpu_tensor *f32_geglu_out =
+        h3_gpu_tensor_new_f32(gpu, f32_geglu_count);
+    check(f32_geglu_gate && f32_geglu_linear && f32_geglu_out, "geglu_f32 alloc");
+    if (f32_geglu_gate && f32_geglu_linear && f32_geglu_out) {
+        check(h3_gpu_geglu_f32(gpu, f32_geglu_out, f32_geglu_gate,
+                               f32_geglu_linear, f32_geglu_count),
+              "geglu_f32");
+        check(h3_gpu_submit(gpu), "submit geglu_f32");
+        float f32_geglu_out_host[f32_geglu_count];
+        check(h3_gpu_tensor_read_f32(f32_geglu_out, f32_geglu_out_host,
+                                     f32_geglu_count),
+              "read geglu_f32");
+        for (uint32_t i = 0; i < f32_geglu_count; i++) {
+            if (fabsf(f32_geglu_out_host[i] - f32_geglu_ref[i]) >= 1e-4f) {
+                fprintf(stderr,
+                        "FAIL: geglu_f32 mismatch at %u got=%f expected=%f\n",
+                        i, f32_geglu_out_host[i], f32_geglu_ref[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
     const uint32_t qkv_sequence = 3;
     const uint32_t qkv_heads = 2;
     const uint32_t qkv_head_dim = 8;
