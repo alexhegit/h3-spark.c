@@ -48,6 +48,9 @@ h3_cuda_dit_block_smoke: tests/test_cuda_dit_block_smoke.o $(LIB_OBJ)
 h3_cuda_text_smoke: tests/test_cuda_text_smoke.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+h3_cuda_vision_smoke: tests/test_cuda_vision_smoke.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 h3_cuda_dit_forward_smoke: tests/test_cuda_dit_forward_smoke.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
@@ -79,6 +82,15 @@ test: h3_tests h3_cuda_smoke h3_cuda_ops
 		./h3_cuda_text_smoke /home/alex/HF-MODELS/MiniMax-H3; \
 	else \
 		echo "skip: text encoder smoke (weights not available)"; \
+	fi
+	@$(MAKE) -f Makefile.linux h3_cuda_vision_smoke
+	@path=$${H3_MODEL_ROOT:-MiniMax-H3}; \
+	if test -f $$path/FL2VA/text_encoder/config.json; then \
+		./h3_cuda_vision_smoke $$path; \
+	elif test -f /home/alex/HF-MODELS/MiniMax-H3/FL2VA/text_encoder/config.json; then \
+		./h3_cuda_vision_smoke /home/alex/HF-MODELS/MiniMax-H3; \
+	else \
+		echo "skip: vision encoder smoke (weights not available)"; \
 	fi
 	@if test -f MiniMax-H3/tokenizer/tokenizer.json || test -n "$$H3_TOKENIZER_JSON"; then \
 		$(MAKE) -f Makefile.linux tokenizer_smoke; \
@@ -149,6 +161,6 @@ linenoise.o: CFLAGS += -Wno-conversion
 
 clean:
 	rm -f h3 h3_tests h3_cuda_smoke h3_cuda_ops h3_cuda_dit_block_smoke \
-		h3_cuda_text_smoke h3_cuda_dit_forward_smoke h3_cuda_probe libh3_cuda.a \
+		h3_cuda_text_smoke h3_cuda_vision_smoke h3_cuda_dit_forward_smoke h3_cuda_probe libh3_cuda.a \
 		tokenizer_test tokenizer_smoke \
 		*.o *.d tests/*.o tests/*.d tools/*.o tools/*.d third_party/*.o third_party/*.d

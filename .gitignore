@@ -31,6 +31,7 @@ h3_cuda_ops
 h3_cuda_probe
 h3_cuda_dit_block_smoke
 h3_cuda_text_smoke
+h3_cuda_vision_smoke
 h3_cuda_dit_forward_smoke
 tokenizer_smoke
 tokenizer_test
