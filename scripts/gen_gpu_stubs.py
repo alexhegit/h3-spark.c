@@ -33,6 +33,7 @@ IMPLEMENTED = {
     "h3_gpu_gelu_bf16", "h3_gpu_embedding_bf16",
     "h3_gpu_vision_qkv_rope_bf16",
     "h3_gpu_quantize_weight_int8", "h3_gpu_linear_int8_bf16",
+    "h3_gpu_linear_int8_head_major_bf16", "h3_gpu_mlp_int8_bf16",
     "h3_gpu_qkv_rope_bf16", "h3_gpu_grouped_qkv_rope_bf16",
     "h3_gpu_grouped_qkv_linear_rope_bf16",
     "h3_gpu_sdpa_bf16", "h3_gpu_sdpa_bf16_head_major_output",

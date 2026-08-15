@@ -190,38 +190,6 @@ int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_gpu_stub_impl(gpu, "h3_gpu_mlp_nax_bf16");
 }
 
-int h3_gpu_linear_int8_head_major_bf16(
-                            h3_gpu *gpu, h3_gpu_tensor *output,
-                            h3_gpu_tensor *quantized_input,
-                            h3_gpu_tensor *input_scales,
-                            const h3_gpu_tensor *input,
-                            const h3_gpu_tensor *weight,
-                            const h3_gpu_tensor *weight_scales,
-                            uint32_t rows, uint32_t heads,
-                            uint32_t head_dim, uint32_t output_dim) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_linear_int8_head_major_bf16");
-}
-
-int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                         h3_gpu_tensor *activated,
-                         h3_gpu_tensor *quantized_activation,
-                         h3_gpu_tensor *activation_scales,
-                         const h3_gpu_tensor *input,
-                         const h3_gpu_tensor *fc1_weight,
-                         const h3_gpu_tensor *fc1_scales,
-                         const h3_gpu_tensor *fc2_weight,
-                         const h3_gpu_tensor *fc2_scales,
-                         const h3_gpu_tensor *fc1_bf16,
-                         const h3_gpu_tensor *fc2_bf16, uint32_t rows,
-                         uint32_t input_dim, uint32_t hidden_dim,
-                         uint32_t output_dim,
-                         int use_slower_grouped_quantizer,
-                         int use_slower_dynamic_fc1_k,
-                         int use_int8_row_fc2,
-                         int input_is_quantized) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_mlp_int8_bf16");
-}
-
 int h3_gpu_gate_adaln_quantize_int8(
                      h3_gpu *gpu, h3_gpu_tensor *gated_residual,
                      h3_gpu_tensor *quantized_output,

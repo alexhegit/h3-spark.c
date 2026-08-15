@@ -3132,6 +3132,357 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         use_slower_uncached_int8_scales, 0);
 }
 
+__global__ static void h3_quantize_bf16_int8_head_major_kernel(
+    const uint16_t *input, int8_t *output, float *scales, uint32_t rows,
+    uint32_t padded_rows, uint32_t heads, uint32_t head_dim) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    uint32_t columns = heads * head_dim;
+    if (row >= padded_rows) return;
+
+    extern __shared__ float reductions[];
+    size_t out_base = (size_t)row * columns;
+    if (row >= rows) {
+        for (uint32_t column = tid; column < columns; column += threads)
+            output[out_base + column] = 0;
+        if (tid == 0) scales[row] = 1.0f;
+        return;
+    }
+
+    float local_max = 0.0f;
+    for (uint32_t column = tid; column < columns; column += threads) {
+        uint32_t head = column / head_dim;
+        uint32_t dim = column % head_dim;
+        size_t in_index =
+            ((size_t)head * rows + row) * head_dim + dim;
+        float value = fabsf(h3_bf16_bits_to_f32(input[in_index]));
+        if (value > local_max) local_max = value;
+    }
+    reductions[tid] = local_max;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) {
+            float other = reductions[tid + stride];
+            if (other > reductions[tid]) reductions[tid] = other;
+        }
+        __syncthreads();
+    }
+    float clipped_max = reductions[0];
+    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
+    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    if (tid == 0) scales[row] = scale;
+    __syncthreads();
+    for (uint32_t column = tid; column < columns; column += threads) {
+        uint32_t head = column / head_dim;
+        uint32_t dim = column % head_dim;
+        size_t in_index =
+            ((size_t)head * rows + row) * head_dim + dim;
+        int quantized =
+            (int)rintf(h3_bf16_bits_to_f32(input[in_index]) * inverse);
+        if (quantized > 127) quantized = 127;
+        if (quantized < -127) quantized = -127;
+        output[out_base + column] = (int8_t)quantized;
+    }
+}
+
+int h3_gpu_linear_int8_head_major_bf16(
+    h3_gpu *gpu, h3_gpu_tensor *output, h3_gpu_tensor *quantized_input,
+    h3_gpu_tensor *input_scales, const h3_gpu_tensor *input,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *weight_scales,
+    uint32_t rows, uint32_t heads, uint32_t head_dim, uint32_t output_dim) {
+    uint32_t input_dim = heads * head_dim;
+    uint32_t padded_rows = (rows + 127u) & ~127u;
+    if (padded_rows < rows) padded_rows = rows;
+    if (!gpu || !output || !quantized_input || !input_scales || !input ||
+        !weight || !weight_scales || !rows || !heads || !head_dim ||
+        !output_dim || input->dtype != H3_GPU_BF16 ||
+        quantized_input->dtype != H3_GPU_I8 ||
+        input_scales->dtype != H3_GPU_F32 ||
+        input->elements < (size_t)rows * input_dim ||
+        quantized_input->elements < (size_t)padded_rows * input_dim ||
+        input_scales->elements < padded_rows)
+        return h3_gpu_fail(gpu, "invalid head-major INT8 linear request");
+
+    unsigned threads = 256;
+    h3_quantize_bf16_int8_head_major_kernel<<<padded_rows, threads,
+                                                threads * sizeof(float),
+                                                gpu->stream>>>(
+        (const uint16_t *)input->device, (int8_t *)quantized_input->device,
+        (float *)input_scales->device, rows, padded_rows, heads, head_dim);
+    gpu->stats.direct_dispatches++;
+    if (!h3_cuda_check(gpu, cudaGetLastError(),
+                       "h3_quantize_bf16_int8_head_major"))
+        return 0;
+    return h3_gpu_linear_int8_bf16_impl(
+        gpu, output, quantized_input, input_scales, NULL, weight,
+        weight_scales, rows, input_dim, output_dim, 0, 1);
+}
+
+struct h3_int8_group_quant_args {
+    uint32_t rows;
+    uint32_t dispatch_rows;
+    uint32_t columns;
+    uint32_t group_size;
+    uint32_t groups;
+};
+
+__global__ static void h3_quantize_bf16_int8_groups_kernel(
+    const uint16_t *input, int8_t *output, float *scales,
+    h3_int8_group_quant_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t group = (uint32_t)blockIdx.y;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.dispatch_rows || group >= args.groups) return;
+
+    extern __shared__ float reductions[];
+    size_t row_base = (size_t)row * args.columns;
+    uint32_t group_start = group * args.group_size;
+    if (row >= args.rows) {
+        for (uint32_t column = tid; column < args.group_size; column += threads)
+            output[row_base + group_start + column] = 0;
+        if (tid == 0) scales[(size_t)row * args.groups + group] = 1.0f;
+        return;
+    }
+
+    float local_max = 0.0f;
+    for (uint32_t column = tid; column < args.group_size; column += threads) {
+        float value =
+            fabsf(h3_bf16_bits_to_f32(input[row_base + group_start + column]));
+        if (value > local_max) local_max = value;
+    }
+    reductions[tid] = local_max;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) {
+            float other = reductions[tid + stride];
+            if (other > reductions[tid]) reductions[tid] = other;
+        }
+        __syncthreads();
+    }
+    float clipped_max = reductions[0];
+    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
+    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    if (tid == 0) scales[(size_t)row * args.groups + group] = scale;
+    __syncthreads();
+    for (uint32_t column = tid; column < args.group_size; column += threads) {
+        int quantized = (int)rintf(
+            h3_bf16_bits_to_f32(input[row_base + group_start + column]) *
+            inverse);
+        if (quantized > 127) quantized = 127;
+        if (quantized < -127) quantized = -127;
+        output[row_base + group_start + column] = (int8_t)quantized;
+    }
+}
+
+static int h3_gpu_quantize_bf16_int8_groups(
+    h3_gpu *gpu, h3_gpu_tensor *output, h3_gpu_tensor *scales,
+    const h3_gpu_tensor *input, uint32_t rows, uint32_t dispatch_rows,
+    uint32_t columns, uint32_t group_size) {
+    if (!group_size || columns % group_size)
+        return h3_gpu_fail(gpu, "invalid grouped INT8 quantize geometry");
+    uint32_t groups = columns / group_size;
+    if (!gpu || !output || !scales || !input || !rows ||
+        dispatch_rows < rows || !columns || input->dtype != H3_GPU_BF16 ||
+        output->dtype != H3_GPU_I8 || scales->dtype != H3_GPU_F32 ||
+        input->elements < (size_t)rows * columns ||
+        output->elements < (size_t)dispatch_rows * columns ||
+        scales->elements < (size_t)dispatch_rows * groups)
+        return h3_gpu_fail(gpu, "invalid grouped INT8 quantize request");
+    h3_int8_group_quant_args args = {rows, dispatch_rows, columns, group_size,
+                                     groups};
+    unsigned threads = 256;
+    dim3 blocks(dispatch_rows, groups, 1);
+    h3_quantize_bf16_int8_groups_kernel<<<blocks, threads,
+                                            threads * sizeof(float),
+                                            gpu->stream>>>(
+        (const uint16_t *)input->device, (int8_t *)output->device,
+        (float *)scales->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(),
+                         "h3_quantize_bf16_int8_groups");
+}
+
+__global__ static void h3_linear_int8_grouped_naive_kernel(
+    const int8_t *input, const int8_t *weight, const float *input_scales,
+    const float *weight_scales, uint16_t *output, uint32_t rows,
+    uint32_t input_dim, uint32_t output_dim, uint32_t group_size,
+    uint32_t groups) {
+    uint32_t column = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t row = (uint32_t)blockIdx.y;
+    if (row >= rows || column >= output_dim) return;
+    float total = 0.0f;
+    size_t input_base = (size_t)row * input_dim;
+    size_t weight_base = (size_t)column * input_dim;
+    for (uint32_t group = 0; group < groups; group++) {
+        int32_t sum = 0;
+        uint32_t start = group * group_size;
+        for (uint32_t k = 0; k < group_size; k++) {
+            sum += (int32_t)input[input_base + start + k] *
+                   (int32_t)weight[weight_base + start + k];
+        }
+        total += (float)sum * input_scales[(size_t)row * groups + group] *
+                 weight_scales[column];
+    }
+    output[(size_t)row * output_dim + column] = h3_f32_to_bf16_bits(total);
+}
+
+static int h3_gpu_linear_int8_grouped_bf16(
+    h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *quantized_input,
+    const h3_gpu_tensor *input_scales, const h3_gpu_tensor *weight,
+    const h3_gpu_tensor *weight_scales, uint32_t rows, uint32_t input_dim,
+    uint32_t output_dim, uint32_t group_size) {
+    if (!group_size || input_dim % group_size)
+        return h3_gpu_fail(gpu, "invalid grouped INT8 linear geometry");
+    uint32_t groups = input_dim / group_size;
+    uint32_t padded_rows = (rows + 127u) & ~127u;
+    if (padded_rows < rows) padded_rows = rows;
+    size_t output_count = (size_t)rows * output_dim;
+    if (!gpu || !output || !quantized_input || !input_scales || !weight ||
+        !weight_scales || output->dtype != H3_GPU_BF16 ||
+        quantized_input->dtype != H3_GPU_I8 ||
+        input_scales->dtype != H3_GPU_F32 || weight->dtype != H3_GPU_I8 ||
+        weight_scales->dtype != H3_GPU_F32 ||
+        output->elements < output_count ||
+        quantized_input->elements < (size_t)padded_rows * input_dim ||
+        input_scales->elements < (size_t)padded_rows * groups ||
+        weight->elements < (size_t)output_dim * input_dim ||
+        weight_scales->elements < output_dim || !rows || !input_dim ||
+        !output_dim)
+        return h3_gpu_fail(gpu, "invalid grouped INT8 linear request");
+
+    dim3 threads(256, 1, 1);
+    dim3 blocks((output_dim + threads.x - 1) / threads.x, rows, 1);
+    h3_linear_int8_grouped_naive_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const int8_t *)quantized_input->device, (const int8_t *)weight->device,
+        (const float *)input_scales->device,
+        (const float *)weight_scales->device, (uint16_t *)output->device, rows,
+        input_dim, output_dim, group_size, groups);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(),
+                         "h3_linear_int8_grouped_naive");
+}
+
+int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                         h3_gpu_tensor *activated,
+                         h3_gpu_tensor *quantized_activation,
+                         h3_gpu_tensor *activation_scales,
+                         const h3_gpu_tensor *input,
+                         const h3_gpu_tensor *fc1_weight,
+                         const h3_gpu_tensor *fc1_scales,
+                         const h3_gpu_tensor *fc2_weight,
+                         const h3_gpu_tensor *fc2_scales,
+                         const h3_gpu_tensor *fc1_bf16,
+                         const h3_gpu_tensor *fc2_bf16, uint32_t rows,
+                         uint32_t input_dim, uint32_t hidden_dim,
+                         uint32_t output_dim,
+                         int use_slower_grouped_quantizer,
+                         int use_slower_dynamic_fc1_k, int use_int8_row_fc2,
+                         int input_is_quantized) {
+    (void)use_slower_grouped_quantizer;
+    (void)use_slower_dynamic_fc1_k;
+    uint32_t padded_rows = (rows + 127u) & ~127u;
+    if (padded_rows < rows) padded_rows = rows;
+    uint32_t fc2_groups =
+        hidden_dim >= 1024u && (hidden_dim % 1024u) == 0u ? hidden_dim / 1024u
+                                                         : 1u;
+    size_t activation_capacity =
+        (size_t)padded_rows *
+        (input_dim > hidden_dim ? input_dim : hidden_dim);
+    const char *stage = getenv("H3_INT8_MLP_STAGE");
+    int int8_fc1 = !stage || (strcmp(stage, "fc2") && strcmp(stage, "bf16"));
+    int int8_fc2 = !stage || (strcmp(stage, "fc1") && strcmp(stage, "bf16"));
+    int grouped_fc2 = int8_fc2 && !use_int8_row_fc2 && fc2_groups > 1u;
+
+    if (!gpu || !output || !activated || !quantized_activation ||
+        !activation_scales || !fc1_weight || !fc1_scales || !fc2_weight ||
+        !fc2_scales || (!input_is_quantized && !input) || !rows ||
+        !input_dim || !hidden_dim || !output_dim ||
+        quantized_activation->dtype != H3_GPU_I8 ||
+        activation_scales->dtype != H3_GPU_F32 ||
+        fc1_weight->dtype != H3_GPU_I8 || fc1_scales->dtype != H3_GPU_F32 ||
+        fc2_weight->dtype != H3_GPU_I8 || fc2_scales->dtype != H3_GPU_F32 ||
+        activated->dtype != H3_GPU_BF16 || output->dtype != H3_GPU_BF16 ||
+        quantized_activation->elements < activation_capacity ||
+        activation_scales->elements <
+            (size_t)padded_rows * (grouped_fc2 ? fc2_groups : 1u) ||
+        fc1_weight->elements < (size_t)hidden_dim * 2u * input_dim ||
+        fc1_scales->elements < (size_t)hidden_dim * 2u ||
+        fc2_weight->elements < (size_t)output_dim * hidden_dim ||
+        fc2_scales->elements < output_dim ||
+        activated->elements < (size_t)rows * hidden_dim ||
+        output->elements < (size_t)rows * output_dim ||
+        (!input_is_quantized &&
+         (input->dtype != H3_GPU_BF16 ||
+          input->elements < (size_t)rows * input_dim)) ||
+        (!int8_fc1 &&
+         (!fc1_bf16 || fc1_bf16->dtype != H3_GPU_BF16 ||
+          fc1_bf16->elements < (size_t)hidden_dim * 2u * input_dim)) ||
+        (!int8_fc2 &&
+         (!fc2_bf16 || fc2_bf16->dtype != H3_GPU_BF16 ||
+          fc2_bf16->elements < (size_t)output_dim * hidden_dim)))
+        return h3_gpu_fail(gpu, "invalid INT8 MLP request");
+    if (input_is_quantized && !int8_fc1)
+        return h3_gpu_fail(gpu, "prequantized MLP input requires int8 FC1");
+
+    h3_gpu_tensor *fc1_fused =
+        h3_gpu_tensor_new_bf16(gpu, (size_t)rows * hidden_dim * 2u);
+    if (!fc1_fused) return h3_gpu_fail(gpu, "INT8 MLP FC1 temp alloc failed");
+
+    int ok = 1;
+    if (int8_fc1) {
+        if (!input_is_quantized &&
+            !h3_gpu_quantize_bf16_int8_rows(
+                gpu, quantized_activation, activation_scales, input, rows,
+                padded_rows, input_dim, 1.0f))
+            ok = 0;
+        if (ok &&
+            !h3_gpu_linear_int8_bf16_impl(
+                gpu, fc1_fused, quantized_activation, activation_scales, NULL,
+                fc1_weight, fc1_scales, rows, input_dim, hidden_dim * 2u, 0,
+                1))
+            ok = 0;
+        if (ok && !h3_gpu_swiglu_bf16(gpu, activated, fc1_fused, rows, hidden_dim))
+            ok = 0;
+    } else if (!h3_gpu_linear_bf16(gpu, fc1_fused, input, fc1_bf16, NULL, rows,
+                                   input_dim, hidden_dim * 2u) ||
+               !h3_gpu_swiglu_bf16(gpu, activated, fc1_fused, rows, hidden_dim)) {
+        ok = 0;
+    }
+
+    if (ok && int8_fc2) {
+        if (grouped_fc2) {
+            if (!h3_gpu_quantize_bf16_int8_groups(
+                    gpu, quantized_activation, activation_scales, activated,
+                    rows, padded_rows, hidden_dim, 1024u))
+                ok = 0;
+            else if (!h3_gpu_linear_int8_grouped_bf16(
+                         gpu, output, quantized_activation, activation_scales,
+                         fc2_weight, fc2_scales, rows, hidden_dim, output_dim,
+                         1024u))
+                ok = 0;
+        } else {
+            if (!h3_gpu_quantize_bf16_int8_rows(
+                    gpu, quantized_activation, activation_scales, activated,
+                    rows, padded_rows, hidden_dim, 1.0f))
+                ok = 0;
+            else if (!h3_gpu_linear_int8_bf16_impl(
+                         gpu, output, quantized_activation, activation_scales,
+                         NULL, fc2_weight, fc2_scales, rows, hidden_dim,
+                         output_dim, 0, 1))
+                ok = 0;
+        }
+    } else if (ok &&
+               !h3_gpu_linear_bf16(gpu, output, activated, fc2_bf16, NULL, rows,
+                                   hidden_dim, output_dim)) {
+        ok = 0;
+    }
+
+    h3_gpu_tensor_free(fc1_fused);
+    return ok;
+}
+
 int h3_gpu_begin(h3_gpu *gpu) {
     if (!gpu) return 0;
     gpu->error[0] = '\0';

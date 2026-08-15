@@ -2250,6 +2250,197 @@ int main(void) {
         }
     }
 
+    const uint32_t hm_rows = 3;
+    const uint32_t hm_heads = 2;
+    const uint32_t hm_dim = 8;
+    const uint32_t hm_out = 16;
+    const uint32_t hm_in = hm_heads * hm_dim;
+    const uint32_t hm_padded = (hm_rows + 127u) & ~127u;
+    float hm_input_host[hm_rows * hm_in];
+    float hm_row_major[hm_rows * hm_in];
+    float hm_weight_host[hm_out * hm_in];
+    uint16_t hm_input_bf16[hm_rows * hm_in];
+    uint16_t hm_weight_bf16[hm_out * hm_in];
+    int8_t hm_weight_qi8[hm_out * hm_in];
+    float hm_weight_scales[hm_out];
+    int8_t hm_input_qi8[hm_rows * hm_in];
+    float hm_input_scales[hm_rows];
+    float hm_ref[hm_rows * hm_out];
+    uint16_t hm_out_bf16[hm_rows * hm_out];
+    for (uint32_t head = 0; head < hm_heads; head++) {
+        for (uint32_t row = 0; row < hm_rows; row++) {
+            for (uint32_t d = 0; d < hm_dim; d++) {
+                size_t hm_index = ((size_t)head * hm_rows + row) * hm_dim + d;
+                size_t rm_index = ((size_t)row * hm_heads + head) * hm_dim + d;
+                hm_input_host[hm_index] =
+                    sinf((float)hm_index * 0.19f) * 0.6f;
+                hm_input_bf16[hm_index] = f32_to_bf16(hm_input_host[hm_index]);
+                hm_row_major[rm_index] = bf16_to_f32(hm_input_bf16[hm_index]);
+            }
+        }
+    }
+    for (size_t i = 0; i < (size_t)hm_out * hm_in; i++) {
+        hm_weight_host[i] = cosf((float)i * 0.11f) * 0.4f;
+        hm_weight_bf16[i] = f32_to_bf16(hm_weight_host[i]);
+        hm_weight_host[i] = bf16_to_f32(hm_weight_bf16[i]);
+    }
+    quantize_bf16_int8_rows_ref(hm_weight_host, hm_weight_qi8, hm_weight_scales,
+                                hm_out, hm_in, 1.0f);
+    quantize_bf16_int8_rows_ref(hm_row_major, hm_input_qi8, hm_input_scales,
+                                hm_rows, hm_in, 1.0f);
+    linear_int8_ref(hm_input_qi8, hm_input_scales, hm_weight_qi8,
+                    hm_weight_scales, hm_ref, hm_rows, hm_in, hm_out);
+
+    h3_gpu_tensor *hm_input_t =
+        h3_gpu_tensor_from_bf16(gpu, hm_input_bf16, (size_t)hm_rows * hm_in);
+    h3_gpu_tensor *hm_weight_bf16_t =
+        h3_gpu_tensor_from_bf16(gpu, hm_weight_bf16, (size_t)hm_out * hm_in);
+    h3_gpu_tensor *hm_weight_i8 =
+        h3_gpu_tensor_new_i8(gpu, (size_t)hm_out * hm_in);
+    h3_gpu_tensor *hm_weight_scale_t = h3_gpu_tensor_new_f32(gpu, hm_out);
+    h3_gpu_tensor *hm_quant_t =
+        h3_gpu_tensor_new_i8(gpu, (size_t)hm_padded * hm_in);
+    h3_gpu_tensor *hm_input_scale_t = h3_gpu_tensor_new_f32(gpu, hm_padded);
+    h3_gpu_tensor *hm_out_t =
+        h3_gpu_tensor_new_bf16(gpu, (size_t)hm_rows * hm_out);
+    check(hm_input_t && hm_weight_bf16_t && hm_weight_i8 && hm_weight_scale_t &&
+              hm_quant_t && hm_input_scale_t && hm_out_t,
+          "head_major int8 alloc");
+    if (hm_input_t && hm_weight_bf16_t && hm_weight_i8 && hm_weight_scale_t &&
+        hm_quant_t && hm_input_scale_t && hm_out_t) {
+        check(h3_gpu_quantize_weight_int8(gpu, hm_weight_i8, hm_weight_scale_t,
+                                          hm_weight_bf16_t, hm_out, hm_in),
+              "quantize head_major weight");
+        check(h3_gpu_linear_int8_head_major_bf16(
+                  gpu, hm_out_t, hm_quant_t, hm_input_scale_t, hm_input_t,
+                  hm_weight_i8, hm_weight_scale_t, hm_rows, hm_heads, hm_dim,
+                  hm_out),
+              "linear_int8_head_major");
+        check(h3_gpu_submit(gpu), "submit head_major int8");
+        check(h3_gpu_tensor_read_bf16(hm_out_t, hm_out_bf16,
+                                      (size_t)hm_rows * hm_out),
+              "read head_major int8");
+        for (size_t i = 0; i < (size_t)hm_rows * hm_out; i++) {
+            float got = bf16_to_f32(hm_out_bf16[i]);
+            if (fabsf(got - hm_ref[i]) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: head_major int8 mismatch at %zu got=%f expected=%f\n",
+                        i, got, hm_ref[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
+    const uint32_t mlp8_rows = 4;
+    const uint32_t mlp8_in = 32;
+    const uint32_t mlp8_hidden = 64;
+    const uint32_t mlp8_out = 32;
+    const uint32_t mlp8_padded = (mlp8_rows + 127u) & ~127u;
+    float mlp8_input_host[mlp8_rows * mlp8_in];
+    float mlp8_fc1_host[mlp8_hidden * 2 * mlp8_in];
+    float mlp8_fc2_host[mlp8_out * mlp8_hidden];
+    uint16_t mlp8_input_bf16[mlp8_rows * mlp8_in];
+    uint16_t mlp8_fc1_bf16[mlp8_hidden * 2 * mlp8_in];
+    uint16_t mlp8_fc2_bf16[mlp8_out * mlp8_hidden];
+    int8_t mlp8_fc1_qi8[mlp8_hidden * 2 * mlp8_in];
+    int8_t mlp8_fc2_qi8[mlp8_out * mlp8_hidden];
+    float mlp8_fc1_scales[mlp8_hidden * 2];
+    float mlp8_fc2_scales[mlp8_out];
+    int8_t mlp8_qin[mlp8_rows * mlp8_in];
+    float mlp8_qin_scales[mlp8_rows];
+    float mlp8_fc1_out[mlp8_rows * mlp8_hidden * 2];
+    float mlp8_activated[mlp8_rows * mlp8_hidden];
+    int8_t mlp8_qact[mlp8_rows * mlp8_hidden];
+    float mlp8_qact_scales[mlp8_rows];
+    float mlp8_ref[mlp8_rows * mlp8_out];
+    uint16_t mlp8_out_bf16[mlp8_rows * mlp8_out];
+    for (size_t i = 0; i < (size_t)mlp8_rows * mlp8_in; i++) {
+        mlp8_input_host[i] = sinf((float)i * 0.09f) * 0.5f;
+        mlp8_input_bf16[i] = f32_to_bf16(mlp8_input_host[i]);
+        mlp8_input_host[i] = bf16_to_f32(mlp8_input_bf16[i]);
+    }
+    for (size_t i = 0; i < (size_t)mlp8_hidden * 2 * mlp8_in; i++) {
+        mlp8_fc1_host[i] = cosf((float)i * 0.05f) * 0.2f;
+        mlp8_fc1_bf16[i] = f32_to_bf16(mlp8_fc1_host[i]);
+        mlp8_fc1_host[i] = bf16_to_f32(mlp8_fc1_bf16[i]);
+    }
+    for (size_t i = 0; i < (size_t)mlp8_out * mlp8_hidden; i++) {
+        mlp8_fc2_host[i] = sinf((float)i * 0.04f) * 0.25f;
+        mlp8_fc2_bf16[i] = f32_to_bf16(mlp8_fc2_host[i]);
+        mlp8_fc2_host[i] = bf16_to_f32(mlp8_fc2_bf16[i]);
+    }
+    quantize_bf16_int8_rows_ref(mlp8_fc1_host, mlp8_fc1_qi8, mlp8_fc1_scales,
+                                mlp8_hidden * 2, mlp8_in, 1.0f);
+    quantize_bf16_int8_rows_ref(mlp8_fc2_host, mlp8_fc2_qi8, mlp8_fc2_scales,
+                                mlp8_out, mlp8_hidden, 1.0f);
+    quantize_bf16_int8_rows_ref(mlp8_input_host, mlp8_qin, mlp8_qin_scales,
+                                mlp8_rows, mlp8_in, 1.0f);
+    linear_int8_ref(mlp8_qin, mlp8_qin_scales, mlp8_fc1_qi8, mlp8_fc1_scales,
+                    mlp8_fc1_out, mlp8_rows, mlp8_in, mlp8_hidden * 2);
+    swiglu_ref(mlp8_fc1_out, mlp8_activated, mlp8_rows, mlp8_hidden);
+    quantize_bf16_int8_rows_ref(mlp8_activated, mlp8_qact, mlp8_qact_scales,
+                                mlp8_rows, mlp8_hidden, 1.0f);
+    linear_int8_ref(mlp8_qact, mlp8_qact_scales, mlp8_fc2_qi8, mlp8_fc2_scales,
+                    mlp8_ref, mlp8_rows, mlp8_hidden, mlp8_out);
+
+    h3_gpu_tensor *mlp8_in_t = h3_gpu_tensor_from_bf16(
+        gpu, mlp8_input_bf16, (size_t)mlp8_rows * mlp8_in);
+    h3_gpu_tensor *mlp8_fc1_bf16_t = h3_gpu_tensor_from_bf16(
+        gpu, mlp8_fc1_bf16, (size_t)mlp8_hidden * 2 * mlp8_in);
+    h3_gpu_tensor *mlp8_fc2_bf16_t = h3_gpu_tensor_from_bf16(
+        gpu, mlp8_fc2_bf16, (size_t)mlp8_out * mlp8_hidden);
+    h3_gpu_tensor *mlp8_fc1_i8 =
+        h3_gpu_tensor_new_i8(gpu, (size_t)mlp8_hidden * 2 * mlp8_in);
+    h3_gpu_tensor *mlp8_fc1_scale_t =
+        h3_gpu_tensor_new_f32(gpu, mlp8_hidden * 2);
+    h3_gpu_tensor *mlp8_fc2_i8 =
+        h3_gpu_tensor_new_i8(gpu, (size_t)mlp8_out * mlp8_hidden);
+    h3_gpu_tensor *mlp8_fc2_scale_t = h3_gpu_tensor_new_f32(gpu, mlp8_out);
+    h3_gpu_tensor *mlp8_act =
+        h3_gpu_tensor_new_bf16(gpu, (size_t)mlp8_rows * mlp8_hidden);
+    h3_gpu_tensor *mlp8_quant =
+        h3_gpu_tensor_new_i8(gpu, (size_t)mlp8_padded * mlp8_hidden);
+    h3_gpu_tensor *mlp8_act_scales = h3_gpu_tensor_new_f32(gpu, mlp8_padded);
+    h3_gpu_tensor *mlp8_out_t =
+        h3_gpu_tensor_new_bf16(gpu, (size_t)mlp8_rows * mlp8_out);
+    check(mlp8_in_t && mlp8_fc1_bf16_t && mlp8_fc2_bf16_t && mlp8_fc1_i8 &&
+              mlp8_fc1_scale_t && mlp8_fc2_i8 && mlp8_fc2_scale_t && mlp8_act &&
+              mlp8_quant && mlp8_act_scales && mlp8_out_t,
+          "mlp_int8 alloc");
+    if (mlp8_in_t && mlp8_fc1_bf16_t && mlp8_fc2_bf16_t && mlp8_fc1_i8 &&
+        mlp8_fc1_scale_t && mlp8_fc2_i8 && mlp8_fc2_scale_t && mlp8_act &&
+        mlp8_quant && mlp8_act_scales && mlp8_out_t) {
+        check(h3_gpu_quantize_weight_int8(gpu, mlp8_fc1_i8, mlp8_fc1_scale_t,
+                                          mlp8_fc1_bf16_t, mlp8_hidden * 2,
+                                          mlp8_in),
+              "quantize mlp fc1");
+        check(h3_gpu_quantize_weight_int8(gpu, mlp8_fc2_i8, mlp8_fc2_scale_t,
+                                          mlp8_fc2_bf16_t, mlp8_out,
+                                          mlp8_hidden),
+              "quantize mlp fc2");
+        check(h3_gpu_mlp_int8_bf16(
+                  gpu, mlp8_out_t, mlp8_act, mlp8_quant, mlp8_act_scales,
+                  mlp8_in_t, mlp8_fc1_i8, mlp8_fc1_scale_t, mlp8_fc2_i8,
+                  mlp8_fc2_scale_t, mlp8_fc1_bf16_t, mlp8_fc2_bf16_t, mlp8_rows,
+                  mlp8_in, mlp8_hidden, mlp8_out, 0, 0, 1, 0),
+              "mlp_int8_bf16");
+        check(h3_gpu_submit(gpu), "submit mlp_int8");
+        check(h3_gpu_tensor_read_bf16(mlp8_out_t, mlp8_out_bf16,
+                                      (size_t)mlp8_rows * mlp8_out),
+              "read mlp_int8");
+        for (size_t i = 0; i < (size_t)mlp8_rows * mlp8_out; i++) {
+            float got = bf16_to_f32(mlp8_out_bf16[i]);
+            if (fabsf(got - mlp8_ref[i]) >= 8e-2f) {
+                fprintf(stderr,
+                        "FAIL: mlp_int8 mismatch at %zu got=%f expected=%f\n",
+                        i, got, mlp8_ref[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
     const uint32_t patch_rows = 1;
     const uint32_t patch_in_dim = 32;
     const uint32_t patch_out_dim = 5376;
@@ -2402,6 +2593,24 @@ int main(void) {
     h3_gpu_tensor_free(iq_quant_t);
     h3_gpu_tensor_free(iq_input_scale_t);
     h3_gpu_tensor_free(iq_out_t);
+    h3_gpu_tensor_free(hm_input_t);
+    h3_gpu_tensor_free(hm_weight_bf16_t);
+    h3_gpu_tensor_free(hm_weight_i8);
+    h3_gpu_tensor_free(hm_weight_scale_t);
+    h3_gpu_tensor_free(hm_quant_t);
+    h3_gpu_tensor_free(hm_input_scale_t);
+    h3_gpu_tensor_free(hm_out_t);
+    h3_gpu_tensor_free(mlp8_in_t);
+    h3_gpu_tensor_free(mlp8_fc1_bf16_t);
+    h3_gpu_tensor_free(mlp8_fc2_bf16_t);
+    h3_gpu_tensor_free(mlp8_fc1_i8);
+    h3_gpu_tensor_free(mlp8_fc1_scale_t);
+    h3_gpu_tensor_free(mlp8_fc2_i8);
+    h3_gpu_tensor_free(mlp8_fc2_scale_t);
+    h3_gpu_tensor_free(mlp8_act);
+    h3_gpu_tensor_free(mlp8_quant);
+    h3_gpu_tensor_free(mlp8_act_scales);
+    h3_gpu_tensor_free(mlp8_out_t);
     h3_gpu_free(gpu);
 
     if (failures) {
