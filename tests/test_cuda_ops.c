@@ -380,6 +380,49 @@ static void rms_norm_ref(const float *input, const float *weight, float *output,
     }
 }
 
+static void quantize_bf16_int8_rows_ref(const float *input, int8_t *output,
+                                       float *scales, uint32_t rows,
+                                       uint32_t columns, float clip) {
+    for (uint32_t row = 0; row < rows; row++) {
+        const float *row_input = input + (size_t)row * columns;
+        float max_abs = 0.0f;
+        for (uint32_t column = 0; column < columns; column++) {
+            float value = fabsf(row_input[column]);
+            if (value > max_abs) max_abs = value;
+        }
+        float clipped_max = max_abs * clip;
+        float scale =
+            clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
+        float inverse =
+            clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+        scales[row] = scale;
+        int8_t *row_output = output + (size_t)row * columns;
+        for (uint32_t column = 0; column < columns; column++) {
+            int quantized = (int)rintf(row_input[column] * inverse);
+            if (quantized > 127) quantized = 127;
+            if (quantized < -127) quantized = -127;
+            row_output[column] = (int8_t)quantized;
+        }
+    }
+}
+
+static void linear_int8_ref(const int8_t *input, const float *input_scales,
+                            const int8_t *weight, const float *weight_scales,
+                            float *output, uint32_t rows, uint32_t input_dim,
+                            uint32_t output_dim) {
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t column = 0; column < output_dim; column++) {
+            int32_t sum = 0;
+            for (uint32_t k = 0; k < input_dim; k++) {
+                sum += (int32_t)input[(size_t)row * input_dim + k] *
+                       (int32_t)weight[(size_t)column * input_dim + k];
+            }
+            output[(size_t)row * output_dim + column] =
+                (float)sum * input_scales[row] * weight_scales[column];
+        }
+    }
+}
+
 static void layer_norm_ref(const float *input, const float *weight,
                            const float *bias, float *output, uint32_t rows,
                            uint32_t width, float epsilon) {
@@ -2119,6 +2162,94 @@ int main(void) {
         }
     }
 
+    const uint32_t iq_rows = 4;
+    const uint32_t iq_cols = 32;
+    const uint32_t iq_out = 16;
+    const uint32_t iq_padded = (iq_rows + 127u) & ~127u;
+    float iq_input_host[iq_rows * iq_cols];
+    float iq_weight_host[iq_out * iq_cols];
+    uint16_t iq_input_bf16[iq_rows * iq_cols];
+    uint16_t iq_weight_bf16[iq_out * iq_cols];
+    int8_t iq_weight_qi8[iq_out * iq_cols];
+    float iq_weight_scales[iq_out];
+    int8_t iq_input_qi8[iq_rows * iq_cols];
+    float iq_input_scales[iq_rows];
+    float iq_linear_ref[iq_rows * iq_out];
+    uint16_t iq_linear_out_bf16[iq_rows * iq_out];
+    for (size_t i = 0; i < (size_t)iq_rows * iq_cols; i++) {
+        iq_input_host[i] = sinf((float)i * 0.13f) * 0.75f;
+        iq_input_bf16[i] = f32_to_bf16(iq_input_host[i]);
+    }
+    for (size_t i = 0; i < (size_t)iq_out * iq_cols; i++) {
+        iq_weight_host[i] = cosf((float)i * 0.07f) * 0.35f;
+        iq_weight_bf16[i] = f32_to_bf16(iq_weight_host[i]);
+    }
+    for (size_t i = 0; i < (size_t)iq_rows * iq_cols; i++)
+        iq_input_host[i] = bf16_to_f32(iq_input_bf16[i]);
+    for (size_t i = 0; i < (size_t)iq_out * iq_cols; i++)
+        iq_weight_host[i] = bf16_to_f32(iq_weight_bf16[i]);
+    quantize_bf16_int8_rows_ref(iq_weight_host, iq_weight_qi8, iq_weight_scales,
+                                iq_out, iq_cols, 1.0f);
+    quantize_bf16_int8_rows_ref(iq_input_host, iq_input_qi8, iq_input_scales,
+                                iq_rows, iq_cols, 1.0f);
+    linear_int8_ref(iq_input_qi8, iq_input_scales, iq_weight_qi8,
+                    iq_weight_scales, iq_linear_ref, iq_rows, iq_cols, iq_out);
+
+    h3_gpu_tensor *iq_weight_bf16_t =
+        h3_gpu_tensor_from_bf16(gpu, iq_weight_bf16, (size_t)iq_out * iq_cols);
+    h3_gpu_tensor *iq_weight_i8 =
+        h3_gpu_tensor_new_i8(gpu, (size_t)iq_out * iq_cols);
+    h3_gpu_tensor *iq_weight_scale_t =
+        h3_gpu_tensor_new_f32(gpu, iq_out);
+    h3_gpu_tensor *iq_input_t =
+        h3_gpu_tensor_from_bf16(gpu, iq_input_bf16, (size_t)iq_rows * iq_cols);
+    h3_gpu_tensor *iq_quant_t =
+        h3_gpu_tensor_new_i8(gpu, (size_t)iq_padded * iq_cols);
+    h3_gpu_tensor *iq_input_scale_t =
+        h3_gpu_tensor_new_f32(gpu, iq_padded);
+    h3_gpu_tensor *iq_out_t =
+        h3_gpu_tensor_new_bf16(gpu, (size_t)iq_rows * iq_out);
+    check(iq_weight_bf16_t && iq_weight_i8 && iq_weight_scale_t && iq_input_t &&
+              iq_quant_t && iq_input_scale_t && iq_out_t,
+          "int8 linear tensor alloc");
+    if (iq_weight_bf16_t && iq_weight_i8 && iq_weight_scale_t && iq_input_t &&
+        iq_quant_t && iq_input_scale_t && iq_out_t) {
+        check(h3_gpu_quantize_weight_int8(gpu, iq_weight_i8, iq_weight_scale_t,
+                                          iq_weight_bf16_t, iq_out, iq_cols),
+              "quantize_weight_int8");
+        check(h3_gpu_linear_int8_bf16(gpu, iq_out_t, iq_quant_t,
+                                      iq_input_scale_t, iq_input_t, iq_weight_i8,
+                                      iq_weight_scale_t, iq_rows, iq_cols,
+                                      iq_out, 0),
+              "linear_int8_bf16");
+        check(h3_gpu_submit(gpu), "submit int8 linear");
+        float iq_got_scales[iq_out];
+        check(h3_gpu_tensor_read_f32(iq_weight_scale_t, iq_got_scales, iq_out),
+              "read weight scales");
+        for (uint32_t i = 0; i < iq_out; i++) {
+            if (fabsf(iq_got_scales[i] - iq_weight_scales[i]) >= 1e-5f) {
+                fprintf(stderr,
+                        "FAIL: weight scale mismatch at %u got=%f expected=%f\n",
+                        i, iq_got_scales[i], iq_weight_scales[i]);
+                failures++;
+                break;
+            }
+        }
+        check(h3_gpu_tensor_read_bf16(iq_out_t, iq_linear_out_bf16,
+                                      (size_t)iq_rows * iq_out),
+              "read linear_int8");
+        for (size_t i = 0; i < (size_t)iq_rows * iq_out; i++) {
+            float got = bf16_to_f32(iq_linear_out_bf16[i]);
+            if (fabsf(got - iq_linear_ref[i]) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: linear_int8 mismatch at %zu got=%f expected=%f\n",
+                        i, got, iq_linear_ref[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
     const uint32_t patch_rows = 1;
     const uint32_t patch_in_dim = 32;
     const uint32_t patch_out_dim = 5376;
@@ -2264,6 +2395,13 @@ int main(void) {
     h3_gpu_tensor_free(ga_head_bias);
     h3_gpu_tensor_free(ga_inverse);
     h3_gpu_tensor_free(ga_head_out);
+    h3_gpu_tensor_free(iq_weight_bf16_t);
+    h3_gpu_tensor_free(iq_weight_i8);
+    h3_gpu_tensor_free(iq_weight_scale_t);
+    h3_gpu_tensor_free(iq_input_t);
+    h3_gpu_tensor_free(iq_quant_t);
+    h3_gpu_tensor_free(iq_input_scale_t);
+    h3_gpu_tensor_free(iq_out_t);
     h3_gpu_free(gpu);
 
     if (failures) {

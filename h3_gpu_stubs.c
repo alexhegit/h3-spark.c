@@ -190,25 +190,6 @@ int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_gpu_stub_impl(gpu, "h3_gpu_mlp_nax_bf16");
 }
 
-int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
-                                h3_gpu_tensor *scales,
-                                const h3_gpu_tensor *input, uint32_t rows,
-                                uint32_t columns) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_quantize_weight_int8");
-}
-
-int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                            h3_gpu_tensor *quantized_input,
-                            h3_gpu_tensor *input_scales,
-                            const h3_gpu_tensor *input,
-                            const h3_gpu_tensor *weight,
-                            const h3_gpu_tensor *weight_scales,
-                            uint32_t rows, uint32_t input_dim,
-                            uint32_t output_dim,
-                            int use_slower_uncached_int8_scales) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_linear_int8_bf16");
-}
-
 int h3_gpu_linear_int8_head_major_bf16(
                             h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
