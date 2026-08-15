@@ -49,7 +49,7 @@ Stubs remaining: **19** (Phase 3 VAE/audio F32 + Metal-only `mlp_nax_bf16`).
 ## Commits (Phase 2)
 
 ```
-898cbb6 INT8-MLP DiT forward smoke + test-step gate
+b6f9e26 INT8-MLP DiT forward smoke + test-step gate
 6656f8a gate_adaln_quantize_int8 + INT8 QKV/RoPE
 9b39dcf head-major linear + mlp_int8_bf16
 03a9d22 quantize_weight_int8 + linear_int8_bf16
