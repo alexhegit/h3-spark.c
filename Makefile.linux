@@ -133,6 +133,14 @@ test-step: h3_cuda_dit_block_smoke h3_cuda_text_smoke h3_cuda_dit_forward_smoke
 	else \
 		echo "skip: DiT forward full smoke (transformer weights not available)"; \
 	fi
+	@path=$${H3_MODEL_ROOT:-MiniMax-H3}; \
+	if test -f $$path/FL2VA/transformer/config.json; then \
+		./h3_cuda_dit_forward_smoke $$path int8; \
+	elif test -f /home/alex/HF-MODELS/MiniMax-H3/FL2VA/transformer/config.json; then \
+		./h3_cuda_dit_forward_smoke /home/alex/HF-MODELS/MiniMax-H3 int8; \
+	else \
+		echo "skip: DiT INT8 forward smoke (transformer weights not available)"; \
+	fi
 
 smoke: h3_cuda_smoke
 	./h3_cuda_smoke

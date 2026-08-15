@@ -73,27 +73,39 @@ static uint64_t hash_f32(const float *values, size_t count) {
     return hash;
 }
 
-static void configure_bf16_path(void) {
-    setenv("H3_DISABLE_INT8_MLP", "1", 1);
-    setenv("H3_DISABLE_INT8_QKV", "1", 1);
-    setenv("H3_DISABLE_INT8_ATTENTION_OUT", "1", 1);
+static void configure_path(int int8_mlp) {
     setenv("H3_DISABLE_TOKEN_REDUCTION", "1", 1);
+    if (int8_mlp) {
+        unsetenv("H3_DISABLE_INT8_MLP");
+        /* Tiny smoke layout has sequence < 128, so QKV/attn stay BF16. */
+        setenv("H3_DISABLE_INT8_QKV", "1", 1);
+        setenv("H3_DISABLE_INT8_ATTENTION_OUT", "1", 1);
+    } else {
+        setenv("H3_DISABLE_INT8_MLP", "1", 1);
+        setenv("H3_DISABLE_INT8_QKV", "1", 1);
+        setenv("H3_DISABLE_INT8_ATTENTION_OUT", "1", 1);
+    }
 }
 
 static h3_dit *load_smoke_dit(const char *weights_path, h3_text_embedding *text,
                               h3_layout *layout, h3_sigma_schedule *sigmas,
-                              unsigned active_blocks, char *error,
-                              size_t error_size) {
+                              unsigned active_blocks, int int8_mlp,
+                              char *error, size_t error_size) {
+    /* use_slower_bf16_mlp = !int8_mlp; QKV/attn remain slower BF16 for this
+     * geometry. */
+    int slower_mlp = int8_mlp ? 0 : 1;
     return h3_dit_load_t2va(
         weights_path, "h3_shaders.metal", text, layout, sigmas, active_blocks,
         1, 0, 0, 1.0f,
-        1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0,
+        slower_mlp, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0,
         NULL, NULL, error, error_size);
 }
 
 int main(int argc, char **argv) {
     const char *model_root = argc > 1 ? argv[1] : getenv("H3_MODEL_ROOT");
-    int full_blocks = argc > 2 && strcmp(argv[2], "full") == 0;
+    const char *mode = argc > 2 ? argv[2] : "";
+    int full_blocks = strcmp(mode, "full") == 0 || strcmp(mode, "int8-full") == 0;
+    int int8_mlp = strcmp(mode, "int8") == 0 || strcmp(mode, "int8-full") == 0;
     if (!model_root) model_root = "MiniMax-H3";
     if (!weights_available(model_root)) {
         const char *fallback = "/home/alex/HF-MODELS/MiniMax-H3";
@@ -105,7 +117,7 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    configure_bf16_path();
+    configure_path(int8_mlp);
 
     char weights_path[1024];
     snprintf(weights_path, sizeof(weights_path), "%s/FL2VA/transformer",
@@ -146,7 +158,7 @@ int main(int argc, char **argv) {
 
     unsigned active_blocks = full_blocks ? 50u : 25u;
     h3_dit *dit = load_smoke_dit(weights_path, &text, &layout, &sigmas,
-                                 active_blocks, error, sizeof(error));
+                                 active_blocks, int8_mlp, error, sizeof(error));
     if (!dit) {
         fprintf(stderr, "FAIL: h3_dit_load_t2va: %s\n", error);
         free(text_bf16);
@@ -186,10 +198,10 @@ int main(int argc, char **argv) {
 
     h3_gpu_stats stats;
     if (!h3_dit_get_gpu_stats(dit, &stats)) fail("cannot read GPU stats");
-    printf("cuda dit forward smoke: %u active blocks, video hash %016llx, "
+    printf("cuda dit forward smoke%s: %u active blocks, video hash %016llx, "
            "audio hash %016llx, %.2f MiB peak, %llu submissions\n",
-           active_blocks, (unsigned long long)video_hash,
-           (unsigned long long)audio_hash,
+           int8_mlp ? " (int8 mlp)" : "", active_blocks,
+           (unsigned long long)video_hash, (unsigned long long)audio_hash,
            (double)stats.peak_live_bytes / (1024.0 * 1024.0),
            (unsigned long long)stats.submissions);
 
@@ -203,7 +215,11 @@ int main(int argc, char **argv) {
     free(video_out_b);
     free(audio_out_b);
 
-    if (full_blocks) {
+    if (int8_mlp && full_blocks) {
+        puts("ok: CUDA INT8-MLP DiT forward smoke passed (50 active blocks)");
+    } else if (int8_mlp) {
+        puts("ok: CUDA INT8-MLP DiT forward smoke passed (25 active blocks)");
+    } else if (full_blocks) {
         puts("ok: CUDA production DiT forward smoke passed (50 active blocks)");
     } else {
         puts("ok: CUDA production DiT forward smoke passed (25 active blocks)");
