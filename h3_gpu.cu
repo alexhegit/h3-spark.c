@@ -3483,6 +3483,96 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     return ok;
 }
 
+int h3_gpu_gate_adaln_quantize_int8(
+    h3_gpu *gpu, h3_gpu_tensor *gated_residual,
+    h3_gpu_tensor *quantized_output, h3_gpu_tensor *quantized_scales,
+    const h3_gpu_tensor *residual, const h3_gpu_tensor *branch,
+    const h3_gpu_tensor *norm_weight, const h3_gpu_tensor *gate_modulation,
+    const h3_gpu_tensor *norm_modulation, const h3_gpu_tensor *row_map,
+    uint32_t rows, uint32_t padded_rows, uint32_t width, uint32_t slots,
+    uint32_t gate_slot, uint32_t shift_slot, uint32_t scale_slot,
+    float epsilon) {
+    size_t elements = (size_t)rows * width;
+    if (!gpu || !gated_residual || !quantized_output || !quantized_scales ||
+        !residual || !branch || !norm_weight || !gate_modulation ||
+        !norm_modulation || !row_map || !rows || padded_rows < rows || !width ||
+        gate_slot >= slots || shift_slot >= slots || scale_slot >= slots)
+        return h3_gpu_fail(gpu, "invalid gate AdaLN quantize request");
+
+    h3_gpu_tensor *adaln = h3_gpu_tensor_new_bf16(gpu, elements);
+    if (!adaln) return h3_gpu_fail(gpu, "gate AdaLN quantize temp alloc failed");
+    int ok =
+        h3_gpu_gate_adaln_bf16(gpu, gated_residual, adaln, residual, branch,
+                               norm_weight, gate_modulation, norm_modulation,
+                               row_map, rows, width, slots, gate_slot,
+                               shift_slot, scale_slot, epsilon) &&
+        h3_gpu_quantize_bf16_int8_rows(gpu, quantized_output, quantized_scales,
+                                       adaln, rows, padded_rows, width, 1.0f);
+    h3_gpu_tensor_free(adaln);
+    return ok;
+}
+
+int h3_gpu_grouped_qkv_linear_rope_int8(
+    h3_gpu *gpu, h3_gpu_tensor *query, h3_gpu_tensor *key,
+    h3_gpu_tensor *value, h3_gpu_tensor *quantized_input,
+    h3_gpu_tensor *input_scales, const h3_gpu_tensor *input,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *weight_scales,
+    const h3_gpu_tensor *q_norm, const h3_gpu_tensor *k_norm,
+    const h3_gpu_tensor *rope_cos, const h3_gpu_tensor *rope_sin,
+    uint32_t rows, uint32_t input_dim, uint32_t heads, uint32_t head_dim,
+    uint32_t rope_half, float epsilon, int input_is_quantized,
+    int use_slower_unfused_qkv_rope, int use_slower_scalar_qkv_rms,
+    int use_slower_uncached_int8_scales) {
+    (void)use_slower_unfused_qkv_rope;
+    (void)use_slower_scalar_qkv_rms;
+    (void)use_slower_uncached_int8_scales;
+    uint32_t inner = heads * head_dim;
+    uint32_t padded_rows = (rows + 127u) & ~127u;
+    if (padded_rows < rows) padded_rows = rows;
+    size_t projected = (size_t)rows * inner;
+    size_t rope_count = (size_t)rows * rope_half;
+    if (!gpu || !query || !key || !value || !quantized_input || !input_scales ||
+        !weight || !weight_scales || !q_norm || !k_norm || !rope_cos ||
+        !rope_sin || (!input_is_quantized && !input) || !rows || !input_dim ||
+        !heads || !head_dim ||
+        weight->dtype != H3_GPU_I8 || weight_scales->dtype != H3_GPU_F32 ||
+        quantized_input->dtype != H3_GPU_I8 ||
+        input_scales->dtype != H3_GPU_F32 || query->dtype != H3_GPU_BF16 ||
+        key->dtype != H3_GPU_BF16 || value->dtype != H3_GPU_BF16 ||
+        q_norm->dtype != H3_GPU_BF16 || k_norm->dtype != H3_GPU_BF16 ||
+        rope_cos->dtype != H3_GPU_BF16 || rope_sin->dtype != H3_GPU_BF16 ||
+        weight->elements < (size_t)inner * 3u * input_dim ||
+        weight_scales->elements < inner * 3u ||
+        quantized_input->elements < (size_t)padded_rows * input_dim ||
+        input_scales->elements < padded_rows || query->elements < projected ||
+        key->elements < projected || value->elements < projected ||
+        q_norm->elements < head_dim || k_norm->elements < head_dim ||
+        rope_cos->elements < rope_count || rope_sin->elements < rope_count ||
+        (!input_is_quantized &&
+         (input->dtype != H3_GPU_BF16 ||
+          input->elements < (size_t)rows * input_dim)))
+        return h3_gpu_fail(gpu, "invalid INT8 QKV/RoPE request");
+
+    if (!input_is_quantized &&
+        !h3_gpu_quantize_bf16_int8_rows(gpu, quantized_input, input_scales,
+                                        input, rows, padded_rows, input_dim,
+                                        1.0f))
+        return 0;
+
+    h3_gpu_tensor *qkv =
+        h3_gpu_tensor_new_bf16(gpu, (size_t)rows * inner * 3u);
+    if (!qkv) return h3_gpu_fail(gpu, "INT8 QKV temp alloc failed");
+    int ok =
+        h3_gpu_linear_int8_bf16_impl(
+            gpu, qkv, quantized_input, input_scales, NULL, weight,
+            weight_scales, rows, input_dim, inner * 3u, 0, 1) &&
+        h3_gpu_qkv_rope_bf16_layout(gpu, query, key, value, qkv, q_norm,
+                                    k_norm, rope_cos, rope_sin, rows, heads,
+                                    head_dim, rope_half, 1u, epsilon);
+    h3_gpu_tensor_free(qkv);
+    return ok;
+}
+
 int h3_gpu_begin(h3_gpu *gpu) {
     if (!gpu) return 0;
     gpu->error[0] = '\0';

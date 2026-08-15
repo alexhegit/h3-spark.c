@@ -2441,6 +2441,102 @@ int main(void) {
         }
     }
 
+    const uint32_t gaq_rows = 4;
+    const uint32_t gaq_width = 32;
+    const uint32_t gaq_slots = 6;
+    const uint32_t gaq_padded = (gaq_rows + 127u) & ~127u;
+    float gaq_res_host[gaq_rows * gaq_width];
+    float gaq_branch_host[gaq_rows * gaq_width];
+    float gaq_norm_host[gaq_width];
+    float gaq_mod_host[gaq_slots * gaq_width];
+    uint32_t gaq_map[gaq_rows];
+    uint16_t gaq_res_bf16[gaq_rows * gaq_width];
+    uint16_t gaq_branch_bf16[gaq_rows * gaq_width];
+    uint16_t gaq_norm_bf16[gaq_width];
+    uint16_t gaq_mod_bf16[gaq_slots * gaq_width];
+    float gaq_gate_ref[gaq_rows * gaq_width];
+    float gaq_adaln_ref[gaq_rows * gaq_width];
+    int8_t gaq_qi8[gaq_rows * gaq_width];
+    float gaq_scales_ref[gaq_rows];
+    uint16_t gaq_gate_out_bf16[gaq_rows * gaq_width];
+    for (uint32_t i = 0; i < gaq_rows; i++) gaq_map[i] = 0;
+    for (size_t i = 0; i < (size_t)gaq_rows * gaq_width; i++) {
+        gaq_res_host[i] = sinf((float)i * 0.08f);
+        gaq_branch_host[i] = cosf((float)i * 0.06f) * 0.5f;
+        gaq_res_bf16[i] = f32_to_bf16(gaq_res_host[i]);
+        gaq_branch_bf16[i] = f32_to_bf16(gaq_branch_host[i]);
+        gaq_res_host[i] = bf16_to_f32(gaq_res_bf16[i]);
+        gaq_branch_host[i] = bf16_to_f32(gaq_branch_bf16[i]);
+    }
+    for (uint32_t i = 0; i < gaq_width; i++) {
+        gaq_norm_host[i] = 0.75f + 0.01f * (float)i;
+        gaq_norm_bf16[i] = f32_to_bf16(gaq_norm_host[i]);
+        gaq_norm_host[i] = bf16_to_f32(gaq_norm_bf16[i]);
+    }
+    for (size_t i = 0; i < (size_t)gaq_slots * gaq_width; i++) {
+        gaq_mod_host[i] = sinf((float)i * 0.03f) * 0.2f;
+        gaq_mod_bf16[i] = f32_to_bf16(gaq_mod_host[i]);
+        gaq_mod_host[i] = bf16_to_f32(gaq_mod_bf16[i]);
+    }
+    gate_ref(gaq_res_host, gaq_branch_host, gaq_mod_host, gaq_map, gaq_gate_ref,
+             gaq_rows, gaq_width, gaq_slots, 0);
+    adaln_ref(gaq_gate_ref, gaq_norm_host, gaq_mod_host, gaq_map, gaq_adaln_ref,
+              gaq_rows, gaq_width, gaq_slots, 1, 2, 1e-5f);
+    quantize_bf16_int8_rows_ref(gaq_adaln_ref, gaq_qi8, gaq_scales_ref, gaq_rows,
+                                gaq_width, 1.0f);
+
+    h3_gpu_tensor *gaq_res =
+        h3_gpu_tensor_from_bf16(gpu, gaq_res_bf16, (size_t)gaq_rows * gaq_width);
+    h3_gpu_tensor *gaq_branch = h3_gpu_tensor_from_bf16(
+        gpu, gaq_branch_bf16, (size_t)gaq_rows * gaq_width);
+    h3_gpu_tensor *gaq_norm =
+        h3_gpu_tensor_from_bf16(gpu, gaq_norm_bf16, gaq_width);
+    h3_gpu_tensor *gaq_mod = h3_gpu_tensor_from_bf16(
+        gpu, gaq_mod_bf16, (size_t)gaq_slots * gaq_width);
+    h3_gpu_tensor *gaq_map_t =
+        h3_gpu_tensor_from_u32(gpu, gaq_map, gaq_rows);
+    h3_gpu_tensor *gaq_gate =
+        h3_gpu_tensor_new_bf16(gpu, (size_t)gaq_rows * gaq_width);
+    h3_gpu_tensor *gaq_quant =
+        h3_gpu_tensor_new_i8(gpu, (size_t)gaq_padded * gaq_width);
+    h3_gpu_tensor *gaq_scales = h3_gpu_tensor_new_f32(gpu, gaq_padded);
+    check(gaq_res && gaq_branch && gaq_norm && gaq_mod && gaq_map_t && gaq_gate &&
+              gaq_quant && gaq_scales,
+          "gate_adaln_quantize alloc");
+    if (gaq_res && gaq_branch && gaq_norm && gaq_mod && gaq_map_t && gaq_gate &&
+        gaq_quant && gaq_scales) {
+        check(h3_gpu_gate_adaln_quantize_int8(
+                  gpu, gaq_gate, gaq_quant, gaq_scales, gaq_res, gaq_branch,
+                  gaq_norm, gaq_mod, gaq_mod, gaq_map_t, gaq_rows, gaq_padded,
+                  gaq_width, gaq_slots, 0, 1, 2, 1e-5f),
+              "gate_adaln_quantize_int8");
+        check(h3_gpu_submit(gpu), "submit gate_adaln_quantize");
+        check(h3_gpu_tensor_read_bf16(gaq_gate, gaq_gate_out_bf16,
+                                      (size_t)gaq_rows * gaq_width),
+              "read gated residual");
+        float gaq_scales_got[gaq_rows];
+        check(h3_gpu_tensor_read_f32(gaq_scales, gaq_scales_got, gaq_rows),
+              "read quant scales");
+        for (size_t i = 0; i < (size_t)gaq_rows * gaq_width; i++) {
+            float got = bf16_to_f32(gaq_gate_out_bf16[i]);
+            if (fabsf(got - gaq_gate_ref[i]) >= 5e-2f) {
+                fprintf(stderr,
+                        "FAIL: gate_adaln_quantize gate mismatch at %zu\n", i);
+                failures++;
+                break;
+            }
+        }
+        for (uint32_t i = 0; i < gaq_rows; i++) {
+            if (fabsf(gaq_scales_got[i] - gaq_scales_ref[i]) >= 1e-4f) {
+                fprintf(stderr,
+                        "FAIL: gate_adaln_quantize scale mismatch at %u got=%f expected=%f\n",
+                        i, gaq_scales_got[i], gaq_scales_ref[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
     const uint32_t patch_rows = 1;
     const uint32_t patch_in_dim = 32;
     const uint32_t patch_out_dim = 5376;
@@ -2611,6 +2707,14 @@ int main(void) {
     h3_gpu_tensor_free(mlp8_quant);
     h3_gpu_tensor_free(mlp8_act_scales);
     h3_gpu_tensor_free(mlp8_out_t);
+    h3_gpu_tensor_free(gaq_res);
+    h3_gpu_tensor_free(gaq_branch);
+    h3_gpu_tensor_free(gaq_norm);
+    h3_gpu_tensor_free(gaq_mod);
+    h3_gpu_tensor_free(gaq_map_t);
+    h3_gpu_tensor_free(gaq_gate);
+    h3_gpu_tensor_free(gaq_quant);
+    h3_gpu_tensor_free(gaq_scales);
     h3_gpu_free(gpu);
 
     if (failures) {
