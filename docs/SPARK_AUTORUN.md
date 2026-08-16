@@ -37,17 +37,20 @@ make -f Makefile.linux test
 | `./h3` e2e | ✅ | 256²×22 MP4 written |
 
 ### Remaining stubs (**4**, non-blocking)
-- DiT-only F32: `adaln_f32`, `gate_f32`, `qkv_rope_f32`
-- Metal-only: `mlp_nax_bf16`
+
+See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md):
+
+- **KI-001** DiT F32: `adaln_f32` / `gate_f32` / `qkv_rope_f32` — deferred on Spark (BF16/INT8 path); not planned unless something forces FP32 DiT
+- **KI-002** `mlp_nax_bf16` — Metal-only; intentional CUDA stub
 
 ### Optional polish
 - MLX fixture parity when `misc/fixtures` present
-- README 512² presets / perf
+- 512² preset wall-clock / `--profile` baseline on Spark
 
 ## Commits (Phase 3)
 
 ```
-(pending) audio encoder attention + smoke
+ec2228b audio encoder attention + smoke (Phase 3 close)
 b302ca7 video encoder pad/conv3d/group_norm + smoke
 7fe5d98 Phase 3 e2e generate documented
 117e538 audio VAE F32 decode + smoke
@@ -56,4 +59,4 @@ e27b1a3 video VAE F32 decode + smoke
 
 ---
 
-*Last updated: 2026-08-16 — Phase 3 complete*
+*Last updated: 2026-08-16*
