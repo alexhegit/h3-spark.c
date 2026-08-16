@@ -27,6 +27,7 @@ IMPLEMENTED = {
     "h3_gpu_linear_f32", "h3_gpu_silu_f32",
     "h3_gpu_scale_add_f32", "h3_gpu_add_scaled_f32", "h3_gpu_clip_f32",
     "h3_gpu_layer_norm_f32", "h3_gpu_swiglu_f32", "h3_gpu_geglu_f32",
+    "h3_gpu_rms_norm_f32", "h3_gpu_video_qkv_rope_f32", "h3_gpu_sdpa_f32",
     "h3_gpu_linear_bf16",
     "h3_gpu_adaln_bf16", "h3_gpu_adaln_bf16_offset", "h3_gpu_gate_bf16",
     "h3_gpu_swiglu_bf16", "h3_gpu_mlp_bf16",

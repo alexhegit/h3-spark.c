@@ -54,6 +54,9 @@ h3_cuda_vision_smoke: tests/test_cuda_vision_smoke.o $(LIB_OBJ)
 h3_cuda_dit_forward_smoke: tests/test_cuda_dit_forward_smoke.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+h3_cuda_video_vae_smoke: tests/test_cuda_video_vae_smoke.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 # Requires MiniMax-H3/tokenizer/tokenizer.json (or pass path as argv[1]).
 tokenizer_test: tests/test_tokenizer.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -98,6 +101,15 @@ test: h3_tests h3_cuda_smoke h3_cuda_ops
 		./tokenizer_smoke $$path; \
 	else \
 		echo "skip: tokenizer JSON not available"; \
+	fi
+	@$(MAKE) -f Makefile.linux h3_cuda_video_vae_smoke
+	@path=$${H3_MODEL_ROOT:-MiniMax-H3}; \
+	if test -f $$path/FL2VA/video_vae/source/config.json; then \
+		./h3_cuda_video_vae_smoke $$path; \
+	elif test -f /home/alex/HF-MODELS/MiniMax-H3/FL2VA/video_vae/source/config.json; then \
+		./h3_cuda_video_vae_smoke /home/alex/HF-MODELS/MiniMax-H3; \
+	else \
+		echo "skip: video VAE smoke (weights not available)"; \
 	fi
 
 test-step: h3_cuda_dit_block_smoke h3_cuda_text_smoke h3_cuda_dit_forward_smoke
@@ -169,6 +181,7 @@ linenoise.o: CFLAGS += -Wno-conversion
 
 clean:
 	rm -f h3 h3_tests h3_cuda_smoke h3_cuda_ops h3_cuda_dit_block_smoke \
-		h3_cuda_text_smoke h3_cuda_vision_smoke h3_cuda_dit_forward_smoke h3_cuda_probe libh3_cuda.a \
+		h3_cuda_text_smoke h3_cuda_vision_smoke h3_cuda_dit_forward_smoke \
+		h3_cuda_video_vae_smoke h3_cuda_probe libh3_cuda.a \
 		tokenizer_test tokenizer_smoke \
 		*.o *.d tests/*.o tests/*.d tools/*.o tools/*.d third_party/*.o third_party/*.d

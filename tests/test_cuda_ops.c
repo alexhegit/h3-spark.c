@@ -213,6 +213,56 @@ static void vision_qkv_rope_ref(const float *qkv, const float *rope_cos,
     }
 }
 
+/* Metal h3_video_qkv_rope_f32: interleaved QKV + per-head RMS + RoPE. */
+static void video_qkv_rope_ref(const float *qkv, const float *rope_cos,
+                               const float *rope_sin, float *query, float *key,
+                               float *value, uint32_t sequence, uint32_t heads,
+                               uint32_t head_dim, uint32_t rope_half,
+                               float epsilon) {
+    for (uint32_t row = 0; row < sequence; row++) {
+        for (uint32_t head = 0; head < heads; head++) {
+            size_t base =
+                ((size_t)row * heads + head) * head_dim * 3u;
+            float q_sum = 0.0f;
+            float k_sum = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                float q = qkv[base + d];
+                float k = qkv[base + head_dim + d];
+                q_sum = fmaf(q, q, q_sum);
+                k_sum = fmaf(k, k, k_sum);
+            }
+            float qi = 1.0f / sqrtf(q_sum / (float)head_dim + epsilon);
+            float ki = 1.0f / sqrtf(k_sum / (float)head_dim + epsilon);
+            for (uint32_t dimension = 0; dimension < head_dim; dimension++) {
+                float q0 = qkv[base + dimension] * qi;
+                float k0 = qkv[base + head_dim + dimension] * ki;
+                if (dimension < rope_half) {
+                    uint32_t pair = dimension + rope_half;
+                    float q1 = qkv[base + pair] * qi;
+                    float k1 = qkv[base + head_dim + pair] * ki;
+                    float c = rope_cos[row * rope_half + dimension];
+                    float s = rope_sin[row * rope_half + dimension];
+                    q0 = q0 * c - q1 * s;
+                    k0 = k0 * c - k1 * s;
+                } else if (dimension < rope_half * 2u) {
+                    uint32_t pair = dimension - rope_half;
+                    float q1 = qkv[base + pair] * qi;
+                    float k1 = qkv[base + head_dim + pair] * ki;
+                    float c = rope_cos[row * rope_half + pair];
+                    float s = rope_sin[row * rope_half + pair];
+                    q0 = q0 * c + q1 * s;
+                    k0 = k0 * c + k1 * s;
+                }
+                size_t output_index =
+                    ((size_t)row * heads + head) * head_dim + dimension;
+                query[output_index] = q0;
+                key[output_index] = k0;
+                value[output_index] = qkv[base + head_dim * 2u + dimension];
+            }
+        }
+    }
+}
+
 static void sdpa_ref(const float *query, const float *key, const float *value,
                      float *output, uint32_t sequence, uint32_t heads,
                      uint32_t head_dim, float scale) {
@@ -1351,6 +1401,162 @@ int main(void) {
                 break;
             }
         }
+    }
+
+    {
+        const uint32_t rms_rows = 4;
+        const uint32_t rms_width = 64;
+        const size_t rms_count = (size_t)rms_rows * rms_width;
+        float rms_in_host[rms_count];
+        float rms_weight_host[rms_width];
+        float rms_ref[rms_count];
+        for (uint32_t column = 0; column < rms_width; column++)
+            rms_weight_host[column] = 0.75f + 0.01f * (float)column;
+        for (size_t i = 0; i < rms_count; i++)
+            rms_in_host[i] = sinf((float)i * 0.09f);
+        rms_norm_ref(rms_in_host, rms_weight_host, rms_ref, rms_rows, rms_width,
+                     1e-5f);
+        h3_gpu_tensor *rms_in = h3_gpu_tensor_from_f32(gpu, rms_in_host, rms_count);
+        h3_gpu_tensor *rms_weight =
+            h3_gpu_tensor_from_f32(gpu, rms_weight_host, rms_width);
+        h3_gpu_tensor *rms_out = h3_gpu_tensor_new_f32(gpu, rms_count);
+        check(rms_in && rms_weight && rms_out, "rms_norm_f32 alloc");
+        if (rms_in && rms_weight && rms_out) {
+            check(h3_gpu_rms_norm_f32(gpu, rms_out, rms_in, rms_weight, rms_rows,
+                                      rms_width, 1e-5f),
+                  "rms_norm_f32");
+            check(h3_gpu_submit(gpu), "submit rms_norm_f32");
+            float rms_got[rms_count];
+            check(h3_gpu_tensor_read_f32(rms_out, rms_got, rms_count),
+                  "read rms_norm_f32");
+            for (size_t i = 0; i < rms_count; i++) {
+                if (fabsf(rms_got[i] - rms_ref[i]) >= 1e-4f) {
+                    fprintf(stderr,
+                            "FAIL: rms_norm_f32 mismatch at %zu got=%f "
+                            "expected=%f\n",
+                            i, rms_got[i], rms_ref[i]);
+                    failures++;
+                    break;
+                }
+            }
+        }
+        h3_gpu_tensor_free(rms_in);
+        h3_gpu_tensor_free(rms_weight);
+        h3_gpu_tensor_free(rms_out);
+    }
+
+    {
+        const uint32_t vq_seq = 3;
+        const uint32_t vq_heads = 2;
+        const uint32_t vq_dim = 8;
+        const uint32_t vq_rope = 4;
+        const size_t vq_out = (size_t)vq_seq * vq_heads * vq_dim;
+        const size_t vq_qkv = vq_out * 3u;
+        const size_t vq_rope_n = (size_t)vq_seq * vq_rope;
+        float vq_qkv_host[vq_qkv];
+        float vq_cos_host[vq_rope_n];
+        float vq_sin_host[vq_rope_n];
+        float vq_q_ref[vq_out];
+        float vq_k_ref[vq_out];
+        float vq_v_ref[vq_out];
+        for (size_t i = 0; i < vq_qkv; i++)
+            vq_qkv_host[i] = sinf((float)i * 0.07f);
+        for (size_t i = 0; i < vq_rope_n; i++) {
+            vq_cos_host[i] = cosf((float)i * 0.11f);
+            vq_sin_host[i] = sinf((float)i * 0.13f);
+        }
+        video_qkv_rope_ref(vq_qkv_host, vq_cos_host, vq_sin_host, vq_q_ref,
+                           vq_k_ref, vq_v_ref, vq_seq, vq_heads, vq_dim, vq_rope,
+                           1e-5f);
+        h3_gpu_tensor *vq_qkv_t =
+            h3_gpu_tensor_from_f32(gpu, vq_qkv_host, vq_qkv);
+        h3_gpu_tensor *vq_cos_t =
+            h3_gpu_tensor_from_f32(gpu, vq_cos_host, vq_rope_n);
+        h3_gpu_tensor *vq_sin_t =
+            h3_gpu_tensor_from_f32(gpu, vq_sin_host, vq_rope_n);
+        h3_gpu_tensor *vq_q = h3_gpu_tensor_new_f32(gpu, vq_out);
+        h3_gpu_tensor *vq_k = h3_gpu_tensor_new_f32(gpu, vq_out);
+        h3_gpu_tensor *vq_v = h3_gpu_tensor_new_f32(gpu, vq_out);
+        check(vq_qkv_t && vq_cos_t && vq_sin_t && vq_q && vq_k && vq_v,
+              "video_qkv_rope_f32 alloc");
+        if (vq_qkv_t && vq_cos_t && vq_sin_t && vq_q && vq_k && vq_v) {
+            check(h3_gpu_video_qkv_rope_f32(gpu, vq_q, vq_k, vq_v, vq_qkv_t,
+                                            vq_cos_t, vq_sin_t, vq_seq, vq_heads,
+                                            vq_dim, vq_rope, 1e-5f),
+                  "video_qkv_rope_f32");
+            check(h3_gpu_submit(gpu), "submit video_qkv_rope_f32");
+            float vq_q_got[vq_out];
+            float vq_k_got[vq_out];
+            float vq_v_got[vq_out];
+            check(h3_gpu_tensor_read_f32(vq_q, vq_q_got, vq_out),
+                  "read video q");
+            check(h3_gpu_tensor_read_f32(vq_k, vq_k_got, vq_out),
+                  "read video k");
+            check(h3_gpu_tensor_read_f32(vq_v, vq_v_got, vq_out),
+                  "read video v");
+            for (size_t i = 0; i < vq_out; i++) {
+                if (fabsf(vq_q_got[i] - vq_q_ref[i]) >= 1e-4f ||
+                    fabsf(vq_k_got[i] - vq_k_ref[i]) >= 1e-4f ||
+                    fabsf(vq_v_got[i] - vq_v_ref[i]) >= 1e-4f) {
+                    fprintf(stderr,
+                            "FAIL: video_qkv_rope_f32 mismatch at %zu\n", i);
+                    failures++;
+                    break;
+                }
+            }
+        }
+        h3_gpu_tensor_free(vq_qkv_t);
+        h3_gpu_tensor_free(vq_cos_t);
+        h3_gpu_tensor_free(vq_sin_t);
+        h3_gpu_tensor_free(vq_q);
+        h3_gpu_tensor_free(vq_k);
+        h3_gpu_tensor_free(vq_v);
+    }
+
+    {
+        const uint32_t sd_seq = 4;
+        const uint32_t sd_heads = 2;
+        const uint32_t sd_dim = 8;
+        const size_t sd_count = (size_t)sd_seq * sd_heads * sd_dim;
+        float sd_q_host[sd_count];
+        float sd_k_host[sd_count];
+        float sd_v_host[sd_count];
+        float sd_ref[sd_count];
+        for (size_t i = 0; i < sd_count; i++) {
+            sd_q_host[i] = sinf((float)i * 0.05f);
+            sd_k_host[i] = cosf((float)i * 0.07f);
+            sd_v_host[i] = sinf((float)i * 0.11f + 0.3f);
+        }
+        float scale = 1.0f / sqrtf((float)sd_dim);
+        sdpa_ref(sd_q_host, sd_k_host, sd_v_host, sd_ref, sd_seq, sd_heads,
+                 sd_dim, scale);
+        h3_gpu_tensor *sd_q = h3_gpu_tensor_from_f32(gpu, sd_q_host, sd_count);
+        h3_gpu_tensor *sd_k = h3_gpu_tensor_from_f32(gpu, sd_k_host, sd_count);
+        h3_gpu_tensor *sd_v = h3_gpu_tensor_from_f32(gpu, sd_v_host, sd_count);
+        h3_gpu_tensor *sd_out = h3_gpu_tensor_new_f32(gpu, sd_count);
+        check(sd_q && sd_k && sd_v && sd_out, "sdpa_f32 alloc");
+        if (sd_q && sd_k && sd_v && sd_out) {
+            check(h3_gpu_sdpa_f32(gpu, sd_out, sd_q, sd_k, sd_v, sd_seq,
+                                  sd_heads, sd_dim, scale),
+                  "sdpa_f32");
+            check(h3_gpu_submit(gpu), "submit sdpa_f32");
+            float sd_got[sd_count];
+            check(h3_gpu_tensor_read_f32(sd_out, sd_got, sd_count),
+                  "read sdpa_f32");
+            for (size_t i = 0; i < sd_count; i++) {
+                if (fabsf(sd_got[i] - sd_ref[i]) >= 1e-4f) {
+                    fprintf(stderr,
+                            "FAIL: sdpa_f32 mismatch at %zu got=%f expected=%f\n",
+                            i, sd_got[i], sd_ref[i]);
+                    failures++;
+                    break;
+                }
+            }
+        }
+        h3_gpu_tensor_free(sd_q);
+        h3_gpu_tensor_free(sd_k);
+        h3_gpu_tensor_free(sd_v);
+        h3_gpu_tensor_free(sd_out);
     }
 
     const uint32_t qkv_sequence = 3;

@@ -2923,6 +2923,203 @@ int h3_gpu_clip_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_clip_f32");
 }
 
+__global__ static void h3_rms_norm_f32_kernel(const float *input,
+                                              const float *weight, float *output,
+                                              h3_rms_norm_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.rows) return;
+
+    extern __shared__ float reductions[];
+    const float *row_input = input + (size_t)row * args.width;
+    float local_sum = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float value = row_input[column];
+        local_sum = fmaf(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float inverse =
+        rsqrtf(reductions[0] / (float)args.width + args.epsilon);
+    for (uint32_t column = tid; column < args.width; column += threads)
+        output[(size_t)row * args.width + column] =
+            row_input[column] * inverse * weight[column];
+}
+
+int h3_gpu_rms_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                        const h3_gpu_tensor *input,
+                        const h3_gpu_tensor *weight, uint32_t rows,
+                        uint32_t width, float epsilon) {
+    size_t count = (size_t)rows * width;
+    if (!gpu || !output || !input || !weight ||
+        output->dtype != H3_GPU_F32 || input->dtype != H3_GPU_F32 ||
+        weight->dtype != H3_GPU_F32 || output->elements < count ||
+        input->elements < count || weight->elements < width || !rows || !width)
+        return h3_gpu_fail(gpu, "invalid F32 RMSNorm request");
+    h3_rms_norm_args args = {rows, width, epsilon};
+    unsigned threads = 256;
+    h3_rms_norm_f32_kernel<<<rows, threads, threads * sizeof(float),
+                             gpu->stream>>>(
+        (const float *)input->device, (const float *)weight->device,
+        (float *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_rms_norm_f32");
+}
+
+struct h3_video_qkv_rope_args {
+    uint32_t sequence;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t rope_half;
+    float epsilon;
+};
+
+__global__ static void h3_video_qkv_rope_f32_kernel(
+    const float *qkv, const float *rope_cos, const float *rope_sin,
+    float *query, float *key, float *value, h3_video_qkv_rope_args args) {
+    uint32_t dimension = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t head = (uint32_t)blockIdx.y;
+    uint32_t row = (uint32_t)blockIdx.z;
+    if (dimension >= args.head_dim || head >= args.heads || row >= args.sequence)
+        return;
+    size_t base =
+        ((size_t)row * args.heads + head) * args.head_dim * 3u;
+    float q_sum = 0.0f;
+    float k_sum = 0.0f;
+    for (uint32_t d = 0; d < args.head_dim; d++) {
+        float q = qkv[base + d];
+        float k = qkv[base + args.head_dim + d];
+        q_sum = fmaf(q, q, q_sum);
+        k_sum = fmaf(k, k, k_sum);
+    }
+    float qi = rsqrtf(q_sum / (float)args.head_dim + args.epsilon);
+    float ki = rsqrtf(k_sum / (float)args.head_dim + args.epsilon);
+    float q0 = qkv[base + dimension] * qi;
+    float k0 = qkv[base + args.head_dim + dimension] * ki;
+    if (dimension < args.rope_half) {
+        uint32_t pair = dimension + args.rope_half;
+        float q1 = qkv[base + pair] * qi;
+        float k1 = qkv[base + args.head_dim + pair] * ki;
+        float c = rope_cos[row * args.rope_half + dimension];
+        float s = rope_sin[row * args.rope_half + dimension];
+        q0 = q0 * c - q1 * s;
+        k0 = k0 * c - k1 * s;
+    } else if (dimension < args.rope_half * 2u) {
+        uint32_t pair = dimension - args.rope_half;
+        float q1 = qkv[base + pair] * qi;
+        float k1 = qkv[base + args.head_dim + pair] * ki;
+        float c = rope_cos[row * args.rope_half + pair];
+        float s = rope_sin[row * args.rope_half + pair];
+        q0 = q0 * c + q1 * s;
+        k0 = k0 * c + k1 * s;
+    }
+    size_t output_index =
+        ((size_t)row * args.heads + head) * args.head_dim + dimension;
+    query[output_index] = q0;
+    key[output_index] = k0;
+    value[output_index] = qkv[base + args.head_dim * 2u + dimension];
+}
+
+int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
+                              h3_gpu_tensor *key, h3_gpu_tensor *value,
+                              const h3_gpu_tensor *qkv,
+                              const h3_gpu_tensor *rope_cos,
+                              const h3_gpu_tensor *rope_sin,
+                              uint32_t sequence, uint32_t heads,
+                              uint32_t head_dim, uint32_t rope_half,
+                              float epsilon) {
+    size_t out_count = (size_t)sequence * heads * head_dim;
+    size_t qkv_count = out_count * 3u;
+    size_t rope_count = (size_t)sequence * rope_half;
+    if (!gpu || !query || !key || !value || !qkv || !rope_cos || !rope_sin ||
+        query->dtype != H3_GPU_F32 || key->dtype != H3_GPU_F32 ||
+        value->dtype != H3_GPU_F32 || qkv->dtype != H3_GPU_F32 ||
+        rope_cos->dtype != H3_GPU_F32 || rope_sin->dtype != H3_GPU_F32 ||
+        query->elements < out_count || key->elements < out_count ||
+        value->elements < out_count || qkv->elements < qkv_count ||
+        rope_cos->elements < rope_count || rope_sin->elements < rope_count ||
+        !sequence || !heads || !head_dim || !rope_half ||
+        rope_half * 2u > head_dim)
+        return h3_gpu_fail(gpu, "invalid video QKV/RoPE request");
+    h3_video_qkv_rope_args args = {sequence, heads, head_dim, rope_half,
+                                   epsilon};
+    dim3 threads(32, 1, 1);
+    dim3 blocks((head_dim + threads.x - 1) / threads.x, heads, sequence);
+    h3_video_qkv_rope_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)qkv->device, (const float *)rope_cos->device,
+        (const float *)rope_sin->device, (float *)query->device,
+        (float *)key->device, (float *)value->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_video_qkv_rope_f32");
+}
+
+__global__ static void h3_sdpa_f32_kernel(const float *query, const float *key,
+                                          const float *value, float *output,
+                                          h3_sdpa_args args) {
+    extern __shared__ float scores[];
+    uint32_t head = (uint32_t)blockIdx.x;
+    uint32_t q_row = (uint32_t)blockIdx.y;
+    uint32_t dim = (uint32_t)threadIdx.x;
+    if (head >= args.heads || q_row >= args.sequence || dim >= args.head_dim)
+        return;
+    size_t q_base = ((size_t)q_row * args.heads + head) * args.head_dim;
+    if (dim == 0) {
+        float max_score = -INFINITY;
+        for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
+            size_t k_base =
+                ((size_t)k_row * args.heads + head) * args.head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < args.head_dim; d++)
+                dot = fmaf(query[q_base + d], key[k_base + d], dot);
+            scores[k_row] = dot * args.scale;
+            if (scores[k_row] > max_score) max_score = scores[k_row];
+        }
+        float sum = 0.0f;
+        for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
+            scores[k_row] = expf(scores[k_row] - max_score);
+            sum += scores[k_row];
+        }
+        float inverse = 1.0f / sum;
+        for (uint32_t k_row = 0; k_row < args.sequence; k_row++)
+            scores[k_row] *= inverse;
+    }
+    __syncthreads();
+    float accumulated = 0.0f;
+    for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
+        size_t v_base = ((size_t)k_row * args.heads + head) * args.head_dim;
+        accumulated = fmaf(scores[k_row], value[v_base + dim], accumulated);
+    }
+    output[q_base + dim] = accumulated;
+}
+
+int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                    const h3_gpu_tensor *value, uint32_t sequence,
+                    uint32_t heads, uint32_t head_dim, float scale) {
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (!gpu || !output || !query || !key || !value ||
+        output->dtype != H3_GPU_F32 || query->dtype != H3_GPU_F32 ||
+        key->dtype != H3_GPU_F32 || value->dtype != H3_GPU_F32 ||
+        output->elements < count || query->elements < count ||
+        key->elements < count || value->elements < count || !sequence ||
+        !heads || !head_dim)
+        return h3_gpu_fail(gpu, "invalid F32 SDPA request");
+    h3_sdpa_args args = {sequence, heads, head_dim, scale, 0u};
+    dim3 threads(head_dim, 1, 1);
+    dim3 blocks(heads, sequence, 1);
+    size_t shared_bytes = (size_t)sequence * sizeof(float);
+    h3_sdpa_f32_kernel<<<blocks, threads, shared_bytes, gpu->stream>>>(
+        (const float *)query->device, (const float *)key->device,
+        (const float *)value->device, (float *)output->device, args);
+    gpu->stats.mps_sdpa_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_f32");
+}
+
 struct h3_int8_quant_args {
     uint32_t rows;
     uint32_t dispatch_rows;
