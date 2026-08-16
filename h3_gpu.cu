@@ -3358,11 +3358,13 @@ __global__ static void h3_alias_free_snake_f32_kernel(
     const float *input, const float *alpha_log, const float *beta_log,
     const float *upsample_filter, const float *downsample_filter, float *output,
     h3_audio_activation_args args) {
-    uint32_t channel = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t time = (uint32_t)blockIdx.y;
-    uint32_t batch = (uint32_t)blockIdx.z;
-    if (channel >= args.channels || time >= args.length || batch >= args.batch)
-        return;
+    size_t count = (size_t)args.batch * args.length * args.channels;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    uint32_t channel = (uint32_t)(gid % args.channels);
+    size_t rem = gid / args.channels;
+    uint32_t time = (uint32_t)(rem % args.length);
+    uint32_t batch = (uint32_t)(rem / args.length);
     float alpha = expf(alpha_log[channel]);
     float beta = expf(beta_log[channel]);
     float result = 0.0f;
@@ -3392,9 +3394,7 @@ __global__ static void h3_alias_free_snake_f32_kernel(
         float activated = upsampled + sine * sine / (beta + 1e-9f);
         result = fmaf(activated, downsample_filter[down_k], result);
     }
-    size_t destination =
-        ((size_t)batch * args.length + time) * args.channels + channel;
-    output[destination] = result;
+    output[gid] = result;
 }
 
 int h3_gpu_alias_free_snake_f32(
@@ -3415,8 +3415,9 @@ int h3_gpu_alias_free_snake_f32(
         downsample_filter->elements < 12 || !batch || !length || !channels)
         return h3_gpu_fail(gpu, "invalid alias-free Snake request");
     h3_audio_activation_args args = {batch, length, channels};
-    dim3 threads(32, 1, 1);
-    dim3 blocks((channels + threads.x - 1) / threads.x, length, batch);
+    unsigned threads = 256;
+    unsigned blocks =
+        (unsigned)((count + threads - 1) / threads);
     h3_alias_free_snake_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
         (const float *)input->device, (const float *)alpha_log->device,
         (const float *)beta_log->device, (const float *)upsample_filter->device,
