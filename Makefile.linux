@@ -20,7 +20,7 @@ LIB_CUDA := h3_gpu.cu h3_gpu_stubs.c
 LIB_OBJ := $(LIB_C:.c=.o) h3_gpu.o h3_gpu_stubs.o
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
-.PHONY: all test test-step smoke probe clean tokenizer_test tokenizer_smoke
+.PHONY: all test test-step test-conditional smoke probe clean tokenizer_test tokenizer_smoke
 
 all: h3
 
@@ -146,6 +146,21 @@ test: h3_tests h3_cuda_smoke h3_cuda_ops
 		./h3_cuda_audio_encoder_smoke /home/alex/HF-MODELS/MiniMax-H3; \
 	else \
 		echo "skip: audio encoder smoke (weights not available)"; \
+	fi
+
+# FL2VA first/last + Ref2VA image/silent-video (~15–20 min). Skips long --ref-video
+# by default; unset H3_CONDITIONAL_SKIP_REF_VIDEO to include 72-frame audio ref.
+test-conditional: h3
+	@chmod +x scripts/smoke_conditional.sh
+	@H3_CONDITIONAL_SKIP_REF_VIDEO=$${H3_CONDITIONAL_SKIP_REF_VIDEO:-1}; \
+	export H3_CONDITIONAL_SKIP_REF_VIDEO; \
+	path=$${H3_MODEL_ROOT:-MiniMax-H3}; \
+	if test -f $$path/FL2VA/transformer/config.json; then \
+		./scripts/smoke_conditional.sh $$path; \
+	elif test -f /home/alex/HF-MODELS/MiniMax-H3/FL2VA/transformer/config.json; then \
+		./scripts/smoke_conditional.sh /home/alex/HF-MODELS/MiniMax-H3; \
+	else \
+		echo "skip: conditional smoke (weights not available)"; \
 	fi
 
 test-step: h3_cuda_dit_block_smoke h3_cuda_text_smoke h3_cuda_dit_forward_smoke

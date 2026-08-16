@@ -10,53 +10,48 @@ Automated **h3-cuda** port on DGX Spark (`spark` branch).
 | **1** | DiT **BF16** block parity + text + vision encoder | no | ✅ Done |
 | **2** | **Metal-aligned runtime INT8** on GB10 | yes | ✅ Done |
 | **3** | Full pipeline + end-to-end generate | inherits Phase 2 | ✅ Done |
+| **3b** | Conditional paths (FL2VA keyframes + Ref2VA) | inherits | ✅ Done |
 
-**Weights:** official `MiniMaxAI/MiniMax-H3` → `FL2VA/*` **BF16** shards only.
+**Weights:** official `MiniMaxAI/MiniMax-H3` → `FL2VA/*` + optional `Ref2VA/*`.
 
 ## Gate commands
 
 ```bash
 make -f Makefile.linux test
-./h3_cuda_video_vae_smoke $H3_MODEL_ROOT
-./h3_cuda_audio_vae_smoke $H3_MODEL_ROOT
-./h3_cuda_video_encoder_smoke $H3_MODEL_ROOT
-./h3_cuda_audio_encoder_smoke $H3_MODEL_ROOT
-./h3 -d $H3_MODEL_ROOT -p "a red fox walking" \
-  --width 256 --height 256 --frames 22 --steps 2 --layers 35 \
-  -o /tmp/h3_phase3_smoke.mp4
+make -f Makefile.linux test-conditional   # FL2VA first/last + Ref2VA image/silent
+# full --ref-video (72 frames, ~20 min extra):
+H3_CONDITIONAL_SKIP_REF_VIDEO=0 make -f Makefile.linux test-conditional
 ```
+
+## Phase 3b — Conditional generate ✅
+
+| Path | Status | Notes |
+|------|--------|-------|
+| `--first-frame` | ✅ | ~135s @256²/22f/2steps |
+| `--last-frame` | ✅ | |
+| first+last | ✅ | |
+| `--ref-image` | ✅ | Ref2VA transformer |
+| `--ref-silent-video` | ✅ | |
+| `--ref-video` (w/ audio) | ✅ | needs ≥48 ref frames + long audio; fixed snake grid |
+
+**Bugfix:** `h3_gpu_alias_free_snake_f32` used `blockIdx.y = length`, which exceeds
+CUDA's 65535 grid limit once AudioVAE upsamples past ~2s of audio. Switched to
+1D linear launch.
+
+Script: `scripts/smoke_conditional.sh`
 
 ## Phase 3 — VAE + generate ✅
 
-| Path | Status | Evidence |
-|------|--------|----------|
-| Video decode | ✅ | 5×32×32, 36 SDPA / 38 sub |
-| Audio decode | ✅ | 2×3200@32k, 136 conv / 16 sub |
-| Video encode | ✅ | 64² → 24×1×4×4, 34 conv / 18 sub |
-| Audio encode | ✅ | 1600 PCM → 32×2×2, 38 conv / 1 SDPA |
-| `./h3` e2e | ✅ | 256²×22 MP4 written |
+(see prior commits)
 
 ### Remaining stubs (**4**, non-blocking)
 
-See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md):
-
-- **KI-001** DiT F32: `adaln_f32` / `gate_f32` / `qkv_rope_f32` — deferred on Spark (BF16/INT8 path); not planned unless something forces FP32 DiT
-- **KI-002** `mlp_nax_bf16` — Metal-only; intentional CUDA stub
+See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002.
 
 ### Optional polish
 - MLX fixture parity when `misc/fixtures` present
-- 512² preset wall-clock / `--profile` baseline on Spark
-
-## Commits (Phase 3)
-
-```
-ec2228b audio encoder attention + smoke (Phase 3 close)
-b302ca7 video encoder pad/conv3d/group_norm + smoke
-7fe5d98 Phase 3 e2e generate documented
-117e538 audio VAE F32 decode + smoke
-e27b1a3 video VAE F32 decode + smoke
-```
+- 512² perf / CUDA `--profile` phase marks
 
 ---
 
-*Last updated: 2026-08-16*
+*Last updated: 2026-08-16 — conditional paths green*
