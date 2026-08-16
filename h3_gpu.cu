@@ -3457,6 +3457,308 @@ int h3_gpu_snake1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_snake1d_f32");
 }
 
+static __device__ __host__ int h3_reflect_coordinate(int coordinate,
+                                                     int length) {
+    if (coordinate < 0) return -coordinate;
+    if (coordinate >= length) return 2 * length - coordinate - 2;
+    return coordinate;
+}
+
+struct h3_vae_encoder_pad_args {
+    uint32_t batch;
+    uint32_t depth;
+    uint32_t height;
+    uint32_t width;
+    uint32_t channels;
+    uint32_t depth_front;
+    uint32_t height_before;
+    uint32_t height_after;
+    uint32_t width_before;
+    uint32_t width_after;
+};
+
+__global__ static void h3_vae_encoder_pad_f32_kernel(
+    const float *input, float *output, h3_vae_encoder_pad_args args) {
+    uint32_t channel = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t out_x = (uint32_t)blockIdx.y;
+    uint32_t out_height =
+        args.height + args.height_before + args.height_after;
+    uint32_t out_width = args.width + args.width_before + args.width_after;
+    uint32_t out_depth = args.depth + args.depth_front;
+    uint32_t plane = (uint32_t)blockIdx.z;
+    if (channel >= args.channels || out_x >= out_width ||
+        plane >= args.batch * out_depth * out_height)
+        return;
+    uint32_t out_y = plane % out_height;
+    uint32_t temporal_plane = plane / out_height;
+    uint32_t out_t = temporal_plane % out_depth;
+    uint32_t batch = temporal_plane / out_depth;
+    size_t destination =
+        ((((size_t)batch * out_depth + out_t) * out_height + out_y) * out_width +
+         out_x) *
+            args.channels +
+        channel;
+    if (out_t < args.depth_front) {
+        output[destination] = 0.0f;
+        return;
+    }
+    int source_y = h3_reflect_coordinate((int)out_y - (int)args.height_before,
+                                         (int)args.height);
+    int source_x = h3_reflect_coordinate((int)out_x - (int)args.width_before,
+                                         (int)args.width);
+    uint32_t source_t = out_t - args.depth_front;
+    size_t source =
+        ((((size_t)batch * args.depth + source_t) * args.height +
+          (uint32_t)source_y) *
+             args.width +
+         (uint32_t)source_x) *
+            args.channels +
+        channel;
+    output[destination] = input[source];
+}
+
+int h3_gpu_vae_encoder_pad_f32(
+    h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+    uint32_t batch, uint32_t depth, uint32_t height, uint32_t width,
+    uint32_t channels, uint32_t depth_front, uint32_t height_before,
+    uint32_t height_after, uint32_t width_before, uint32_t width_after) {
+    uint32_t out_depth = depth + depth_front;
+    uint32_t out_height = height + height_before + height_after;
+    uint32_t out_width = width + width_before + width_after;
+    size_t input_count = (size_t)batch * depth * height * width * channels;
+    size_t output_count =
+        (size_t)batch * out_depth * out_height * out_width * channels;
+    if (!gpu || !output || !input || output->dtype != H3_GPU_F32 ||
+        input->dtype != H3_GPU_F32 || output->elements < output_count ||
+        input->elements < input_count || !batch || !depth || !height ||
+        !width || !channels)
+        return h3_gpu_fail(gpu, "invalid VAE encoder pad request");
+    h3_vae_encoder_pad_args args = {
+        batch,         depth,         height,       width,       channels,
+        depth_front,   height_before, height_after, width_before, width_after};
+    dim3 threads(32, 1, 1);
+    dim3 blocks((channels + threads.x - 1) / threads.x, out_width,
+                batch * out_depth * out_height);
+    h3_vae_encoder_pad_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)input->device, (float *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_vae_encoder_pad_f32");
+}
+
+struct h3_vae_encoder_norm_args {
+    uint32_t batch;
+    uint32_t depth;
+    uint32_t height;
+    uint32_t width;
+    uint32_t channels;
+    uint32_t groups;
+    float epsilon;
+};
+
+__global__ static void h3_vae_encoder_group_norm_silu_f32_kernel(
+    const float *input, const float *weight, const float *bias, float *output,
+    h3_vae_encoder_norm_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    uint32_t rows = args.batch * args.depth * args.groups;
+    if (row >= rows) return;
+    uint32_t channels_per_group = args.channels / args.groups;
+    uint32_t group_index = row % args.groups;
+    uint32_t temporal_plane = row / args.groups;
+    uint32_t elements = args.height * args.width * channels_per_group;
+    extern __shared__ float reductions[];
+    float local = 0.0f;
+    for (uint32_t index = tid; index < elements; index += threads) {
+        uint32_t spatial = index / channels_per_group;
+        uint32_t channel =
+            group_index * channels_per_group + index % channels_per_group;
+        size_t source =
+            ((size_t)temporal_plane * args.height * args.width + spatial) *
+                args.channels +
+            channel;
+        local += input[source];
+    }
+    reductions[tid] = local;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float mean = reductions[0] / (float)elements;
+    local = 0.0f;
+    for (uint32_t index = tid; index < elements; index += threads) {
+        uint32_t spatial = index / channels_per_group;
+        uint32_t channel =
+            group_index * channels_per_group + index % channels_per_group;
+        size_t source =
+            ((size_t)temporal_plane * args.height * args.width + spatial) *
+                args.channels +
+            channel;
+        float centered = input[source] - mean;
+        local = fmaf(centered, centered, local);
+    }
+    reductions[tid] = local;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float inverse = rsqrtf(reductions[0] / (float)elements + args.epsilon);
+    for (uint32_t index = tid; index < elements; index += threads) {
+        uint32_t spatial = index / channels_per_group;
+        uint32_t channel =
+            group_index * channels_per_group + index % channels_per_group;
+        size_t destination =
+            ((size_t)temporal_plane * args.height * args.width + spatial) *
+                args.channels +
+            channel;
+        float value =
+            (input[destination] - mean) * inverse * weight[channel] +
+            bias[channel];
+        output[destination] = value / (1.0f + expf(-value));
+    }
+}
+
+int h3_gpu_vae_encoder_group_norm_silu_f32(
+    h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *bias, uint32_t batch,
+    uint32_t depth, uint32_t height, uint32_t width, uint32_t channels,
+    uint32_t groups, float epsilon) {
+    size_t count = (size_t)batch * depth * height * width * channels;
+    if (!gpu || !output || !input || !weight || !bias ||
+        output->dtype != H3_GPU_F32 || input->dtype != H3_GPU_F32 ||
+        weight->dtype != H3_GPU_F32 || bias->dtype != H3_GPU_F32 ||
+        output->elements < count || input->elements < count ||
+        weight->elements < channels || bias->elements < channels || !batch ||
+        !depth || !height || !width || !channels || !groups ||
+        channels % groups != 0)
+        return h3_gpu_fail(gpu, "invalid VAE group-norm request");
+    h3_vae_encoder_norm_args args = {batch, depth, height, width,
+                                     channels, groups, epsilon};
+    uint32_t rows = batch * depth * groups;
+    unsigned threads = 256;
+    h3_vae_encoder_group_norm_silu_f32_kernel<<<
+        rows, threads, threads * sizeof(float), gpu->stream>>>(
+        (const float *)input->device, (const float *)weight->device,
+        (const float *)bias->device, (float *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(),
+                         "h3_vae_encoder_group_norm_silu_f32");
+}
+
+struct h3_conv3d_args {
+    uint32_t batch;
+    uint32_t depth;
+    uint32_t height;
+    uint32_t width;
+    uint32_t output_depth;
+    uint32_t output_height;
+    uint32_t output_width;
+    uint32_t input_channels;
+    uint32_t output_channels;
+    uint32_t kernel_depth;
+    uint32_t kernel_height;
+    uint32_t kernel_width;
+    uint32_t stride_depth;
+    uint32_t stride_height;
+    uint32_t stride_width;
+    uint32_t has_bias;
+};
+
+__global__ static void h3_conv3d_f32_kernel(const float *input,
+                                            const float *weight,
+                                            const float *bias, float *output,
+                                            h3_conv3d_args args) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)args.batch * args.output_depth * args.output_height *
+                   args.output_width * args.output_channels;
+    if (index >= total) return;
+    uint32_t oc = (uint32_t)(index % args.output_channels);
+    size_t rem = index / args.output_channels;
+    uint32_t ox = (uint32_t)(rem % args.output_width);
+    rem /= args.output_width;
+    uint32_t oy = (uint32_t)(rem % args.output_height);
+    rem /= args.output_height;
+    uint32_t od = (uint32_t)(rem % args.output_depth);
+    uint32_t batch = (uint32_t)(rem / args.output_depth);
+    float acc = args.has_bias ? bias[oc] : 0.0f;
+    for (uint32_t ic = 0; ic < args.input_channels; ic++) {
+        for (uint32_t kd = 0; kd < args.kernel_depth; kd++) {
+            for (uint32_t kh = 0; kh < args.kernel_height; kh++) {
+                for (uint32_t kw = 0; kw < args.kernel_width; kw++) {
+                    uint32_t id = od * args.stride_depth + kd;
+                    uint32_t ih = oy * args.stride_height + kh;
+                    uint32_t iw = ox * args.stride_width + kw;
+                    size_t in_index =
+                        ((((size_t)batch * args.depth + id) * args.height +
+                          ih) *
+                             args.width +
+                         iw) *
+                            args.input_channels +
+                        ic;
+                    size_t w_index =
+                        (((((size_t)oc * args.input_channels + ic) *
+                               args.kernel_depth +
+                           kd) *
+                              args.kernel_height +
+                          kh) *
+                             args.kernel_width +
+                         kw);
+                    acc = fmaf(input[in_index], weight[w_index], acc);
+                }
+            }
+        }
+    }
+    output[index] = acc;
+}
+
+int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width,
+                      uint32_t input_channels, uint32_t output_channels,
+                      uint32_t kernel_depth, uint32_t kernel_height,
+                      uint32_t kernel_width, uint32_t stride_depth,
+                      uint32_t stride_height, uint32_t stride_width) {
+    if (!gpu || !output || !input || !weight || !batch || !depth || !height ||
+        !width || !input_channels || !output_channels || !kernel_depth ||
+        !kernel_height || !kernel_width || !stride_depth || !stride_height ||
+        !stride_width || depth < kernel_depth || height < kernel_height ||
+        width < kernel_width)
+        return h3_gpu_fail(gpu, "invalid Conv3d request");
+    uint32_t output_depth = (depth - kernel_depth) / stride_depth + 1u;
+    uint32_t output_height = (height - kernel_height) / stride_height + 1u;
+    uint32_t output_width = (width - kernel_width) / stride_width + 1u;
+    size_t input_count =
+        (size_t)batch * depth * height * width * input_channels;
+    size_t weight_count = (size_t)output_channels * input_channels *
+                          kernel_depth * kernel_height * kernel_width;
+    size_t output_count = (size_t)batch * output_depth * output_height *
+                          output_width * output_channels;
+    if (output->dtype != H3_GPU_F32 || input->dtype != H3_GPU_F32 ||
+        weight->dtype != H3_GPU_F32 || (bias && bias->dtype != H3_GPU_F32) ||
+        output->elements < output_count || input->elements < input_count ||
+        weight->elements < weight_count ||
+        (bias && bias->elements < output_channels))
+        return h3_gpu_fail(gpu, "invalid Conv3d tensor shapes");
+    h3_conv3d_args args = {
+        batch,         depth,          height,         width,
+        output_depth,  output_height,  output_width,   input_channels,
+        output_channels, kernel_depth, kernel_height,  kernel_width,
+        stride_depth,  stride_height,  stride_width,   bias ? 1u : 0u};
+    unsigned threads = 256;
+    unsigned blocks =
+        (unsigned)((output_count + threads - 1) / threads);
+    h3_conv3d_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)input->device, (const float *)weight->device,
+        bias ? (const float *)bias->device : NULL, (float *)output->device,
+        args);
+    gpu->stats.mps_conv_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_conv3d_f32");
+}
+
 struct h3_int8_quant_args {
     uint32_t rows;
     uint32_t dispatch_rows;
