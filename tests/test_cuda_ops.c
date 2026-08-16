@@ -1559,6 +1559,152 @@ int main(void) {
         h3_gpu_tensor_free(sd_out);
     }
 
+    {
+        /* weight_norm + conv1d + transpose + snake smoke oracles */
+        const uint32_t wn_outer = 4;
+        const uint32_t wn_inner = 8;
+        float wn_vec[wn_outer * wn_inner];
+        float wn_mag[wn_outer];
+        float wn_ref[wn_outer * wn_inner];
+        for (uint32_t row = 0; row < wn_outer; row++) {
+            wn_mag[row] = 0.5f + 0.1f * (float)row;
+            float square = 0.0f;
+            for (uint32_t col = 0; col < wn_inner; col++) {
+                float v = sinf((float)(row * wn_inner + col) * 0.2f);
+                wn_vec[row * wn_inner + col] = v;
+                square += v * v;
+            }
+            float scale = wn_mag[row] / sqrtf(square);
+            for (uint32_t col = 0; col < wn_inner; col++)
+                wn_ref[row * wn_inner + col] =
+                    wn_vec[row * wn_inner + col] * scale;
+        }
+        h3_gpu_tensor *wn_v =
+            h3_gpu_tensor_from_f32(gpu, wn_vec, wn_outer * wn_inner);
+        h3_gpu_tensor *wn_m = h3_gpu_tensor_from_f32(gpu, wn_mag, wn_outer);
+        h3_gpu_tensor *wn_o =
+            h3_gpu_tensor_new_f32(gpu, wn_outer * wn_inner);
+        check(wn_v && wn_m && wn_o, "weight_norm alloc");
+        if (wn_v && wn_m && wn_o) {
+            check(h3_gpu_weight_norm_f32(gpu, wn_o, wn_v, wn_m, wn_outer,
+                                         wn_inner),
+                  "weight_norm_f32");
+            check(h3_gpu_submit(gpu), "submit weight_norm");
+            float wn_got[wn_outer * wn_inner];
+            check(h3_gpu_tensor_read_f32(wn_o, wn_got, wn_outer * wn_inner),
+                  "read weight_norm");
+            for (uint32_t i = 0; i < wn_outer * wn_inner; i++) {
+                if (fabsf(wn_got[i] - wn_ref[i]) >= 1e-4f) {
+                    fprintf(stderr, "FAIL: weight_norm_f32 at %u\n", i);
+                    failures++;
+                    break;
+                }
+            }
+        }
+        h3_gpu_tensor_free(wn_v);
+        h3_gpu_tensor_free(wn_m);
+        h3_gpu_tensor_free(wn_o);
+
+        const uint32_t c_batch = 1, c_len = 5, c_in = 2, c_out = 3, c_k = 3;
+        const uint32_t c_pad = 1, c_dil = 1, c_stride = 1;
+        uint32_t c_out_len =
+            (c_len + 2 * c_pad - (c_dil * (c_k - 1) + 1)) / c_stride + 1;
+        float c_in_h[c_batch * c_len * c_in];
+        float c_w_h[c_out * c_in * c_k];
+        float c_b_h[c_out];
+        float c_ref[c_batch * c_out_len * c_out];
+        for (uint32_t i = 0; i < c_batch * c_len * c_in; i++)
+            c_in_h[i] = sinf((float)i * 0.15f);
+        for (uint32_t i = 0; i < c_out * c_in * c_k; i++)
+            c_w_h[i] = cosf((float)i * 0.09f);
+        for (uint32_t i = 0; i < c_out; i++) c_b_h[i] = 0.01f * (float)i;
+        for (uint32_t b = 0; b < c_batch; b++) {
+            for (uint32_t t = 0; t < c_out_len; t++) {
+                for (uint32_t oc = 0; oc < c_out; oc++) {
+                    float acc = c_b_h[oc];
+                    for (uint32_t ic = 0; ic < c_in; ic++) {
+                        for (uint32_t k = 0; k < c_k; k++) {
+                            int tin = (int)t * (int)c_stride - (int)c_pad +
+                                      (int)k * (int)c_dil;
+                            if (tin < 0 || tin >= (int)c_len) continue;
+                            acc += c_in_h[(b * c_len + (uint32_t)tin) * c_in +
+                                          ic] *
+                                   c_w_h[(oc * c_in + ic) * c_k + k];
+                        }
+                    }
+                    c_ref[(b * c_out_len + t) * c_out + oc] = acc;
+                }
+            }
+        }
+        h3_gpu_tensor *c_in_t =
+            h3_gpu_tensor_from_f32(gpu, c_in_h, c_batch * c_len * c_in);
+        h3_gpu_tensor *c_w_t =
+            h3_gpu_tensor_from_f32(gpu, c_w_h, c_out * c_in * c_k);
+        h3_gpu_tensor *c_b_t = h3_gpu_tensor_from_f32(gpu, c_b_h, c_out);
+        h3_gpu_tensor *c_o_t =
+            h3_gpu_tensor_new_f32(gpu, c_batch * c_out_len * c_out);
+        check(c_in_t && c_w_t && c_b_t && c_o_t, "conv1d alloc");
+        if (c_in_t && c_w_t && c_b_t && c_o_t) {
+            check(h3_gpu_conv1d_f32(gpu, c_o_t, c_in_t, c_w_t, c_b_t, c_batch,
+                                    c_len, c_in, c_out, c_k, c_pad, c_dil),
+                  "conv1d_f32");
+            check(h3_gpu_submit(gpu), "submit conv1d");
+            float c_got[c_batch * c_out_len * c_out];
+            check(h3_gpu_tensor_read_f32(c_o_t, c_got,
+                                         c_batch * c_out_len * c_out),
+                  "read conv1d");
+            for (uint32_t i = 0; i < c_batch * c_out_len * c_out; i++) {
+                if (fabsf(c_got[i] - c_ref[i]) >= 1e-4f) {
+                    fprintf(stderr, "FAIL: conv1d_f32 at %u got=%f want=%f\n",
+                            i, c_got[i], c_ref[i]);
+                    failures++;
+                    break;
+                }
+            }
+        }
+        h3_gpu_tensor_free(c_in_t);
+        h3_gpu_tensor_free(c_w_t);
+        h3_gpu_tensor_free(c_b_t);
+        h3_gpu_tensor_free(c_o_t);
+
+        const uint32_t sn_b = 1, sn_l = 4, sn_c = 3;
+        float sn_in[sn_b * sn_l * sn_c];
+        float sn_alpha[sn_c];
+        float sn_ref[sn_b * sn_l * sn_c];
+        for (uint32_t i = 0; i < sn_c; i++) sn_alpha[i] = 0.5f + 0.1f * (float)i;
+        for (uint32_t i = 0; i < sn_b * sn_l * sn_c; i++) {
+            sn_in[i] = sinf((float)i * 0.2f);
+            float a = sn_alpha[i % sn_c];
+            float x = sn_in[i];
+            float wave = sinf(a * x);
+            sn_ref[i] = x + wave * wave / (a + 1e-9f);
+        }
+        h3_gpu_tensor *sn_i =
+            h3_gpu_tensor_from_f32(gpu, sn_in, sn_b * sn_l * sn_c);
+        h3_gpu_tensor *sn_a = h3_gpu_tensor_from_f32(gpu, sn_alpha, sn_c);
+        h3_gpu_tensor *sn_o =
+            h3_gpu_tensor_new_f32(gpu, sn_b * sn_l * sn_c);
+        check(sn_i && sn_a && sn_o, "snake1d alloc");
+        if (sn_i && sn_a && sn_o) {
+            check(h3_gpu_snake1d_f32(gpu, sn_o, sn_i, sn_a, sn_b, sn_l, sn_c),
+                  "snake1d_f32");
+            check(h3_gpu_submit(gpu), "submit snake1d");
+            float sn_got[sn_b * sn_l * sn_c];
+            check(h3_gpu_tensor_read_f32(sn_o, sn_got, sn_b * sn_l * sn_c),
+                  "read snake1d");
+            for (uint32_t i = 0; i < sn_b * sn_l * sn_c; i++) {
+                if (fabsf(sn_got[i] - sn_ref[i]) >= 1e-4f) {
+                    fprintf(stderr, "FAIL: snake1d_f32 at %u\n", i);
+                    failures++;
+                    break;
+                }
+            }
+        }
+        h3_gpu_tensor_free(sn_i);
+        h3_gpu_tensor_free(sn_a);
+        h3_gpu_tensor_free(sn_o);
+    }
+
     const uint32_t qkv_sequence = 3;
     const uint32_t qkv_heads = 2;
     const uint32_t qkv_head_dim = 8;

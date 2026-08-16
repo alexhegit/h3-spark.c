@@ -3120,6 +3120,343 @@ int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_f32");
 }
 
+__global__ static void h3_weight_norm_f32_kernel(const float *vector,
+                                                 const float *magnitude,
+                                                 float *output, uint32_t outer,
+                                                 uint32_t inner) {
+    uint32_t row = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= outer) return;
+    size_t base = (size_t)row * inner;
+    float square_sum = 0.0f;
+    for (uint32_t index = 0; index < inner; index++) {
+        float value = vector[base + index];
+        square_sum = fmaf(value, value, square_sum);
+    }
+    float scale = magnitude[row] * rsqrtf(square_sum);
+    for (uint32_t index = 0; index < inner; index++)
+        output[base + index] = vector[base + index] * scale;
+}
+
+int h3_gpu_weight_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *vector,
+                           const h3_gpu_tensor *magnitude, uint32_t outer,
+                           uint32_t inner) {
+    size_t count = (size_t)outer * inner;
+    if (!gpu || !output || !vector || !magnitude ||
+        output->dtype != H3_GPU_F32 || vector->dtype != H3_GPU_F32 ||
+        magnitude->dtype != H3_GPU_F32 || output->elements < count ||
+        vector->elements < count || magnitude->elements < outer || !outer ||
+        !inner)
+        return h3_gpu_fail(gpu, "invalid weight-norm request");
+    unsigned threads = 256;
+    unsigned blocks = (outer + threads - 1u) / threads;
+    h3_weight_norm_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)vector->device, (const float *)magnitude->device,
+        (float *)output->device, outer, inner);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_weight_norm_f32");
+}
+
+struct h3_conv1d_args {
+    uint32_t batch;
+    uint32_t length;
+    uint32_t output_length;
+    uint32_t input_channels;
+    uint32_t output_channels;
+    uint32_t kernel;
+    uint32_t stride;
+    uint32_t padding;
+    uint32_t dilation;
+    uint32_t has_bias;
+};
+
+__global__ static void h3_conv1d_f32_kernel(const float *input,
+                                            const float *weight,
+                                            const float *bias, float *output,
+                                            h3_conv1d_args args) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)args.batch * args.output_length * args.output_channels;
+    if (index >= total) return;
+    uint32_t oc = (uint32_t)(index % args.output_channels);
+    size_t rem = index / args.output_channels;
+    uint32_t t_out = (uint32_t)(rem % args.output_length);
+    uint32_t batch = (uint32_t)(rem / args.output_length);
+    float acc = args.has_bias ? bias[oc] : 0.0f;
+    for (uint32_t ic = 0; ic < args.input_channels; ic++) {
+        for (uint32_t k = 0; k < args.kernel; k++) {
+            int32_t t_in = (int32_t)t_out * (int32_t)args.stride -
+                           (int32_t)args.padding +
+                           (int32_t)k * (int32_t)args.dilation;
+            if (t_in < 0 || t_in >= (int32_t)args.length) continue;
+            size_t in_index =
+                ((size_t)batch * args.length + (size_t)t_in) *
+                    args.input_channels +
+                ic;
+            size_t w_index =
+                ((size_t)oc * args.input_channels + ic) * args.kernel + k;
+            acc = fmaf(input[in_index], weight[w_index], acc);
+        }
+    }
+    output[index] = acc;
+}
+
+static int h3_gpu_conv1d_impl(h3_gpu *gpu, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *input,
+                              const h3_gpu_tensor *weight,
+                              const h3_gpu_tensor *bias, uint32_t batch,
+                              uint32_t length, uint32_t input_channels,
+                              uint32_t output_channels, uint32_t kernel,
+                              uint32_t stride, uint32_t padding,
+                              uint32_t dilation) {
+    uint64_t effective = (uint64_t)dilation * (kernel - 1u) + 1u;
+    if (!gpu || !output || !input || !weight || !batch || !length ||
+        !input_channels || !output_channels || !kernel || !stride ||
+        !dilation || (uint64_t)length + 2ull * padding < effective)
+        return h3_gpu_fail(gpu, "invalid Conv1d request");
+    uint32_t output_length = (uint32_t)(((uint64_t)length + 2ull * padding -
+                                         effective) /
+                                            stride +
+                                        1u);
+    size_t input_count = (size_t)batch * length * input_channels;
+    size_t weight_count = (size_t)output_channels * input_channels * kernel;
+    size_t output_count = (size_t)batch * output_length * output_channels;
+    if (output->dtype != H3_GPU_F32 || input->dtype != H3_GPU_F32 ||
+        weight->dtype != H3_GPU_F32 || (bias && bias->dtype != H3_GPU_F32) ||
+        output->elements < output_count || input->elements < input_count ||
+        weight->elements < weight_count ||
+        (bias && bias->elements < output_channels))
+        return h3_gpu_fail(gpu, "invalid Conv1d tensor shapes");
+    h3_conv1d_args args = {batch,         length,         output_length,
+                           input_channels, output_channels, kernel,
+                           stride,        padding,        dilation,
+                           bias ? 1u : 0u};
+    unsigned threads = 256;
+    unsigned blocks =
+        (unsigned)((output_count + threads - 1) / threads);
+    h3_conv1d_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)input->device, (const float *)weight->device,
+        bias ? (const float *)bias->device : NULL, (float *)output->device,
+        args);
+    gpu->stats.mps_conv_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_conv1d_f32");
+}
+
+int h3_gpu_conv1d_stride_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *weight,
+                             const h3_gpu_tensor *bias, uint32_t batch,
+                             uint32_t length, uint32_t input_channels,
+                             uint32_t output_channels, uint32_t kernel,
+                             uint32_t stride, uint32_t padding,
+                             uint32_t dilation) {
+    return h3_gpu_conv1d_impl(gpu, output, input, weight, bias, batch, length,
+                              input_channels, output_channels, kernel, stride,
+                              padding, dilation);
+}
+
+int h3_gpu_conv1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t length, uint32_t input_channels,
+                      uint32_t output_channels, uint32_t kernel,
+                      uint32_t padding, uint32_t dilation) {
+    return h3_gpu_conv1d_impl(gpu, output, input, weight, bias, batch, length,
+                              input_channels, output_channels, kernel, 1u,
+                              padding, dilation);
+}
+
+struct h3_conv_transpose1d_args {
+    uint32_t batch;
+    uint32_t length;
+    uint32_t output_length;
+    uint32_t input_channels;
+    uint32_t output_channels;
+    uint32_t kernel;
+    uint32_t stride;
+    uint32_t padding;
+    uint32_t has_bias;
+};
+
+__global__ static void h3_conv_transpose1d_f32_kernel(
+    const float *input, const float *weight, const float *bias, float *output,
+    h3_conv_transpose1d_args args) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total =
+        (size_t)args.batch * args.output_length * args.output_channels;
+    if (index >= total) return;
+    uint32_t oc = (uint32_t)(index % args.output_channels);
+    size_t rem = index / args.output_channels;
+    uint32_t t_out = (uint32_t)(rem % args.output_length);
+    uint32_t batch = (uint32_t)(rem / args.output_length);
+    float acc = args.has_bias ? bias[oc] : 0.0f;
+    for (uint32_t ic = 0; ic < args.input_channels; ic++) {
+        for (uint32_t k = 0; k < args.kernel; k++) {
+            int32_t numerator =
+                (int32_t)t_out + (int32_t)args.padding - (int32_t)k;
+            if (numerator < 0 || (numerator % (int32_t)args.stride) != 0)
+                continue;
+            int32_t t_in = numerator / (int32_t)args.stride;
+            if (t_in < 0 || t_in >= (int32_t)args.length) continue;
+            size_t in_index =
+                ((size_t)batch * args.length + (size_t)t_in) *
+                    args.input_channels +
+                ic;
+            /* Transpose weight layout IOK: [ic, oc, k]. */
+            size_t w_index =
+                ((size_t)ic * args.output_channels + oc) * args.kernel + k;
+            acc = fmaf(input[in_index], weight[w_index], acc);
+        }
+    }
+    output[index] = acc;
+}
+
+int h3_gpu_conv_transpose1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *input,
+                                const h3_gpu_tensor *weight,
+                                const h3_gpu_tensor *bias, uint32_t batch,
+                                uint32_t length, uint32_t input_channels,
+                                uint32_t output_channels, uint32_t kernel,
+                                uint32_t stride, uint32_t padding) {
+    if (!gpu || !output || !input || !weight || !batch || !length ||
+        !input_channels || !output_channels || !kernel || !stride ||
+        (uint64_t)(length - 1u) * stride + kernel < 2ull * padding)
+        return h3_gpu_fail(gpu, "invalid ConvTranspose1d request");
+    uint32_t output_length = (uint32_t)((uint64_t)(length - 1u) * stride +
+                                        kernel - 2ull * padding);
+    size_t input_count = (size_t)batch * length * input_channels;
+    size_t weight_count = (size_t)input_channels * output_channels * kernel;
+    size_t output_count = (size_t)batch * output_length * output_channels;
+    if (output->dtype != H3_GPU_F32 || input->dtype != H3_GPU_F32 ||
+        weight->dtype != H3_GPU_F32 || (bias && bias->dtype != H3_GPU_F32) ||
+        output->elements < output_count || input->elements < input_count ||
+        weight->elements < weight_count ||
+        (bias && bias->elements < output_channels))
+        return h3_gpu_fail(gpu, "invalid ConvTranspose1d tensor shapes");
+    h3_conv_transpose1d_args args = {
+        batch,         length,         output_length, input_channels,
+        output_channels, kernel,       stride,        padding,
+        bias ? 1u : 0u};
+    unsigned threads = 256;
+    unsigned blocks =
+        (unsigned)((output_count + threads - 1) / threads);
+    h3_conv_transpose1d_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)input->device, (const float *)weight->device,
+        bias ? (const float *)bias->device : NULL, (float *)output->device,
+        args);
+    gpu->stats.mps_conv_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_conv_transpose1d_f32");
+}
+
+struct h3_audio_activation_args {
+    uint32_t batch;
+    uint32_t length;
+    uint32_t channels;
+};
+
+__global__ static void h3_alias_free_snake_f32_kernel(
+    const float *input, const float *alpha_log, const float *beta_log,
+    const float *upsample_filter, const float *downsample_filter, float *output,
+    h3_audio_activation_args args) {
+    uint32_t channel = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t time = (uint32_t)blockIdx.y;
+    uint32_t batch = (uint32_t)blockIdx.z;
+    if (channel >= args.channels || time >= args.length || batch >= args.batch)
+        return;
+    float alpha = expf(alpha_log[channel]);
+    float beta = expf(beta_log[channel]);
+    float result = 0.0f;
+    for (int down_k = 0; down_k < 12; down_k++) {
+        int up_time = (int)time * 2 + down_k - 5;
+        if (up_time < 0) up_time = 0;
+        int up_max = (int)args.length * 2 - 1;
+        if (up_time > up_max) up_time = up_max;
+        int raw_time = up_time + 15;
+        float upsampled = 0.0f;
+        for (int up_k = 0; up_k < 12; up_k++) {
+            int numerator = raw_time - up_k;
+            if (numerator < 0 || (numerator & 1)) continue;
+            int padded_time = numerator / 2;
+            int source_time = padded_time - 5;
+            if (source_time < 0) source_time = 0;
+            if (source_time > (int)args.length - 1)
+                source_time = (int)args.length - 1;
+            size_t source =
+                ((size_t)batch * args.length + (size_t)source_time) *
+                    args.channels +
+                channel;
+            upsampled =
+                fmaf(input[source], 2.0f * upsample_filter[up_k], upsampled);
+        }
+        float sine = sinf(alpha * upsampled);
+        float activated = upsampled + sine * sine / (beta + 1e-9f);
+        result = fmaf(activated, downsample_filter[down_k], result);
+    }
+    size_t destination =
+        ((size_t)batch * args.length + time) * args.channels + channel;
+    output[destination] = result;
+}
+
+int h3_gpu_alias_free_snake_f32(
+    h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+    const h3_gpu_tensor *alpha_log, const h3_gpu_tensor *beta_log,
+    const h3_gpu_tensor *upsample_filter,
+    const h3_gpu_tensor *downsample_filter, uint32_t batch, uint32_t length,
+    uint32_t channels) {
+    size_t count = (size_t)batch * length * channels;
+    if (!gpu || !output || !input || !alpha_log || !beta_log ||
+        !upsample_filter || !downsample_filter ||
+        output->dtype != H3_GPU_F32 || input->dtype != H3_GPU_F32 ||
+        alpha_log->dtype != H3_GPU_F32 || beta_log->dtype != H3_GPU_F32 ||
+        upsample_filter->dtype != H3_GPU_F32 ||
+        downsample_filter->dtype != H3_GPU_F32 || output->elements < count ||
+        input->elements < count || alpha_log->elements < channels ||
+        beta_log->elements < channels || upsample_filter->elements < 12 ||
+        downsample_filter->elements < 12 || !batch || !length || !channels)
+        return h3_gpu_fail(gpu, "invalid alias-free Snake request");
+    h3_audio_activation_args args = {batch, length, channels};
+    dim3 threads(32, 1, 1);
+    dim3 blocks((channels + threads.x - 1) / threads.x, length, batch);
+    h3_alias_free_snake_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)input->device, (const float *)alpha_log->device,
+        (const float *)beta_log->device, (const float *)upsample_filter->device,
+        (const float *)downsample_filter->device, (float *)output->device,
+        args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_alias_free_snake_f32");
+}
+
+__global__ static void h3_snake1d_f32_kernel(const float *input,
+                                             const float *alpha, float *output,
+                                             h3_audio_activation_args args) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t count = (size_t)args.batch * args.length * args.channels;
+    if (index >= count) return;
+    float a = alpha[index % args.channels];
+    float x = input[index];
+    float wave = sinf(a * x);
+    output[index] = x + wave * wave / (a + 1e-9f);
+}
+
+int h3_gpu_snake1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input, const h3_gpu_tensor *alpha,
+                       uint32_t batch, uint32_t length, uint32_t channels) {
+    size_t count = (size_t)batch * length * channels;
+    if (!gpu || !output || !input || !alpha || output->dtype != H3_GPU_F32 ||
+        input->dtype != H3_GPU_F32 || alpha->dtype != H3_GPU_F32 ||
+        output->elements < count || input->elements < count ||
+        alpha->elements < channels || !batch || !length || !channels)
+        return h3_gpu_fail(gpu, "invalid Snake1d request");
+    h3_audio_activation_args args = {batch, length, channels};
+    unsigned threads = 256;
+    unsigned blocks = (unsigned)((count + threads - 1) / threads);
+    h3_snake1d_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)input->device, (const float *)alpha->device,
+        (float *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_snake1d_f32");
+}
+
 struct h3_int8_quant_args {
     uint32_t rows;
     uint32_t dispatch_rows;
