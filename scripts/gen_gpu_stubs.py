@@ -33,6 +33,8 @@ IMPLEMENTED = {
     "h3_gpu_snake1d_f32",
     "h3_gpu_vae_encoder_pad_f32", "h3_gpu_conv3d_f32",
     "h3_gpu_vae_encoder_group_norm_silu_f32",
+    "h3_gpu_audio_qkv_split_f32", "h3_gpu_sdpa_causal_f32",
+    "h3_gpu_audio_attention_pool_f32",
     "h3_gpu_linear_bf16",
     "h3_gpu_adaln_bf16", "h3_gpu_adaln_bf16_offset", "h3_gpu_gate_bf16",
     "h3_gpu_swiglu_bf16", "h3_gpu_mlp_bf16",

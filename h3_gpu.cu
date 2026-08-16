@@ -3759,6 +3759,198 @@ int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_conv3d_f32");
 }
 
+struct h3_audio_qkv_args {
+    uint32_t batch;
+    uint32_t length;
+    uint32_t heads;
+    uint32_t head_dim;
+};
+
+__global__ static void h3_audio_qkv_split_f32_kernel(
+    const float *qkv, const float *q_bias, const float *k_bias,
+    const float *v_bias, float *query, float *key, float *value,
+    h3_audio_qkv_args args) {
+    size_t width = (size_t)args.heads * args.head_dim;
+    size_t count = (size_t)args.batch * args.length * width;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    uint32_t column = (uint32_t)(gid % width);
+    size_t row = gid / width;
+    size_t base = row * width * 3u;
+    query[gid] = qkv[base + column] + q_bias[column];
+    key[gid] = qkv[base + width + column] + k_bias[column];
+    value[gid] = qkv[base + width * 2u + column] + v_bias[column];
+}
+
+int h3_gpu_audio_qkv_split_f32(h3_gpu *gpu, h3_gpu_tensor *query,
+                               h3_gpu_tensor *key, h3_gpu_tensor *value,
+                               const h3_gpu_tensor *qkv,
+                               const h3_gpu_tensor *q_bias,
+                               const h3_gpu_tensor *k_bias,
+                               const h3_gpu_tensor *v_bias, uint32_t batch,
+                               uint32_t length, uint32_t heads,
+                               uint32_t head_dim) {
+    size_t width = (size_t)heads * head_dim;
+    size_t count = (size_t)batch * length * width;
+    if (!gpu || !query || !key || !value || !qkv || !q_bias || !k_bias ||
+        !v_bias || query->dtype != H3_GPU_F32 || key->dtype != H3_GPU_F32 ||
+        value->dtype != H3_GPU_F32 || qkv->dtype != H3_GPU_F32 ||
+        q_bias->dtype != H3_GPU_F32 || k_bias->dtype != H3_GPU_F32 ||
+        v_bias->dtype != H3_GPU_F32 || query->elements < count ||
+        key->elements < count || value->elements < count ||
+        qkv->elements < count * 3u || q_bias->elements < width ||
+        k_bias->elements < width || v_bias->elements < width || !batch ||
+        !length || !heads || !head_dim)
+        return h3_gpu_fail(gpu, "invalid audio QKV split request");
+    h3_audio_qkv_args args = {batch, length, heads, head_dim};
+    unsigned threads = 256;
+    unsigned blocks = (unsigned)((count + threads - 1) / threads);
+    h3_audio_qkv_split_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)qkv->device, (const float *)q_bias->device,
+        (const float *)k_bias->device, (const float *)v_bias->device,
+        (float *)query->device, (float *)key->device, (float *)value->device,
+        args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_audio_qkv_split_f32");
+}
+
+struct h3_sdpa_causal_args {
+    uint32_t batch;
+    uint32_t sequence;
+    uint32_t heads;
+    uint32_t head_dim;
+    float scale;
+};
+
+__global__ static void h3_sdpa_causal_f32_kernel(
+    const float *query, const float *key, const float *value, float *output,
+    h3_sdpa_causal_args args) {
+    extern __shared__ float scores[];
+    uint32_t head = (uint32_t)blockIdx.x;
+    uint32_t q_row = (uint32_t)blockIdx.y;
+    uint32_t batch = (uint32_t)blockIdx.z;
+    uint32_t dim = (uint32_t)threadIdx.x;
+    if (batch >= args.batch || head >= args.heads || q_row >= args.sequence ||
+        dim >= args.head_dim)
+        return;
+    size_t q_base =
+        (((size_t)batch * args.sequence + q_row) * args.heads + head) *
+        args.head_dim;
+    if (dim == 0) {
+        float max_score = -INFINITY;
+        for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
+            if (k_row > q_row) {
+                scores[k_row] = -INFINITY;
+                continue;
+            }
+            size_t k_base =
+                (((size_t)batch * args.sequence + k_row) * args.heads +
+                 head) *
+                args.head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < args.head_dim; d++)
+                dot = fmaf(query[q_base + d], key[k_base + d], dot);
+            scores[k_row] = dot * args.scale;
+            if (scores[k_row] > max_score) max_score = scores[k_row];
+        }
+        float sum = 0.0f;
+        for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
+            if (k_row > q_row) {
+                scores[k_row] = 0.0f;
+                continue;
+            }
+            scores[k_row] = expf(scores[k_row] - max_score);
+            sum += scores[k_row];
+        }
+        float inverse = 1.0f / sum;
+        for (uint32_t k_row = 0; k_row <= q_row; k_row++)
+            scores[k_row] *= inverse;
+    }
+    __syncthreads();
+    float accumulated = 0.0f;
+    for (uint32_t k_row = 0; k_row <= q_row; k_row++) {
+        size_t v_base =
+            (((size_t)batch * args.sequence + k_row) * args.heads + head) *
+            args.head_dim;
+        accumulated = fmaf(scores[k_row], value[v_base + dim], accumulated);
+    }
+    output[q_base + dim] = accumulated;
+}
+
+int h3_gpu_sdpa_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *query,
+                           const h3_gpu_tensor *key,
+                           const h3_gpu_tensor *value, uint32_t batch,
+                           uint32_t sequence, uint32_t heads,
+                           uint32_t head_dim, float scale) {
+    size_t count = (size_t)batch * sequence * heads * head_dim;
+    if (!gpu || !output || !query || !key || !value ||
+        output->dtype != H3_GPU_F32 || query->dtype != H3_GPU_F32 ||
+        key->dtype != H3_GPU_F32 || value->dtype != H3_GPU_F32 ||
+        output->elements < count || query->elements < count ||
+        key->elements < count || value->elements < count || !batch ||
+        !sequence || !heads || !head_dim)
+        return h3_gpu_fail(gpu, "invalid causal SDPA request");
+    h3_sdpa_causal_args args = {batch, sequence, heads, head_dim, scale};
+    dim3 threads(head_dim, 1, 1);
+    dim3 blocks(heads, sequence, batch);
+    size_t shared_bytes = (size_t)sequence * sizeof(float);
+    h3_sdpa_causal_f32_kernel<<<blocks, threads, shared_bytes, gpu->stream>>>(
+        (const float *)query->device, (const float *)key->device,
+        (const float *)value->device, (float *)output->device, args);
+    gpu->stats.mps_sdpa_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_causal_f32");
+}
+
+struct h3_audio_pool_args {
+    uint32_t batch;
+    uint32_t length;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t output_dim;
+};
+
+__global__ static void h3_audio_attention_pool_f32_kernel(
+    const float *attended, float *output, h3_audio_pool_args args) {
+    size_t count = (size_t)args.batch * args.length * args.output_dim;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    uint32_t column = (uint32_t)(gid % args.output_dim);
+    size_t row = gid / args.output_dim;
+    uint32_t pool = args.head_dim / args.output_dim;
+    float sum = 0.0f;
+    for (uint32_t head = 0; head < args.heads; head++) {
+        size_t base =
+            (row * args.heads + head) * args.head_dim + column * pool;
+        for (uint32_t item = 0; item < pool; item++)
+            sum += attended[base + item];
+    }
+    output[gid] = sum / (float)(args.heads * pool);
+}
+
+int h3_gpu_audio_attention_pool_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                                    const h3_gpu_tensor *attended,
+                                    uint32_t batch, uint32_t length,
+                                    uint32_t heads, uint32_t head_dim,
+                                    uint32_t output_dim) {
+    size_t input_count = (size_t)batch * length * heads * head_dim;
+    size_t output_count = (size_t)batch * length * output_dim;
+    if (!gpu || !output || !attended || output->dtype != H3_GPU_F32 ||
+        attended->dtype != H3_GPU_F32 || output->elements < output_count ||
+        attended->elements < input_count || !batch || !length || !heads ||
+        !head_dim || !output_dim || head_dim % output_dim != 0)
+        return h3_gpu_fail(gpu, "invalid audio attention pool request");
+    h3_audio_pool_args args = {batch, length, heads, head_dim, output_dim};
+    unsigned threads = 256;
+    unsigned blocks =
+        (unsigned)((output_count + threads - 1) / threads);
+    h3_audio_attention_pool_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const float *)attended->device, (float *)output->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(),
+                         "h3_audio_attention_pool_f32");
+}
+
 struct h3_int8_quant_args {
     uint32_t rows;
     uint32_t dispatch_rows;

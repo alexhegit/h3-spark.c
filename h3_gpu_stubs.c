@@ -37,34 +37,6 @@ int h3_gpu_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
     return h3_gpu_stub_impl(gpu, "h3_gpu_qkv_rope_f32");
 }
 
-int h3_gpu_audio_qkv_split_f32(h3_gpu *gpu,
-                       h3_gpu_tensor *query, h3_gpu_tensor *key,
-                       h3_gpu_tensor *value, const h3_gpu_tensor *qkv,
-                       const h3_gpu_tensor *q_bias,
-                       const h3_gpu_tensor *k_bias,
-                       const h3_gpu_tensor *v_bias, uint32_t batch,
-                       uint32_t length, uint32_t heads,
-                       uint32_t head_dim) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_audio_qkv_split_f32");
-}
-
-int h3_gpu_sdpa_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
-                       const h3_gpu_tensor *query,
-                       const h3_gpu_tensor *key,
-                       const h3_gpu_tensor *value, uint32_t batch,
-                       uint32_t sequence, uint32_t heads,
-                       uint32_t head_dim, float scale) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_sdpa_causal_f32");
-}
-
-int h3_gpu_audio_attention_pool_f32(h3_gpu *gpu,
-                       h3_gpu_tensor *output,
-                       const h3_gpu_tensor *attended, uint32_t batch,
-                       uint32_t length, uint32_t heads,
-                       uint32_t head_dim, uint32_t output_dim) {
-    return h3_gpu_stub_impl(gpu, "h3_gpu_audio_attention_pool_f32");
-}
-
 int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                         h3_gpu_tensor *activated,
                         const h3_gpu_tensor *input,

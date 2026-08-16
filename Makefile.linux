@@ -63,6 +63,9 @@ h3_cuda_audio_vae_smoke: tests/test_cuda_audio_vae_smoke.o $(LIB_OBJ)
 h3_cuda_video_encoder_smoke: tests/test_cuda_video_encoder_smoke.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+h3_cuda_audio_encoder_smoke: tests/test_cuda_audio_encoder_smoke.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 # Requires MiniMax-H3/tokenizer/tokenizer.json (or pass path as argv[1]).
 tokenizer_test: tests/test_tokenizer.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -134,6 +137,15 @@ test: h3_tests h3_cuda_smoke h3_cuda_ops
 		./h3_cuda_video_encoder_smoke /home/alex/HF-MODELS/MiniMax-H3; \
 	else \
 		echo "skip: video encoder smoke (weights not available)"; \
+	fi
+	@$(MAKE) -f Makefile.linux h3_cuda_audio_encoder_smoke
+	@path=$${H3_MODEL_ROOT:-MiniMax-H3}; \
+	if test -f $$path/FL2VA/audio_vae/model.safetensors; then \
+		./h3_cuda_audio_encoder_smoke $$path; \
+	elif test -f /home/alex/HF-MODELS/MiniMax-H3/FL2VA/audio_vae/model.safetensors; then \
+		./h3_cuda_audio_encoder_smoke /home/alex/HF-MODELS/MiniMax-H3; \
+	else \
+		echo "skip: audio encoder smoke (weights not available)"; \
 	fi
 
 test-step: h3_cuda_dit_block_smoke h3_cuda_text_smoke h3_cuda_dit_forward_smoke
@@ -207,6 +219,7 @@ clean:
 	rm -f h3 h3_tests h3_cuda_smoke h3_cuda_ops h3_cuda_dit_block_smoke \
 		h3_cuda_text_smoke h3_cuda_vision_smoke h3_cuda_dit_forward_smoke \
 		h3_cuda_video_vae_smoke h3_cuda_audio_vae_smoke \
-		h3_cuda_video_encoder_smoke h3_cuda_probe libh3_cuda.a \
+		h3_cuda_video_encoder_smoke h3_cuda_audio_encoder_smoke \
+		h3_cuda_probe libh3_cuda.a \
 		tokenizer_test tokenizer_smoke \
 		*.o *.d tests/*.o tests/*.d tools/*.o tools/*.d third_party/*.o third_party/*.d
