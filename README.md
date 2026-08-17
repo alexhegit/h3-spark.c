@@ -20,9 +20,33 @@ the MP4.
 | **Ref2VA** — `--ref-image` | [![Ref2VA](assets/showcase/ref2va-person-lamb.jpg)](assets/showcase/ref2va-person-lamb.mp4) [mp4](assets/showcase/ref2va-person-lamb.mp4) |
 | **FL2VA** — `--first-frame` + `--last-frame` | [![FL2VA](assets/showcase/fl2va-family-dinner.jpg)](assets/showcase/fl2va-family-dinner.mp4) [mp4](assets/showcase/fl2va-family-dinner.mp4) |
 
-- **T2VA:** fox walking through snow (prompt-only).
-- **Ref2VA:** identity/scene from a real reference still (person in pink suit holding a black lamb), then motion from the prompt.
-- **FL2VA:** warm dinner / ramen scene anchored by real first and last frames from an official demo clip.
+### Reproduce the showcase clips
+
+```bash
+MODEL=/path/to/MiniMax-H3
+COMMON=(--width 512 --height 512 --frames 22 --steps 20 --layers 45 --reuse 2)
+
+# T2VA — fox in snow (assets/showcase/t2va-fox-fast.mp4)
+./h3 -d "$MODEL" "${COMMON[@]}" \
+  -p "A red fox walks through fresh snow in a pine forest. Medium tracking shot, natural winter light, realistic fur, soft footsteps and wind." \
+  -o assets/showcase/t2va-fox-fast.mp4
+
+# Ref2VA — reference still + motion prompt (assets/showcase/ref2va-person-lamb.mp4)
+./h3 -d "$MODEL" "${COMMON[@]}" \
+  -p "The person in Picture 1 smiles and gently waves while holding the black lamb on the grassy hillside. Soft natural light, cinematic, realistic motion." \
+  --ref-image assets/showcase/refs/ref2va-person-lamb.png \
+  -o assets/showcase/ref2va-person-lamb.mp4
+
+# FL2VA — first + last frame anchors (assets/showcase/fl2va-family-dinner.mp4)
+./h3 -d "$MODEL" "${COMMON[@]}" \
+  -p "A warm family dinner continues: steam rises from the ramen bowl, people chat softly, natural window light, cinematic." \
+  --first-frame assets/showcase/refs/fl2va-first.png \
+  --last-frame assets/showcase/refs/fl2va-last.png \
+  -o assets/showcase/fl2va-family-dinner.mp4
+```
+
+Reference stills under `assets/showcase/refs/` were taken from the official
+MiniMax-H3 demo assets (`ref2va.mp4` / `fl2va.mp4`).
 
 ## Status (2026-08-17)
 
@@ -57,7 +81,7 @@ make -f Makefile.linux -j$(nproc) h3
 
 ## Quick generate (T2VA)
 
-Validated balanced preset (512², ~22 frames @ 24 fps):
+Same fox-fast preset as the T2VA showcase clip:
 
 ```bash
 ./h3 --profile \
@@ -70,23 +94,14 @@ Validated balanced preset (512², ~22 frames @ 24 fps):
 ```
 
 First run pays model load + filesystem cache; repeat runs for timing.
+For Ref2VA / FL2VA reproduction commands, see [Showcase](#showcase-dgx-spark).
 
 ## Conditional paths
 
-```bash
-# FL2VA first frame
-./h3 -d /path/to/MiniMax-H3 -p "Continue the scene." \
-  --first-frame fox.png --width 512 --height 512 --frames 22 --steps 20 \
-  -o outputs/fl2va.mp4
-
-# Ref2VA image + standalone audio
-./h3 -d /path/to/MiniMax-H3 \
-  -p "Use the animal in Picture 1 with soft wind. <Picture 1>" \
-  --ref-image fox.png --ref-audio wind.wav \
-  --width 512 --height 512 --frames 22 --steps 20 \
-  -o outputs/ref2va.mp4
-```
-
+Ordered references (`--ref-image`, `--ref-video`, `--ref-audio`, …) and
+first/last-frame anchors (`--first-frame`, `--last-frame`) follow the same CLI
+as [antirez/h3.c](https://github.com/antirez/h3.c). Exact commands for the
+three showcase samples are under [Showcase](#showcase-dgx-spark).
 ## Preview while generating
 
 - **`--frames-dir DIR`** — write each decoded frame as PPM (works everywhere)
