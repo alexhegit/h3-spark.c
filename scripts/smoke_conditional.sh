@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Conditional-path smoke: FL2VA first/last frame + Ref2VA image/video.
+# Conditional-path smoke: FL2VA first/last frame + Ref2VA image/video/audio.
 # Usage: ./scripts/smoke_conditional.sh [MODEL_ROOT]
 # Env: H3_CONDITIONAL_SKIP_REF_VIDEO=1 to skip long --ref-video (72 frames)
 set -euo pipefail
@@ -37,16 +37,23 @@ ffmpeg -y -f lavfi -i color=c=0x7030a0:s=320x240:r=24:d=3 \
   -f lavfi -i sine=f=440:d=3 -shortest \
   -c:v libx264 -pix_fmt yuv420p -c:a aac "$ASSETS/ref_audio.mp4" \
   >/dev/null 2>&1
+# Standalone --ref-audio needs >=2s @32 kHz.
+ffmpeg -y -f lavfi -i sine=f=440:d=3 -ar 32000 -ac 1 \
+  "$ASSETS/ref_standalone.wav" >/dev/null 2>&1
 
 COMMON=(-d "$MODEL" --width 256 --height 256 --frames 22 --steps 2 --layers 35)
 
-echo "== FL2VA --first-frame =="
+echo "== FL2VA --first-frame (+ --frames-dir preview UX) =="
+rm -rf "$ASSETS/frames_first"
 "$H3" "${COMMON[@]}" --seed 7 \
   -p "conditional first-frame smoke" \
   --first-frame "$ASSETS/first.png" \
+  --frames-dir "$ASSETS/frames_first" \
   -o "$ASSETS/out_first.mp4"
 test -s "$ASSETS/out_first.mp4"
+test -s "$ASSETS/frames_first/frame-0000.ppm"
 echo "ok: first-frame"
+echo "ok: frames-dir preview"
 
 echo "== FL2VA --last-frame =="
 "$H3" "${COMMON[@]}" --seed 8 \
@@ -74,6 +81,15 @@ if test -f "$MODEL/Ref2VA/transformer/config.json" || \
     -o "$ASSETS/out_ref_image.mp4"
   test -s "$ASSETS/out_ref_image.mp4"
   echo "ok: ref-image"
+
+  echo "== Ref2VA --ref-image + --ref-audio =="
+  "$H3" "${COMMON[@]}" --seed 13 \
+    -p "A red fox walks through snow with soft wind. <Picture 1>" \
+    --ref-image "$ASSETS/ref.png" \
+    --ref-audio "$ASSETS/ref_standalone.wav" \
+    -o "$ASSETS/out_ref_image_audio.mp4"
+  test -s "$ASSETS/out_ref_image_audio.mp4"
+  echo "ok: ref-image+ref-audio"
 
   echo "== Ref2VA --ref-silent-video =="
   "$H3" "${COMMON[@]}" --seed 11 \

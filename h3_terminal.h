@@ -10,10 +10,12 @@ typedef enum {
     H3_TERM_ITERM2
 } h3_terminal_protocol;
 
+/* Auto-detect Kitty/Ghostty/iTerm2/WezTerm/Konsole. Override with
+ * H3_TERMINAL=kitty|ghostty|iterm2|wezterm|konsole|none. */
 h3_terminal_protocol h3_terminal_detect(void);
 const char *h3_terminal_protocol_name(h3_terminal_protocol protocol);
 
-/* Terminal display dimensions default to 2x for macOS Retina displays. */
+/* Display dimensions default to 2x on macOS (Retina) and 1x elsewhere. */
 int h3_terminal_set_zoom(int zoom);
 int h3_terminal_display_dimensions(int width, int height,
                                    int *display_width, int *display_height);

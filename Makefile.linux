@@ -148,8 +148,8 @@ test: h3_tests h3_cuda_smoke h3_cuda_ops
 		echo "skip: audio encoder smoke (weights not available)"; \
 	fi
 
-# FL2VA first/last + Ref2VA image/silent-video (~15–20 min). Skips long --ref-video
-# by default; unset H3_CONDITIONAL_SKIP_REF_VIDEO to include 72-frame audio ref.
+# FL2VA first/last + Ref2VA image/audio/silent (~15–25 min). Skips long --ref-video
+# by default; H3_CONDITIONAL_SKIP_REF_VIDEO=0 includes 72-frame embedded audio ref.
 test-conditional: h3
 	@chmod +x scripts/smoke_conditional.sh
 	@H3_CONDITIONAL_SKIP_REF_VIDEO=$${H3_CONDITIONAL_SKIP_REF_VIDEO:-1}; \

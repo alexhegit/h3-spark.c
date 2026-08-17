@@ -15,8 +15,13 @@
 extern char **environ;
 
 /* Match Iris: macOS graphical terminals otherwise display generated pixels at
- * roughly half their intended logical size on Retina screens. */
+ * roughly half their intended logical size on Retina screens. Linux / Spark
+ * terminals are typically 1x CSS pixels, so default zoom is 1 there. */
+#if defined(__APPLE__)
 static int terminal_zoom = 2;
+#else
+static int terminal_zoom = 1;
+#endif
 
 static void fail(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
@@ -26,11 +31,39 @@ static void fail(char *error, size_t error_size, const char *format, ...) {
     va_end(arguments);
 }
 
+static int env_eq_ci(const char *value, const char *expected) {
+    if (!value || !expected) return 0;
+    while (*value && *expected) {
+        char a = *value++;
+        char b = *expected++;
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return *value == '\0' && *expected == '\0';
+}
+
 h3_terminal_protocol h3_terminal_detect(void) {
+    /* Force protocol for SSH / IDE terminals that strip native env vars.
+     * H3_TERMINAL=kitty|ghostty|iterm2|wezterm|konsole|none */
+    const char *forced = getenv("H3_TERMINAL");
+    if (forced && *forced) {
+        if (env_eq_ci(forced, "none") || strcmp(forced, "0") == 0)
+            return H3_TERM_NONE;
+        if (env_eq_ci(forced, "kitty") || env_eq_ci(forced, "ghostty"))
+            return H3_TERM_KITTY;
+        if (env_eq_ci(forced, "iterm2") || env_eq_ci(forced, "iterm") ||
+            env_eq_ci(forced, "wezterm") || env_eq_ci(forced, "konsole"))
+            return H3_TERM_ITERM2;
+    }
     if (getenv("KITTY_WINDOW_ID") || getenv("GHOSTTY_RESOURCES_DIR"))
+        return H3_TERM_KITTY;
+    const char *term = getenv("TERM");
+    if (term && (strstr(term, "kitty") || strstr(term, "ghostty")))
         return H3_TERM_KITTY;
     const char *program = getenv("TERM_PROGRAM");
     if ((program && !strcmp(program, "iTerm.app")) ||
+        (program && env_eq_ci(program, "ghostty")) ||
         getenv("ITERM_SESSION_ID") || getenv("WEZTERM_PANE") ||
         getenv("KONSOLE_VERSION"))
         return H3_TERM_ITERM2;

@@ -396,6 +396,26 @@ static void test_terminal_zoom(void) {
     CHECK(!h3_terminal_display_dimensions(INT32_MAX, 1, &width, &height));
 }
 
+static void test_terminal_detect_override(void) {
+    unsetenv("KITTY_WINDOW_ID");
+    unsetenv("GHOSTTY_RESOURCES_DIR");
+    unsetenv("TERM_PROGRAM");
+    unsetenv("ITERM_SESSION_ID");
+    unsetenv("WEZTERM_PANE");
+    unsetenv("KONSOLE_VERSION");
+    setenv("TERM", "xterm-256color", 1);
+    setenv("H3_TERMINAL", "kitty", 1);
+    CHECK(h3_terminal_detect() == H3_TERM_KITTY);
+    setenv("H3_TERMINAL", "iterm2", 1);
+    CHECK(h3_terminal_detect() == H3_TERM_ITERM2);
+    setenv("H3_TERMINAL", "none", 1);
+    CHECK(h3_terminal_detect() == H3_TERM_NONE);
+    unsetenv("H3_TERMINAL");
+    setenv("TERM", "xterm-kitty", 1);
+    CHECK(h3_terminal_detect() == H3_TERM_KITTY);
+    unsetenv("TERM");
+}
+
 int main(void) {
     test_temporal_and_canvas();
     test_schedule();
@@ -409,6 +429,7 @@ int main(void) {
     test_dit_row_conversions();
     test_device_probe();
     test_terminal_zoom();
+    test_terminal_detect_override();
     printf("ok: %d checks\n", tests_run);
     return 0;
 }

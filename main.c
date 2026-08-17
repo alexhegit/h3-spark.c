@@ -55,9 +55,9 @@ static void usage(const char *program) {
         "      --ref-video-audio VIDEO AUDIO  Append video + soundtrack\n"
         "      --ref-audio PATH    Append an ordered standalone audio clip\n"
         "      --frames-dir PATH  Write generated frames as PPM files\n"
-        "      --show             Display a frame after every denoising step (M5)\n"
-        "      --zoom N           Terminal image zoom (default: 2 for Retina)\n"
-        "      --profile          Print per-phase Metal timing and allocation data\n"
+        "      --show             Live denoise preview (Kitty/Ghostty/iTerm2/…)\n"
+        "      --zoom N           Terminal image zoom (default: 2 macOS / 1 else)\n"
+        "      --profile          Print per-phase timing and allocation data\n"
         "      --info             Inspect model/device without mapping weights\n"
         "  -h, --help             Show this help\n",
         program, program, program);
@@ -507,8 +507,10 @@ int main(int argc, char **argv) {
         if (show) {
             cli.terminal = h3_terminal_detect();
             if (cli.terminal == H3_TERM_NONE) {
-                fprintf(stderr, "h3: warning: --show needs Kitty, Ghostty, "
-                        "iTerm2, WezTerm, or Konsole\n");
+                fprintf(stderr,
+                        "h3: warning: --show needs Kitty, Ghostty, iTerm2, "
+                        "WezTerm, or Konsole (or set H3_TERMINAL=kitty); "
+                        "use --frames-dir PATH for file previews\n");
             } else {
                 fprintf(stderr, "h3: graphical output uses %s\n",
                         h3_terminal_protocol_name(cli.terminal));
