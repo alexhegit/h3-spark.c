@@ -1,11 +1,11 @@
 # h3-spark.c
 
-Native **MiniMax-H3** inference for **NVIDIA DGX Spark** (GB10, CUDA). This
-repository is the long-term home for the Spark/CUDA port. It was split from
-[`alexhegit/h3.c`](https://github.com/alexhegit/h3.c) (`spark` branch history)
-so Spark work can evolve independently of the upstream Apple Metal tree.
+CUDA port of [antirez/h3.c](https://github.com/antirez/h3.c) for **NVIDIA DGX
+Spark** (GB10). The original project is a native MiniMax-H3 inference engine
+(Apple Metal / macOS); this repository reimplements the GPU backend for CUDA so
+the same CLI and model stack run on Spark.
 
-**Upstream (Metal / macOS):** [alexhegit/h3.c](https://github.com/alexhegit/h3.c)  
+**Original project:** [antirez/h3.c](https://github.com/antirez/h3.c)  
 **Official weights:** [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3)
 
 ## Status (2026-08-17)
@@ -91,10 +91,10 @@ Set `H3_MODEL_ROOT=/path/to/MiniMax-H3` if weights are not under `./MiniMax-H3`.
 
 ## Repository layout
 
-This tree retains the full h3 host/model stack plus CUDA backend
-(`h3_gpu.cu`, `Makefile.linux`). Apple Metal sources (`h3_gpu.m`,
-`h3_shaders.metal`, root `Makefile`) remain for reference and upstream parity
-but are not the Spark build path.
+Host/model/CLI code follows [antirez/h3.c](https://github.com/antirez/h3.c).
+The Spark build uses the CUDA backend (`h3_gpu.cu`, `Makefile.linux`). Apple
+Metal sources (`h3_gpu.m`, `h3_shaders.metal`, root `Makefile`) remain for
+reference against the original project and are not the Spark build path.
 
 ## License
 
