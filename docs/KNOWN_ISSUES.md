@@ -35,7 +35,7 @@ unimplemented. CUDA performance work should use its own fused MLP / INT8 path
 
 | ID | Topic | Status |
 |----|-------|--------|
-| D | Perf + CUDA `--profile` marks | Planned later |
+| D | Perf + CUDA `--profile` marks | Baseline recorded — see [`PERF_BASELINE.md`](PERF_BASELINE.md); optimize next |
 | E | MLX fixture numerical parity | Pending (no Mac / fixtures) |
 
 Progress log: [`docs/SPARK_AUTORUN.md`](SPARK_AUTORUN.md) · Porting:

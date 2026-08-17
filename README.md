@@ -57,11 +57,12 @@ MiniMax-H3 demo assets (`ref2va.mp4` / `fl2va.mp4`).
 | Ref2VA (`--ref-image`, `--ref-video`, …) | ✅ |
 | Runtime INT8 MLP (Metal-aligned) | ✅ |
 | `--ref-audio` + preview UX (`--frames-dir`, `--show`) | ✅ |
-| Performance vs Metal / CUDA `--profile` phases | 📋 planned (see docs) |
+| Performance vs Metal / CUDA `--profile` phases | 📋 baseline — [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) |
 
 Progress log: [`docs/SPARK_AUTORUN.md`](docs/SPARK_AUTORUN.md) · Known gaps:
 [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) · Porting notes:
-[`docs/SPARK_PORTING.md`](docs/SPARK_PORTING.md)
+[`docs/SPARK_PORTING.md`](docs/SPARK_PORTING.md) · Perf baseline:
+[`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md)
 
 ## Requirements
 

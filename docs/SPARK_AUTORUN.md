@@ -67,8 +67,9 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 
 ### Planned later (D)
 
-- Implement real `h3_gpu_profile_mark` on CUDA (wall / encode / kernel buckets)
-- Hotspot: SDPA, GEMM/MLP fusion, VAE decode tiling
+- Implement real `h3_gpu_profile_mark` on CUDA (wall / encode / kernel buckets) — **done** (`483ffdf`)
+- **Baseline recorded:** [`PERF_BASELINE.md`](PERF_BASELINE.md) — fox-fast 512² DiT denoise **1471.7 s** vs Metal **~16.7 s** (~88×)
+- Hotspot: SDPA, GEMM/MLP fusion, VAE decode tiling (DiT first; VAE second)
 - Target: close the gap vs Metal fox-fast wall times on GB10
 
 ### Pending (E)
