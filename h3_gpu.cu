@@ -3369,40 +3369,61 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
 __global__ static void h3_sdpa_f32_kernel(const float *query, const float *key,
                                           const float *value, float *output,
                                           h3_sdpa_args args) {
-    extern __shared__ float scores[];
+    extern __shared__ float shared[];
+    float *scores = shared;
+    float *reduce = shared + args.sequence;
     uint32_t head = (uint32_t)blockIdx.x;
     uint32_t q_row = (uint32_t)blockIdx.y;
-    uint32_t dim = (uint32_t)threadIdx.x;
-    if (head >= args.heads || q_row >= args.sequence || dim >= args.head_dim)
-        return;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (head >= args.heads || q_row >= args.sequence) return;
     size_t q_base = ((size_t)q_row * args.heads + head) * args.head_dim;
-    if (dim == 0) {
-        float max_score = -INFINITY;
-        for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
-            size_t k_base =
-                ((size_t)k_row * args.heads + head) * args.head_dim;
-            float dot = 0.0f;
-            for (uint32_t d = 0; d < args.head_dim; d++)
-                dot = fmaf(query[q_base + d], key[k_base + d], dot);
-            scores[k_row] = dot * args.scale;
-            if (scores[k_row] > max_score) max_score = scores[k_row];
-        }
-        float sum = 0.0f;
-        for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
-            scores[k_row] = expf(scores[k_row] - max_score);
-            sum += scores[k_row];
-        }
-        float inverse = 1.0f / sum;
-        for (uint32_t k_row = 0; k_row < args.sequence; k_row++)
-            scores[k_row] *= inverse;
+    for (uint32_t k_row = tid; k_row < args.sequence; k_row += threads) {
+        size_t k_base = ((size_t)k_row * args.heads + head) * args.head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < args.head_dim; d++)
+            dot = fmaf(query[q_base + d], key[k_base + d], dot);
+        scores[k_row] = dot * args.scale;
     }
     __syncthreads();
-    float accumulated = 0.0f;
-    for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
-        size_t v_base = ((size_t)k_row * args.heads + head) * args.head_dim;
-        accumulated = fmaf(scores[k_row], value[v_base + dim], accumulated);
+    float local_max = -INFINITY;
+    for (uint32_t k_row = tid; k_row < args.sequence; k_row += threads)
+        if (scores[k_row] > local_max) local_max = scores[k_row];
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (uint32_t stride = threads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && reduce[tid + stride] > reduce[tid])
+            reduce[tid] = reduce[tid + stride];
+        __syncthreads();
     }
-    output[q_base + dim] = accumulated;
+    float max_score = reduce[0];
+    __syncthreads();
+    float local_sum = 0.0f;
+    for (uint32_t k_row = tid; k_row < args.sequence; k_row += threads) {
+        float value = expf(scores[k_row] - max_score);
+        scores[k_row] = value;
+        local_sum += value;
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+    float inverse = 1.0f / reduce[0];
+    __syncthreads();
+    for (uint32_t k_row = tid; k_row < args.sequence; k_row += threads)
+        scores[k_row] *= inverse;
+    __syncthreads();
+    for (uint32_t d = tid; d < args.head_dim; d += threads) {
+        float accumulated = 0.0f;
+        for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
+            size_t v_base =
+                ((size_t)k_row * args.heads + head) * args.head_dim;
+            accumulated = fmaf(scores[k_row], value[v_base + d], accumulated);
+        }
+        output[q_base + d] = accumulated;
+    }
 }
 
 int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -3418,9 +3439,14 @@ int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         !heads || !head_dim)
         return h3_gpu_fail(gpu, "invalid F32 SDPA request");
     h3_sdpa_args args = {sequence, heads, head_dim, scale, 0u};
-    dim3 threads(head_dim, 1, 1);
+    unsigned threads = 128;
+    while (threads > head_dim && threads > 32) threads >>= 1;
+    if (threads < 32) threads = 32;
+    size_t shared_bytes =
+        (size_t)sequence * sizeof(float) + (size_t)threads * sizeof(float);
+    if (shared_bytes > 48u * 1024u)
+        return h3_gpu_fail(gpu, "F32 SDPA shared memory exceeds 48KiB");
     dim3 blocks(heads, sequence, 1);
-    size_t shared_bytes = (size_t)sequence * sizeof(float);
     h3_sdpa_f32_kernel<<<blocks, threads, shared_bytes, gpu->stream>>>(
         (const float *)query->device, (const float *)key->device,
         (const float *)value->device, (float *)output->device, args);
@@ -4134,56 +4160,77 @@ struct h3_sdpa_causal_args {
 __global__ static void h3_sdpa_causal_f32_kernel(
     const float *query, const float *key, const float *value, float *output,
     h3_sdpa_causal_args args) {
-    extern __shared__ float scores[];
+    extern __shared__ float shared[];
+    float *scores = shared;
+    float *reduce = shared + args.sequence;
     uint32_t head = (uint32_t)blockIdx.x;
     uint32_t q_row = (uint32_t)blockIdx.y;
     uint32_t batch = (uint32_t)blockIdx.z;
-    uint32_t dim = (uint32_t)threadIdx.x;
-    if (batch >= args.batch || head >= args.heads || q_row >= args.sequence ||
-        dim >= args.head_dim)
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (batch >= args.batch || head >= args.heads || q_row >= args.sequence)
         return;
     size_t q_base =
         (((size_t)batch * args.sequence + q_row) * args.heads + head) *
         args.head_dim;
-    if (dim == 0) {
-        float max_score = -INFINITY;
-        for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
-            if (k_row > q_row) {
-                scores[k_row] = -INFINITY;
-                continue;
-            }
-            size_t k_base =
+    for (uint32_t k_row = tid; k_row < args.sequence; k_row += threads) {
+        if (k_row > q_row) {
+            scores[k_row] = -INFINITY;
+            continue;
+        }
+        size_t k_base =
+            (((size_t)batch * args.sequence + k_row) * args.heads + head) *
+            args.head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < args.head_dim; d++)
+            dot = fmaf(query[q_base + d], key[k_base + d], dot);
+        scores[k_row] = dot * args.scale;
+    }
+    __syncthreads();
+    float local_max = -INFINITY;
+    for (uint32_t k_row = tid; k_row <= q_row; k_row += threads)
+        if (scores[k_row] > local_max) local_max = scores[k_row];
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (uint32_t stride = threads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && reduce[tid + stride] > reduce[tid])
+            reduce[tid] = reduce[tid + stride];
+        __syncthreads();
+    }
+    float max_score = reduce[0];
+    __syncthreads();
+    float local_sum = 0.0f;
+    for (uint32_t k_row = tid; k_row < args.sequence; k_row += threads) {
+        if (k_row > q_row) {
+            scores[k_row] = 0.0f;
+            continue;
+        }
+        float value = expf(scores[k_row] - max_score);
+        scores[k_row] = value;
+        local_sum += value;
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+    float inverse = 1.0f / reduce[0];
+    __syncthreads();
+    for (uint32_t k_row = tid; k_row <= q_row; k_row += threads)
+        scores[k_row] *= inverse;
+    __syncthreads();
+    for (uint32_t d = tid; d < args.head_dim; d += threads) {
+        float accumulated = 0.0f;
+        for (uint32_t k_row = 0; k_row <= q_row; k_row++) {
+            size_t v_base =
                 (((size_t)batch * args.sequence + k_row) * args.heads +
                  head) *
                 args.head_dim;
-            float dot = 0.0f;
-            for (uint32_t d = 0; d < args.head_dim; d++)
-                dot = fmaf(query[q_base + d], key[k_base + d], dot);
-            scores[k_row] = dot * args.scale;
-            if (scores[k_row] > max_score) max_score = scores[k_row];
+            accumulated = fmaf(scores[k_row], value[v_base + d], accumulated);
         }
-        float sum = 0.0f;
-        for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
-            if (k_row > q_row) {
-                scores[k_row] = 0.0f;
-                continue;
-            }
-            scores[k_row] = expf(scores[k_row] - max_score);
-            sum += scores[k_row];
-        }
-        float inverse = 1.0f / sum;
-        for (uint32_t k_row = 0; k_row <= q_row; k_row++)
-            scores[k_row] *= inverse;
+        output[q_base + d] = accumulated;
     }
-    __syncthreads();
-    float accumulated = 0.0f;
-    for (uint32_t k_row = 0; k_row <= q_row; k_row++) {
-        size_t v_base =
-            (((size_t)batch * args.sequence + k_row) * args.heads + head) *
-            args.head_dim;
-        accumulated = fmaf(scores[k_row], value[v_base + dim], accumulated);
-    }
-    output[q_base + dim] = accumulated;
 }
 
 int h3_gpu_sdpa_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -4201,9 +4248,14 @@ int h3_gpu_sdpa_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         !sequence || !heads || !head_dim)
         return h3_gpu_fail(gpu, "invalid causal SDPA request");
     h3_sdpa_causal_args args = {batch, sequence, heads, head_dim, scale};
-    dim3 threads(head_dim, 1, 1);
+    unsigned threads = 128;
+    while (threads > head_dim && threads > 32) threads >>= 1;
+    if (threads < 32) threads = 32;
+    size_t shared_bytes =
+        (size_t)sequence * sizeof(float) + (size_t)threads * sizeof(float);
+    if (shared_bytes > 48u * 1024u)
+        return h3_gpu_fail(gpu, "causal SDPA shared memory exceeds 48KiB");
     dim3 blocks(heads, sequence, batch);
-    size_t shared_bytes = (size_t)sequence * sizeof(float);
     h3_sdpa_causal_f32_kernel<<<blocks, threads, shared_bytes, gpu->stream>>>(
         (const float *)query->device, (const float *)key->device,
         (const float *)value->device, (float *)output->device, args);
