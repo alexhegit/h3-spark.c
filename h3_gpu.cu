@@ -1713,37 +1713,50 @@ __global__ static void h3_sdpa_bf16_parallel_kernel(
     if (head >= args.heads || q_row >= args.sequence) return;
 
     size_t q_base = ((size_t)q_row * args.heads + head) * args.head_dim;
-    for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
+    /* Each thread owns a strided set of key rows for the score pass. */
+    for (uint32_t k_row = tid; k_row < args.sequence; k_row += threads) {
         size_t k_base = ((size_t)k_row * args.heads + head) * args.head_dim;
-        float partial = 0.0f;
-        for (uint32_t d = tid; d < args.head_dim; d += threads) {
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < args.head_dim; d++) {
             float q = h3_bf16_bits_to_f32(query[q_base + d]);
             float k = h3_bf16_bits_to_f32(key[k_base + d]);
-            partial = fmaf(q, k, partial);
+            dot = fmaf(q, k, dot);
         }
-        reduce[tid] = partial;
-        __syncthreads();
-        for (uint32_t stride = threads >> 1; stride > 0; stride >>= 1) {
-            if (tid < stride) reduce[tid] += reduce[tid + stride];
-            __syncthreads();
-        }
-        if (tid == 0) scores[k_row] = reduce[0] * args.scale;
-        __syncthreads();
-    }
-    if (tid == 0) {
-        float max_score = -INFINITY;
-        for (uint32_t k_row = 0; k_row < args.sequence; k_row++)
-            if (scores[k_row] > max_score) max_score = scores[k_row];
-        float sum = 0.0f;
-        for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
-            scores[k_row] = expf(scores[k_row] - max_score);
-            sum += scores[k_row];
-        }
-        float inverse = 1.0f / sum;
-        for (uint32_t k_row = 0; k_row < args.sequence; k_row++)
-            scores[k_row] *= inverse;
+        scores[k_row] = dot * args.scale;
     }
     __syncthreads();
+
+    float local_max = -INFINITY;
+    for (uint32_t k_row = tid; k_row < args.sequence; k_row += threads)
+        if (scores[k_row] > local_max) local_max = scores[k_row];
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (uint32_t stride = threads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && reduce[tid + stride] > reduce[tid])
+            reduce[tid] = reduce[tid + stride];
+        __syncthreads();
+    }
+    float max_score = reduce[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (uint32_t k_row = tid; k_row < args.sequence; k_row += threads) {
+        float value = expf(scores[k_row] - max_score);
+        scores[k_row] = value;
+        local_sum += value;
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+    float inverse = 1.0f / reduce[0];
+    __syncthreads();
+    for (uint32_t k_row = tid; k_row < args.sequence; k_row += threads)
+        scores[k_row] *= inverse;
+    __syncthreads();
+
     for (uint32_t d = tid; d < args.head_dim; d += threads) {
         float accumulated = 0.0f;
         for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
