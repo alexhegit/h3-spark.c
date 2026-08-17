@@ -1510,6 +1510,8 @@ struct h3_sdpa_args {
     uint32_t head_major_output;
 };
 
+/* Naive reference kernel (serial score loop on thread 0). Kept for
+ * H3_SDPA_NAIVE=1 A/B and tiny correctness fallbacks. */
 __global__ static void h3_sdpa_bf16_kernel(
     const uint16_t *query, const uint16_t *key, const uint16_t *value,
     uint16_t *output, h3_sdpa_args args) {
@@ -1558,6 +1560,232 @@ __global__ static void h3_sdpa_bf16_kernel(
     output[output_index] = h3_f32_to_bf16_bits(accumulated);
 }
 
+__global__ static void h3_sdpa_softmax_rows_f32_kernel(float *scores,
+                                                       uint32_t sequence,
+                                                       uint32_t heads) {
+    uint32_t head = (uint32_t)blockIdx.x;
+    uint32_t q_row = (uint32_t)blockIdx.y;
+    if (head >= heads || q_row >= sequence) return;
+    float *row = scores + ((size_t)head * sequence + q_row) * sequence;
+    float max_score = -INFINITY;
+    for (uint32_t k = 0; k < sequence; k++)
+        if (row[k] > max_score) max_score = row[k];
+    float sum = 0.0f;
+    for (uint32_t k = 0; k < sequence; k++) {
+        row[k] = expf(row[k] - max_score);
+        sum += row[k];
+    }
+    float inverse = 1.0f / sum;
+    for (uint32_t k = 0; k < sequence; k++) row[k] *= inverse;
+}
+
+__global__ static void h3_sdpa_pack_head_major_bf16_kernel(
+    const uint16_t *token_major, uint16_t *head_major, uint32_t sequence,
+    uint32_t heads, uint32_t head_dim) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (index >= count) return;
+    uint32_t dim = (uint32_t)(index % head_dim);
+    size_t tmp = index / head_dim;
+    uint32_t head = (uint32_t)(tmp % heads);
+    uint32_t row = (uint32_t)(tmp / heads);
+    size_t src = ((size_t)row * heads + head) * head_dim + dim;
+    size_t dst = ((size_t)head * sequence + row) * head_dim + dim;
+    head_major[dst] = token_major[src];
+}
+
+static int h3_gpu_sdpa_bf16_naive(h3_gpu *gpu, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *query,
+                                  const h3_gpu_tensor *key,
+                                  const h3_gpu_tensor *value,
+                                  uint32_t sequence, uint32_t heads,
+                                  uint32_t head_dim, float scale,
+                                  int head_major_output) {
+    h3_sdpa_args args = {sequence, heads, head_dim, scale,
+                         head_major_output ? 1u : 0u};
+    dim3 threads(head_dim, 1, 1);
+    dim3 blocks(heads, sequence, 1);
+    size_t shared_bytes = (size_t)sequence * sizeof(float);
+    h3_sdpa_bf16_kernel<<<blocks, threads, shared_bytes, gpu->stream>>>(
+        (const uint16_t *)query->device, (const uint16_t *)key->device,
+        (const uint16_t *)value->device, (uint16_t *)output->device, args);
+    gpu->stats.mps_sdpa_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_bf16_naive");
+}
+
+static int h3_gpu_sdpa_bf16_gemm(h3_gpu *gpu, h3_gpu_tensor *output,
+                                 const h3_gpu_tensor *query,
+                                 const h3_gpu_tensor *key,
+                                 const h3_gpu_tensor *value,
+                                 uint32_t sequence, uint32_t heads,
+                                 uint32_t head_dim, float scale,
+                                 int head_major_output) {
+    size_t score_count = (size_t)heads * sequence * sequence;
+    if (score_count / sequence / heads != sequence)
+        return h3_gpu_fail(gpu, "SDPA score buffer size overflow");
+    h3_gpu_tensor *scores = h3_gpu_tensor_new_f32(gpu, score_count);
+    if (!scores) return h3_gpu_fail(gpu, "SDPA score alloc failed");
+
+    int lda = (int)(heads * head_dim);
+    float beta = 0.0f;
+    int ok = 1;
+    for (uint32_t head = 0; head < heads && ok; head++) {
+        const uint16_t *query_h =
+            (const uint16_t *)query->device + (size_t)head * head_dim;
+        const uint16_t *key_h =
+            (const uint16_t *)key->device + (size_t)head * head_dim;
+        float *scores_h =
+            (float *)scores->device + (size_t)head * sequence * sequence;
+        /* Row-major scores = scale * Q @ K^T, same OP trick as linear_bf16. */
+        cublasStatus_t status = cublasGemmEx(
+            gpu->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)sequence,
+            (int)sequence, (int)head_dim, &scale, key_h, CUDA_R_16BF, lda,
+            query_h, CUDA_R_16BF, lda, &beta, scores_h, CUDA_R_32F,
+            (int)sequence, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        if (!h3_cublas_check(gpu, status, "cublasGemmEx sdpa QK")) ok = 0;
+        gpu->stats.mps_linear_dispatches++;
+    }
+    if (ok) {
+        dim3 blocks(heads, sequence, 1);
+        h3_sdpa_softmax_rows_f32_kernel<<<blocks, 1, 0, gpu->stream>>>(
+            (float *)scores->device, sequence, heads);
+        ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_softmax");
+        gpu->stats.direct_dispatches++;
+    }
+    h3_gpu_tensor *token_major = output;
+    h3_gpu_tensor *packed = NULL;
+    if (ok && head_major_output) {
+        packed = h3_gpu_tensor_new_bf16(
+            gpu, (size_t)sequence * heads * head_dim);
+        if (!packed) {
+            ok = h3_gpu_fail(gpu, "SDPA head-major temp alloc failed");
+        } else {
+            token_major = packed;
+        }
+    }
+    float alpha = 1.0f;
+    for (uint32_t head = 0; head < heads && ok; head++) {
+        const uint16_t *value_h =
+            (const uint16_t *)value->device + (size_t)head * head_dim;
+        uint16_t *out_h =
+            (uint16_t *)token_major->device + (size_t)head * head_dim;
+        float *scores_h =
+            (float *)scores->device + (size_t)head * sequence * sequence;
+        /* Row-major out = scores @ V. */
+        cublasStatus_t status = cublasGemmEx(
+            gpu->cublas, CUBLAS_OP_N, CUBLAS_OP_N, (int)head_dim,
+            (int)sequence, (int)sequence, &alpha, value_h, CUDA_R_16BF, lda,
+            scores_h, CUDA_R_32F, (int)sequence, &beta, out_h, CUDA_R_16BF,
+            lda, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        if (!h3_cublas_check(gpu, status, "cublasGemmEx sdpa AV")) ok = 0;
+        gpu->stats.mps_linear_dispatches++;
+    }
+    if (ok && head_major_output) {
+        unsigned threads = 256;
+        size_t count = (size_t)sequence * heads * head_dim;
+        unsigned blocks =
+            (unsigned)((count + threads - 1) / threads);
+        h3_sdpa_pack_head_major_bf16_kernel<<<blocks, threads, 0,
+                                              gpu->stream>>>(
+            (const uint16_t *)token_major->device, (uint16_t *)output->device,
+            sequence, heads, head_dim);
+        ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_pack_head_major");
+        gpu->stats.direct_dispatches++;
+    }
+    h3_gpu_tensor_free(packed);
+    h3_gpu_tensor_free(scores);
+    if (ok) gpu->stats.mps_sdpa_dispatches++;
+    return ok;
+}
+
+/* Parallel SDPA: one block per (head, query row). Much faster than the
+ * thread-0 serial score loop, and matches the reference math. */
+__global__ static void h3_sdpa_bf16_parallel_kernel(
+    const uint16_t *query, const uint16_t *key, const uint16_t *value,
+    uint16_t *output, h3_sdpa_args args) {
+    extern __shared__ float shared[];
+    float *scores = shared;
+    float *reduce = shared + args.sequence;
+    uint32_t head = (uint32_t)blockIdx.x;
+    uint32_t q_row = (uint32_t)blockIdx.y;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (head >= args.heads || q_row >= args.sequence) return;
+
+    size_t q_base = ((size_t)q_row * args.heads + head) * args.head_dim;
+    for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
+        size_t k_base = ((size_t)k_row * args.heads + head) * args.head_dim;
+        float partial = 0.0f;
+        for (uint32_t d = tid; d < args.head_dim; d += threads) {
+            float q = h3_bf16_bits_to_f32(query[q_base + d]);
+            float k = h3_bf16_bits_to_f32(key[k_base + d]);
+            partial = fmaf(q, k, partial);
+        }
+        reduce[tid] = partial;
+        __syncthreads();
+        for (uint32_t stride = threads >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) reduce[tid] += reduce[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) scores[k_row] = reduce[0] * args.scale;
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float max_score = -INFINITY;
+        for (uint32_t k_row = 0; k_row < args.sequence; k_row++)
+            if (scores[k_row] > max_score) max_score = scores[k_row];
+        float sum = 0.0f;
+        for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
+            scores[k_row] = expf(scores[k_row] - max_score);
+            sum += scores[k_row];
+        }
+        float inverse = 1.0f / sum;
+        for (uint32_t k_row = 0; k_row < args.sequence; k_row++)
+            scores[k_row] *= inverse;
+    }
+    __syncthreads();
+    for (uint32_t d = tid; d < args.head_dim; d += threads) {
+        float accumulated = 0.0f;
+        for (uint32_t k_row = 0; k_row < args.sequence; k_row++) {
+            size_t v_base =
+                ((size_t)k_row * args.heads + head) * args.head_dim;
+            accumulated = fmaf(scores[k_row],
+                               h3_bf16_bits_to_f32(value[v_base + d]),
+                               accumulated);
+        }
+        size_t output_index =
+            args.head_major_output
+                ? ((size_t)head * args.sequence + q_row) * args.head_dim + d
+                : q_base + d;
+        output[output_index] = h3_f32_to_bf16_bits(accumulated);
+    }
+}
+
+static int h3_gpu_sdpa_bf16_parallel(h3_gpu *gpu, h3_gpu_tensor *output,
+                                     const h3_gpu_tensor *query,
+                                     const h3_gpu_tensor *key,
+                                     const h3_gpu_tensor *value,
+                                     uint32_t sequence, uint32_t heads,
+                                     uint32_t head_dim, float scale,
+                                     int head_major_output) {
+    h3_sdpa_args args = {sequence, heads, head_dim, scale,
+                         head_major_output ? 1u : 0u};
+    unsigned threads = 128;
+    while (threads > head_dim && threads > 32) threads >>= 1;
+    if (threads < 32) threads = 32;
+    size_t shared_bytes =
+        (size_t)sequence * sizeof(float) + (size_t)threads * sizeof(float);
+    if (shared_bytes > 48u * 1024u)
+        return h3_gpu_fail(gpu, "SDPA shared memory exceeds 48KiB");
+    dim3 blocks(heads, sequence, 1);
+    h3_sdpa_bf16_parallel_kernel<<<blocks, threads, shared_bytes,
+                                   gpu->stream>>>(
+        (const uint16_t *)query->device, (const uint16_t *)key->device,
+        (const uint16_t *)value->device, (uint16_t *)output->device, args);
+    gpu->stats.mps_sdpa_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_bf16_parallel");
+}
+
 static int h3_gpu_sdpa_bf16_impl(h3_gpu *gpu, h3_gpu_tensor *output,
                                    const h3_gpu_tensor *query,
                                    const h3_gpu_tensor *key,
@@ -1573,16 +1801,25 @@ static int h3_gpu_sdpa_bf16_impl(h3_gpu *gpu, h3_gpu_tensor *output,
         key->elements < count || value->elements < count || !sequence ||
         !heads || !head_dim)
         return h3_gpu_fail(gpu, "invalid SDPA request");
-    h3_sdpa_args args = {sequence, heads, head_dim, scale,
-                         head_major_output ? 1u : 0u};
-    dim3 threads(head_dim, 1, 1);
-    dim3 blocks(heads, sequence, 1);
-    size_t shared_bytes = (size_t)sequence * sizeof(float);
-    h3_sdpa_bf16_kernel<<<blocks, threads, shared_bytes, gpu->stream>>>(
-        (const uint16_t *)query->device, (const uint16_t *)key->device,
-        (const uint16_t *)value->device, (uint16_t *)output->device, args);
-    gpu->stats.mps_sdpa_dispatches++;
-    return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_bf16");
+    const char *mode = getenv("H3_SDPA_NAIVE");
+    if (mode && *mode && strcmp(mode, "0") != 0)
+        return h3_gpu_sdpa_bf16_naive(gpu, output, query, key, value, sequence,
+                                      heads, head_dim, scale,
+                                      head_major_output);
+    mode = getenv("H3_SDPA_GEMM");
+    if (mode && *mode && strcmp(mode, "0") != 0)
+        return h3_gpu_sdpa_bf16_gemm(gpu, output, query, key, value, sequence,
+                                     heads, head_dim, scale,
+                                     head_major_output);
+    size_t shared_need =
+        (size_t)sequence * sizeof(float) + 128u * sizeof(float);
+    if (shared_need > 48u * 1024u)
+        return h3_gpu_sdpa_bf16_gemm(gpu, output, query, key, value, sequence,
+                                     heads, head_dim, scale,
+                                     head_major_output);
+    return h3_gpu_sdpa_bf16_parallel(gpu, output, query, key, value, sequence,
+                                     heads, head_dim, scale,
+                                     head_major_output);
 }
 
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -4667,10 +4904,10 @@ int h3_gpu_begin(h3_gpu *gpu) {
 }
 
 int h3_gpu_continue(h3_gpu *gpu) {
+    /* Match Metal: enqueue without waiting. CUDA stream already orders work. */
     if (!gpu) return 0;
-    cudaError_t status = cudaStreamSynchronize(gpu->stream);
     gpu->stats.submissions++;
-    return h3_cuda_check(gpu, status, "cudaStreamSynchronize continue");
+    return 1;
 }
 
 int h3_gpu_submit(h3_gpu *gpu) {
