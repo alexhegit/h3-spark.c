@@ -8,6 +8,22 @@ the same CLI and model stack run on Spark.
 **Original project:** [antirez/h3.c](https://github.com/antirez/h3.c)  
 **Official weights:** [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3)
 
+## Showcase (DGX Spark)
+
+Clips below were generated on NVIDIA DGX Spark with this CUDA port
+(512×512, 22 frames, `--steps 20 --layers 45 --reuse 2`). Click a poster for
+the MP4.
+
+| Mode | Sample |
+|------|--------|
+| **T2VA** — text → video+audio | [![T2VA fox](assets/showcase/t2va-fox-fast.jpg)](assets/showcase/t2va-fox-fast.mp4) [mp4](assets/showcase/t2va-fox-fast.mp4) |
+| **Ref2VA** — `--ref-image` | [![Ref2VA](assets/showcase/ref2va-person-lamb.jpg)](assets/showcase/ref2va-person-lamb.mp4) [mp4](assets/showcase/ref2va-person-lamb.mp4) |
+| **FL2VA** — `--first-frame` + `--last-frame` | [![FL2VA](assets/showcase/fl2va-family-dinner.jpg)](assets/showcase/fl2va-family-dinner.mp4) [mp4](assets/showcase/fl2va-family-dinner.mp4) |
+
+- **T2VA:** fox walking through snow (prompt-only).
+- **Ref2VA:** identity/scene from a real reference still (person in pink suit holding a black lamb), then motion from the prompt.
+- **FL2VA:** warm dinner / ramen scene anchored by real first and last frames from an official demo clip.
+
 ## Status (2026-08-17)
 
 | Capability | Status |
