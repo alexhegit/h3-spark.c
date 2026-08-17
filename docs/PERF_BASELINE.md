@@ -127,5 +127,38 @@ unless intentionally changing resolution/steps.
 
 ---
 
-*Baseline frozen 2026-08-17. Append new dated sections when a material speedup
-lands; do not overwrite this table without noting the old numbers.*
+---
+
+## 2026-08-17 — Parallel SDPA (autoloop, `perf/dit-denoise-opt`)
+
+**Change:** Replace thread-0 serial SDPA score loop with block-parallel SDPA
+(`h3_sdpa_bf16_parallel_kernel`). Keep naive path behind `H3_SDPA_NAIVE=1`.
+Also make `h3_gpu_continue` non-blocking (Metal semantics).
+
+**Commits:** `abf1ef8` (first parallel), `92a190b` (fewer syncthreads on scores).
+
+### Fox-fast A/B (same preset as baseline)
+
+| Metric | Baseline (naive SDPA) | Parallel SDPA (`abf1ef8` binary) | Speedup |
+|--------|----------------------:|---------------------------------:|--------:|
+| **GPU Euler denoise** | **1471.7 s** | **912.3 s** | **1.61×** |
+| Video VAE decode | 183.6 s | 178.2 s | ~1.03× |
+| DiT load | 53.0 s | 58.5 s | — |
+| Text encode | 14.8 s | 14.8 s | — |
+| **E2E wall** | **1725.7 s** | **1166.1 s** | **1.48×** |
+
+Log: `/tmp/h3_perf/fox-fast-512-sdpa-parallel.log`
+
+### Proxy A/B (512² / 22f / steps4 / layers35 / reuse1)
+
+| Backend | Denoise wall | E2E wall |
+|---------|-------------:|---------:|
+| Parallel (default) | 255.2 s | 501.5 s |
+| `H3_SDPA_NAIVE=1` | 409.4 s | 655.2 s |
+
+Denoise proxy speedup **1.60×**, consistent with full fox-fast.
+
+### Remaining hotspot share (after parallel SDPA)
+
+At fox-fast: denoise still **~78%** of wall (912/1166); video VAE **~15%**.
+Next: GEMM/Flash-style SDPA, INT8 GEMM reliability, VAE decode.
