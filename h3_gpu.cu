@@ -14,6 +14,7 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 struct h3_gpu_tensor {
@@ -33,7 +34,56 @@ struct h3_gpu {
     char error[512];
     char profile_label[128];
     h3_gpu_stats stats;
+    h3_gpu_stats profile_start_stats;
+    h3_gpu_stats profile_mark_stats;
+    double profile_start_wall;
+    double profile_mark_wall;
 };
+
+static double h3_gpu_now(void) {
+    struct timespec time;
+    if (clock_gettime(CLOCK_MONOTONIC, &time) != 0) return 0.0;
+    return (double)time.tv_sec + (double)time.tv_nsec * 1e-9;
+}
+
+static int h3_gpu_profile_enabled(void) {
+    const char *value = getenv("H3_PROFILE");
+    return value && *value && strcmp(value, "0") != 0;
+}
+
+static uint64_t h3_gpu_counter_delta(uint64_t value, uint64_t start) {
+    return value >= start ? value - start : 0;
+}
+
+static void h3_gpu_profile_emit(h3_gpu *gpu, const char *phase,
+                                const h3_gpu_stats *start, double wall_start) {
+    if (!gpu || !phase || !h3_gpu_profile_enabled()) return;
+    if (gpu->stream) cudaStreamSynchronize(gpu->stream);
+    h3_gpu_stats value = gpu->stats;
+    double wall = h3_gpu_now() - wall_start;
+    const char *label =
+        gpu->profile_label[0] ? gpu->profile_label : "CUDA context";
+    fprintf(stderr,
+            "h3 profile: %-24s %-14s wall=%8.3fs "
+            "peak=%7.3fGiB alloc=%7.3fGiB submissions=%llu "
+            "direct=%llu linear=%llu conv=%llu attention=%llu\n",
+            label, phase, wall,
+            (double)value.peak_live_bytes / (1024.0 * 1024.0 * 1024.0),
+            (double)h3_gpu_counter_delta(value.allocated_bytes,
+                                         start->allocated_bytes) /
+                (1024.0 * 1024.0 * 1024.0),
+            (unsigned long long)h3_gpu_counter_delta(value.submissions,
+                                                     start->submissions),
+            (unsigned long long)h3_gpu_counter_delta(value.direct_dispatches,
+                                                     start->direct_dispatches),
+            (unsigned long long)h3_gpu_counter_delta(
+                value.mps_linear_dispatches, start->mps_linear_dispatches),
+            (unsigned long long)h3_gpu_counter_delta(value.mps_conv_dispatches,
+                                                     start->mps_conv_dispatches),
+            (unsigned long long)h3_gpu_counter_delta(
+                value.mps_sdpa_dispatches, start->mps_sdpa_dispatches));
+    fflush(stderr);
+}
 
 static inline __device__ __host__ float h3_bf16_bits_to_f32(uint16_t bits) {
     union {
@@ -171,11 +221,19 @@ h3_gpu *h3_gpu_create(const char *shader_source_path, char *error,
         gpu->tensor_fast_path = gpu->fast_path;
     }
     gpu->error[0] = '\0';
+    snprintf(gpu->profile_label, sizeof(gpu->profile_label), "%s",
+             "CUDA context");
+    gpu->profile_start_stats = gpu->stats;
+    gpu->profile_mark_stats = gpu->stats;
+    gpu->profile_start_wall = h3_gpu_now();
+    gpu->profile_mark_wall = gpu->profile_start_wall;
     return gpu;
 }
 
 void h3_gpu_free(h3_gpu *gpu) {
     if (!gpu) return;
+    h3_gpu_profile_emit(gpu, "total", &gpu->profile_start_stats,
+                        gpu->profile_start_wall);
     if (gpu->cublas) cublasDestroy(gpu->cublas);
     if (gpu->stream) cudaStreamDestroy(gpu->stream);
     free(gpu);
@@ -4634,8 +4692,11 @@ void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label) {
 }
 
 void h3_gpu_profile_mark(h3_gpu *gpu, const char *phase) {
-    (void)gpu;
-    (void)phase;
+    if (!gpu || !phase || !*phase || !h3_gpu_profile_enabled()) return;
+    h3_gpu_profile_emit(gpu, phase, &gpu->profile_mark_stats,
+                        gpu->profile_mark_wall);
+    gpu->profile_mark_stats = gpu->stats;
+    gpu->profile_mark_wall = h3_gpu_now();
 }
 
 } /* extern "C" */
