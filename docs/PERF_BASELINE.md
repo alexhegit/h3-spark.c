@@ -162,3 +162,26 @@ Denoise proxy speedup **1.60×**, consistent with full fox-fast.
 
 At fox-fast: denoise still **~78%** of wall (912/1166); video VAE **~15%**.
 Next: GEMM/Flash-style SDPA, INT8 GEMM reliability, VAE decode.
+
+### Follow-up: SDPA v2 kernel (`92a190b`)
+
+Full fox-fast remeasure with the fewer-syncthreads score/softmax kernel:
+
+| Metric | Parallel v1 (`abf1ef8`) | Parallel v2 (`92a190b`) |
+|--------|------------------------:|------------------------:|
+| GPU Euler denoise | **912.3 s** | 940.5 s |
+| E2E wall | **1166.1 s** | 1193.9 s |
+
+v2 was **not** faster on this workload; keep **v1-style** scheduling as the
+reference win. Log: `/tmp/h3_perf/fox-fast-512-sdpa-v2.log`.
+
+### Autoloop close-out (2026-08-18)
+
+11h deadline reached. Branch `perf/dit-denoise-opt` holds:
+
+- Parallel BF16 DiT SDPA (+ continue non-blocking)
+- Parallel F32 / causal SDPA (VAE paths)
+- Documented ~**1.61×** denoise / **1.48×** e2e vs naive baseline
+
+Not merged to `main` yet. Next: GEMM/Flash SDPA, VAE decode, re-profile with
+VAE parallel SDPA binary.
