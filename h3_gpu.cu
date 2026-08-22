@@ -38,6 +38,21 @@ struct h3_gpu {
     h3_gpu_stats profile_mark_stats;
     double profile_start_wall;
     double profile_mark_wall;
+    int op_events_ready;
+    int op_event_count;
+    unsigned char *op_class;
+    cudaEvent_t *op_events;
+    int32_t *int8_accum;
+    size_t int8_accum_bytes;
+    uint64_t int8_cublas_ok;
+    uint64_t int8_naive_fallback;
+};
+
+enum {
+    H3_GPU_OP_LINEAR = 0,
+    H3_GPU_OP_SDPA = 1,
+    H3_GPU_OP_CONV = 2,
+    H3_GPU_OP_EVENT_MAX = 4096
 };
 
 static double h3_gpu_now(void) {
@@ -55,9 +70,92 @@ static uint64_t h3_gpu_counter_delta(uint64_t value, uint64_t start) {
     return value >= start ? value - start : 0;
 }
 
+static double h3_gpu_seconds_delta(double value, double start) {
+    return value >= start ? value - start : 0.0;
+}
+
+static int h3_env_on(const char *name) {
+    const char *value = getenv(name);
+    return value && *value && strcmp(value, "0") != 0;
+}
+
+static void h3_gpu_op_events_destroy(h3_gpu *gpu) {
+    if (!gpu || !gpu->op_events_ready) return;
+    int count = H3_GPU_OP_EVENT_MAX * 2;
+    for (int i = 0; i < count; i++) cudaEventDestroy(gpu->op_events[i]);
+    free(gpu->op_events);
+    free(gpu->op_class);
+    gpu->op_events = NULL;
+    gpu->op_class = NULL;
+    gpu->op_events_ready = 0;
+    gpu->op_event_count = 0;
+}
+
+static int h3_gpu_op_events_init(h3_gpu *gpu) {
+    if (!gpu || gpu->op_events_ready) return gpu && gpu->op_events_ready;
+    gpu->op_events = (cudaEvent_t *)calloc((size_t)H3_GPU_OP_EVENT_MAX * 2u,
+                                           sizeof(cudaEvent_t));
+    gpu->op_class = (unsigned char *)calloc(H3_GPU_OP_EVENT_MAX, 1);
+    if (!gpu->op_events || !gpu->op_class) {
+        free(gpu->op_events);
+        free(gpu->op_class);
+        gpu->op_events = NULL;
+        gpu->op_class = NULL;
+        return 0;
+    }
+    for (int i = 0; i < H3_GPU_OP_EVENT_MAX * 2; i++) {
+        if (cudaEventCreate(&gpu->op_events[i]) != cudaSuccess) {
+            for (int j = 0; j < i; j++) cudaEventDestroy(gpu->op_events[j]);
+            free(gpu->op_events);
+            free(gpu->op_class);
+            gpu->op_events = NULL;
+            gpu->op_class = NULL;
+            return 0;
+        }
+    }
+    gpu->op_events_ready = 1;
+    gpu->op_event_count = 0;
+    return 1;
+}
+
+static void h3_gpu_op_events_flush(h3_gpu *gpu) {
+    if (!gpu || !gpu->op_events_ready || gpu->op_event_count <= 0) return;
+    if (gpu->stream) cudaStreamSynchronize(gpu->stream);
+    for (int i = 0; i < gpu->op_event_count; i++) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, gpu->op_events[i * 2],
+                                 gpu->op_events[i * 2 + 1]) != cudaSuccess)
+            continue;
+        double seconds = (double)ms * 1e-3;
+        unsigned cls = gpu->op_class[i];
+        if (cls == H3_GPU_OP_LINEAR) gpu->stats.gpu_linear_seconds += seconds;
+        else if (cls == H3_GPU_OP_SDPA) gpu->stats.gpu_sdpa_seconds += seconds;
+        else if (cls == H3_GPU_OP_CONV) gpu->stats.gpu_conv_seconds += seconds;
+    }
+    gpu->op_event_count = 0;
+}
+
+static void h3_gpu_op_begin(h3_gpu *gpu, int cls) {
+    if (!gpu || !h3_gpu_profile_enabled()) return;
+    if (!h3_gpu_op_events_init(gpu)) return;
+    if (gpu->op_event_count >= H3_GPU_OP_EVENT_MAX) h3_gpu_op_events_flush(gpu);
+    int i = gpu->op_event_count;
+    gpu->op_class[i] = (unsigned char)cls;
+    cudaEventRecord(gpu->op_events[i * 2], gpu->stream);
+}
+
+static void h3_gpu_op_end(h3_gpu *gpu) {
+    if (!gpu || !gpu->op_events_ready || !h3_gpu_profile_enabled()) return;
+    if (gpu->op_event_count >= H3_GPU_OP_EVENT_MAX) return;
+    int i = gpu->op_event_count;
+    cudaEventRecord(gpu->op_events[i * 2 + 1], gpu->stream);
+    gpu->op_event_count = i + 1;
+}
+
 static void h3_gpu_profile_emit(h3_gpu *gpu, const char *phase,
                                 const h3_gpu_stats *start, double wall_start) {
     if (!gpu || !phase || !h3_gpu_profile_enabled()) return;
+    h3_gpu_op_events_flush(gpu);
     if (gpu->stream) cudaStreamSynchronize(gpu->stream);
     h3_gpu_stats value = gpu->stats;
     double wall = h3_gpu_now() - wall_start;
@@ -66,7 +164,9 @@ static void h3_gpu_profile_emit(h3_gpu *gpu, const char *phase,
     fprintf(stderr,
             "h3 profile: %-24s %-14s wall=%8.3fs "
             "peak=%7.3fGiB alloc=%7.3fGiB submissions=%llu "
-            "direct=%llu linear=%llu conv=%llu attention=%llu\n",
+            "direct=%llu linear=%llu conv=%llu attention=%llu "
+            "gpu-op linear=%.3fs sdpa=%.3fs conv=%.3fs "
+            "int8-cublas=%llu naive=%llu\n",
             label, phase, wall,
             (double)value.peak_live_bytes / (1024.0 * 1024.0 * 1024.0),
             (double)h3_gpu_counter_delta(value.allocated_bytes,
@@ -81,7 +181,15 @@ static void h3_gpu_profile_emit(h3_gpu *gpu, const char *phase,
             (unsigned long long)h3_gpu_counter_delta(value.mps_conv_dispatches,
                                                      start->mps_conv_dispatches),
             (unsigned long long)h3_gpu_counter_delta(
-                value.mps_sdpa_dispatches, start->mps_sdpa_dispatches));
+                value.mps_sdpa_dispatches, start->mps_sdpa_dispatches),
+            h3_gpu_seconds_delta(value.gpu_linear_seconds,
+                                 start->gpu_linear_seconds),
+            h3_gpu_seconds_delta(value.gpu_sdpa_seconds,
+                                 start->gpu_sdpa_seconds),
+            h3_gpu_seconds_delta(value.gpu_conv_seconds,
+                                 start->gpu_conv_seconds),
+            (unsigned long long)gpu->int8_cublas_ok,
+            (unsigned long long)gpu->int8_naive_fallback);
     fflush(stderr);
 }
 
@@ -234,6 +342,8 @@ void h3_gpu_free(h3_gpu *gpu) {
     if (!gpu) return;
     h3_gpu_profile_emit(gpu, "total", &gpu->profile_start_stats,
                         gpu->profile_start_wall);
+    h3_gpu_op_events_destroy(gpu);
+    if (gpu->int8_accum) cudaFree(gpu->int8_accum);
     if (gpu->cublas) cublasDestroy(gpu->cublas);
     if (gpu->stream) cudaStreamDestroy(gpu->stream);
     free(gpu);
@@ -977,6 +1087,7 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         !output_dim)
         return h3_gpu_fail(gpu, "invalid F32 linear request");
 
+    h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
     float alpha = 1.0f;
     float beta = 0.0f;
     cublasStatus_t status = cublasGemmEx(
@@ -985,7 +1096,10 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         input->device, CUDA_R_32F, (int)input_dim, &beta, output->device,
         CUDA_R_32F, (int)output_dim, CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT);
-    if (!h3_cublas_check(gpu, status, "cublasGemmEx linear_f32")) return 0;
+    if (!h3_cublas_check(gpu, status, "cublasGemmEx linear_f32")) {
+        h3_gpu_op_end(gpu);
+        return 0;
+    }
     gpu->stats.direct_dispatches++;
 
     if (bias) {
@@ -996,9 +1110,12 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
             (float *)output->device, (const float *)bias->device, rows,
             output_dim);
         gpu->stats.direct_dispatches++;
-        return h3_cuda_check(gpu, cudaGetLastError(),
-                             "h3_linear_add_bias_f32");
+        int ok = h3_cuda_check(gpu, cudaGetLastError(),
+                               "h3_linear_add_bias_f32");
+        h3_gpu_op_end(gpu);
+        return ok;
     }
+    h3_gpu_op_end(gpu);
     return 1;
 }
 
@@ -1020,6 +1137,7 @@ int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         !output_dim)
         return h3_gpu_fail(gpu, "invalid linear request");
 
+    h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
     float alpha = 1.0f;
     float beta = 0.0f;
     cublasStatus_t status = cublasGemmEx(
@@ -1028,7 +1146,10 @@ int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         input->device, CUDA_R_16BF, (int)input_dim, &beta, output->device,
         CUDA_R_16BF, (int)output_dim, CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT);
-    if (!h3_cublas_check(gpu, status, "cublasGemmEx linear")) return 0;
+    if (!h3_cublas_check(gpu, status, "cublasGemmEx linear")) {
+        h3_gpu_op_end(gpu);
+        return 0;
+    }
     gpu->stats.direct_dispatches++;
 
     if (bias) {
@@ -1039,9 +1160,12 @@ int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
             (uint16_t *)output->device, (const uint16_t *)bias->device, rows,
             output_dim);
         gpu->stats.direct_dispatches++;
-        return h3_cuda_check(gpu, cudaGetLastError(),
-                             "h3_linear_add_bias_bf16");
+        int ok = h3_cuda_check(gpu, cudaGetLastError(),
+                               "h3_linear_add_bias_bf16");
+        h3_gpu_op_end(gpu);
+        return ok;
     }
+    h3_gpu_op_end(gpu);
     return 1;
 }
 
@@ -1508,7 +1632,29 @@ struct h3_sdpa_args {
     uint32_t head_dim;
     float scale;
     uint32_t head_major_output;
+    uint32_t kv_head_major;
 };
+
+__device__ static inline float h3_warp_reduce_sum(float value) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        value += __shfl_xor_sync(0xffffffffu, value, mask);
+    return value;
+}
+
+__device__ static inline size_t h3_sdpa_output_index(h3_sdpa_args args,
+                                                     uint32_t q_pos,
+                                                     uint32_t head,
+                                                     uint32_t dimension) {
+    return args.head_major_output
+               ? ((size_t)head * args.sequence + q_pos) * args.head_dim +
+                     dimension
+               : ((size_t)q_pos * args.heads + head) * args.head_dim +
+                     dimension;
+}
+
+/* One warp per query row. Online softmax, no S-row in shared memory.
+ * Ported from h3-hip.c wave SDPA (gfx1151 KEEP). */
 
 /* Naive reference kernel (serial score loop on thread 0). Kept for
  * H3_SDPA_NAIVE=1 A/B and tiny correctness fallbacks. */
@@ -1602,7 +1748,7 @@ static int h3_gpu_sdpa_bf16_naive(h3_gpu *gpu, h3_gpu_tensor *output,
                                   uint32_t head_dim, float scale,
                                   int head_major_output) {
     h3_sdpa_args args = {sequence, heads, head_dim, scale,
-                         head_major_output ? 1u : 0u};
+                         head_major_output ? 1u : 0u, 0u};
     dim3 threads(head_dim, 1, 1);
     dim3 blocks(heads, sequence, 1);
     size_t shared_bytes = (size_t)sequence * sizeof(float);
@@ -1782,7 +1928,7 @@ static int h3_gpu_sdpa_bf16_parallel(h3_gpu *gpu, h3_gpu_tensor *output,
                                      uint32_t head_dim, float scale,
                                      int head_major_output) {
     h3_sdpa_args args = {sequence, heads, head_dim, scale,
-                         head_major_output ? 1u : 0u};
+                         head_major_output ? 1u : 0u, 0u};
     unsigned threads = 128;
     while (threads > head_dim && threads > 32) threads >>= 1;
     if (threads < 32) threads = 32;
@@ -1797,6 +1943,176 @@ static int h3_gpu_sdpa_bf16_parallel(h3_gpu *gpu, h3_gpu_tensor *output,
         (const uint16_t *)value->device, (uint16_t *)output->device, args);
     gpu->stats.mps_sdpa_dispatches++;
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_bf16_parallel");
+}
+
+__global__ static void __launch_bounds__(32)
+h3_sdpa_bf16_wave_kernel(const uint16_t *query, const uint16_t *key,
+                         const uint16_t *value, uint16_t *output,
+                         h3_sdpa_args args) {
+    uint32_t q_pos = (uint32_t)blockIdx.x;
+    uint32_t head = (uint32_t)blockIdx.y;
+    uint32_t lane = (uint32_t)threadIdx.x;
+    if (q_pos >= args.sequence || head >= args.heads) return;
+    uint32_t q_base = (q_pos * args.heads + head) * args.head_dim;
+    float q[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int item = 0; item < 4; item++) {
+        uint32_t dimension = lane + (uint32_t)item * 32u;
+        if (dimension < args.head_dim)
+            q[item] = h3_bf16_bits_to_f32(query[q_base + dimension]) *
+                      args.scale;
+    }
+    float maximum = -1e30f;
+    float sum = 0.0f;
+    uint32_t stride = args.kv_head_major ? args.head_dim
+                                         : args.heads * args.head_dim;
+    uint32_t k_base = args.kv_head_major ? head * args.sequence * args.head_dim
+                                         : head * args.head_dim;
+    for (uint32_t k_pos = 0; k_pos < args.sequence; k_pos++) {
+        float partial = 0.0f;
+#pragma unroll
+        for (int item = 0; item < 4; item++) {
+            uint32_t dimension = lane + (uint32_t)item * 32u;
+            if (dimension < args.head_dim)
+                partial = fmaf(q[item],
+                               h3_bf16_bits_to_f32(key[k_base + dimension]),
+                               partial);
+        }
+        float score = h3_warp_reduce_sum(partial);
+        float new_max = fmaxf(maximum, score);
+        float alpha = expf(maximum - new_max);
+        float probability = expf(score - new_max);
+#pragma unroll
+        for (int item = 0; item < 4; item++) {
+            uint32_t dimension = lane + (uint32_t)item * 32u;
+            float v = 0.0f;
+            if (dimension < args.head_dim)
+                v = h3_bf16_bits_to_f32(value[k_base + dimension]);
+            acc[item] = fmaf(probability, v, acc[item] * alpha);
+        }
+        sum = fmaf(sum, alpha, probability);
+        maximum = new_max;
+        k_base += stride;
+    }
+    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+#pragma unroll
+    for (int item = 0; item < 4; item++) {
+        uint32_t dimension = lane + (uint32_t)item * 32u;
+        if (dimension < args.head_dim)
+            output[h3_sdpa_output_index(args, q_pos, head, dimension)] =
+                h3_f32_to_bf16_bits(acc[item] * inv);
+    }
+}
+
+__global__ static void __launch_bounds__(32)
+h3_sdpa_bf16_wave_d128_q2_kernel(const uint16_t *query, const uint16_t *key,
+                                 const uint16_t *value, uint16_t *output,
+                                 h3_sdpa_args args) {
+    uint32_t q_pos = (uint32_t)blockIdx.x * 2u;
+    uint32_t head = (uint32_t)blockIdx.y;
+    uint32_t lane = (uint32_t)threadIdx.x;
+    if (q_pos >= args.sequence || head >= args.heads) return;
+    int q1_live = (q_pos + 1u) < args.sequence;
+    uint32_t q_base0 = (q_pos * args.heads + head) * 128u;
+    uint32_t q_base1 = q_base0 + args.heads * 128u;
+    float a0 = h3_bf16_bits_to_f32(query[q_base0 + lane]) * args.scale;
+    float a1 = h3_bf16_bits_to_f32(query[q_base0 + 32u + lane]) * args.scale;
+    float a2 = h3_bf16_bits_to_f32(query[q_base0 + 64u + lane]) * args.scale;
+    float a3 = h3_bf16_bits_to_f32(query[q_base0 + 96u + lane]) * args.scale;
+    float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
+    if (q1_live) {
+        b0 = h3_bf16_bits_to_f32(query[q_base1 + lane]) * args.scale;
+        b1 = h3_bf16_bits_to_f32(query[q_base1 + 32u + lane]) * args.scale;
+        b2 = h3_bf16_bits_to_f32(query[q_base1 + 64u + lane]) * args.scale;
+        b3 = h3_bf16_bits_to_f32(query[q_base1 + 96u + lane]) * args.scale;
+    }
+    float acc_a0 = 0.0f, acc_a1 = 0.0f, acc_a2 = 0.0f, acc_a3 = 0.0f;
+    float acc_b0 = 0.0f, acc_b1 = 0.0f, acc_b2 = 0.0f, acc_b3 = 0.0f;
+    float max_a = -1e30f, max_b = -1e30f, sum_a = 0.0f, sum_b = 0.0f;
+    uint32_t stride = args.kv_head_major ? 128u : args.heads * 128u;
+    uint32_t k_base = args.kv_head_major ? head * args.sequence * 128u
+                                         : head * 128u;
+    for (uint32_t k_pos = 0; k_pos < args.sequence; k_pos++) {
+        float k0 = h3_bf16_bits_to_f32(key[k_base + lane]);
+        float k1v = h3_bf16_bits_to_f32(key[k_base + 32u + lane]);
+        float k2 = h3_bf16_bits_to_f32(key[k_base + 64u + lane]);
+        float k3 = h3_bf16_bits_to_f32(key[k_base + 96u + lane]);
+        float v0 = h3_bf16_bits_to_f32(value[k_base + lane]);
+        float v1 = h3_bf16_bits_to_f32(value[k_base + 32u + lane]);
+        float v2 = h3_bf16_bits_to_f32(value[k_base + 64u + lane]);
+        float v3 = h3_bf16_bits_to_f32(value[k_base + 96u + lane]);
+        float score_a = h3_warp_reduce_sum(a0 * k0 + a1 * k1v + a2 * k2 + a3 * k3);
+        float new_a = fmaxf(max_a, score_a);
+        float alpha_a = expf(max_a - new_a);
+        float pa = expf(score_a - new_a);
+        acc_a0 = fmaf(pa, v0, acc_a0 * alpha_a);
+        acc_a1 = fmaf(pa, v1, acc_a1 * alpha_a);
+        acc_a2 = fmaf(pa, v2, acc_a2 * alpha_a);
+        acc_a3 = fmaf(pa, v3, acc_a3 * alpha_a);
+        sum_a = fmaf(sum_a, alpha_a, pa);
+        max_a = new_a;
+        if (q1_live) {
+            float score_b =
+                h3_warp_reduce_sum(b0 * k0 + b1 * k1v + b2 * k2 + b3 * k3);
+            float new_b = fmaxf(max_b, score_b);
+            float alpha_b = expf(max_b - new_b);
+            float pb = expf(score_b - new_b);
+            acc_b0 = fmaf(pb, v0, acc_b0 * alpha_b);
+            acc_b1 = fmaf(pb, v1, acc_b1 * alpha_b);
+            acc_b2 = fmaf(pb, v2, acc_b2 * alpha_b);
+            acc_b3 = fmaf(pb, v3, acc_b3 * alpha_b);
+            sum_b = fmaf(sum_b, alpha_b, pb);
+            max_b = new_b;
+        }
+        k_base += stride;
+    }
+    float inv_a = sum_a > 0.0f ? 1.0f / sum_a : 0.0f;
+    output[h3_sdpa_output_index(args, q_pos, head, lane)] =
+        h3_f32_to_bf16_bits(acc_a0 * inv_a);
+    output[h3_sdpa_output_index(args, q_pos, head, 32u + lane)] =
+        h3_f32_to_bf16_bits(acc_a1 * inv_a);
+    output[h3_sdpa_output_index(args, q_pos, head, 64u + lane)] =
+        h3_f32_to_bf16_bits(acc_a2 * inv_a);
+    output[h3_sdpa_output_index(args, q_pos, head, 96u + lane)] =
+        h3_f32_to_bf16_bits(acc_a3 * inv_a);
+    if (q1_live) {
+        float inv_b = sum_b > 0.0f ? 1.0f / sum_b : 0.0f;
+        output[h3_sdpa_output_index(args, q_pos + 1u, head, lane)] =
+            h3_f32_to_bf16_bits(acc_b0 * inv_b);
+        output[h3_sdpa_output_index(args, q_pos + 1u, head, 32u + lane)] =
+            h3_f32_to_bf16_bits(acc_b1 * inv_b);
+        output[h3_sdpa_output_index(args, q_pos + 1u, head, 64u + lane)] =
+            h3_f32_to_bf16_bits(acc_b2 * inv_b);
+        output[h3_sdpa_output_index(args, q_pos + 1u, head, 96u + lane)] =
+            h3_f32_to_bf16_bits(acc_b3 * inv_b);
+    }
+}
+
+static int h3_gpu_sdpa_bf16_wave(h3_gpu *gpu, h3_gpu_tensor *output,
+                                 const h3_gpu_tensor *query,
+                                 const h3_gpu_tensor *key,
+                                 const h3_gpu_tensor *value,
+                                 uint32_t sequence, uint32_t heads,
+                                 uint32_t head_dim, float scale,
+                                 int head_major_output) {
+    h3_sdpa_args args = {sequence, heads, head_dim, scale,
+                         head_major_output ? 1u : 0u, 0u};
+    dim3 threads(32, 1, 1);
+    if (head_dim == 128u && !h3_env_on("H3_SDPA_D128_Q1")) {
+        dim3 blocks((sequence + 1u) / 2u, heads, 1);
+        h3_sdpa_bf16_wave_d128_q2_kernel<<<blocks, threads, 0, gpu->stream>>>(
+            (const uint16_t *)query->device, (const uint16_t *)key->device,
+            (const uint16_t *)value->device, (uint16_t *)output->device, args);
+        gpu->stats.mps_sdpa_dispatches++;
+        return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_bf16_wave_q2");
+    }
+    dim3 blocks(sequence, heads, 1);
+    h3_sdpa_bf16_wave_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)query->device, (const uint16_t *)key->device,
+        (const uint16_t *)value->device, (uint16_t *)output->device, args);
+    gpu->stats.mps_sdpa_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_bf16_wave");
 }
 
 static int h3_gpu_sdpa_bf16_impl(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -1814,14 +2130,20 @@ static int h3_gpu_sdpa_bf16_impl(h3_gpu *gpu, h3_gpu_tensor *output,
         key->elements < count || value->elements < count || !sequence ||
         !heads || !head_dim)
         return h3_gpu_fail(gpu, "invalid SDPA request");
-    const char *mode = getenv("H3_SDPA_NAIVE");
-    if (mode && *mode && strcmp(mode, "0") != 0)
+    if (h3_env_on("H3_SDPA_NAIVE"))
         return h3_gpu_sdpa_bf16_naive(gpu, output, query, key, value, sequence,
                                       heads, head_dim, scale,
                                       head_major_output);
-    mode = getenv("H3_SDPA_GEMM");
-    if (mode && *mode && strcmp(mode, "0") != 0)
+    if (h3_env_on("H3_SDPA_GEMM"))
         return h3_gpu_sdpa_bf16_gemm(gpu, output, query, key, value, sequence,
+                                     heads, head_dim, scale,
+                                     head_major_output);
+    if (h3_env_on("H3_SDPA_PARALLEL"))
+        return h3_gpu_sdpa_bf16_parallel(gpu, output, query, key, value,
+                                         sequence, heads, head_dim, scale,
+                                         head_major_output);
+    if (head_dim <= 128u && !h3_env_on("H3_SDPA_WAVE_OFF"))
+        return h3_gpu_sdpa_bf16_wave(gpu, output, query, key, value, sequence,
                                      heads, head_dim, scale,
                                      head_major_output);
     size_t shared_need =
@@ -1839,16 +2161,22 @@ int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale) {
-    return h3_gpu_sdpa_bf16_impl(gpu, output, query, key, value, sequence,
-                                 heads, head_dim, scale, 0);
+    h3_gpu_op_begin(gpu, H3_GPU_OP_SDPA);
+    int ok = h3_gpu_sdpa_bf16_impl(gpu, output, query, key, value, sequence,
+                                   heads, head_dim, scale, 0);
+    h3_gpu_op_end(gpu);
+    return ok;
 }
 
 int h3_gpu_sdpa_bf16_head_major_output(
     h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *query,
     const h3_gpu_tensor *key, const h3_gpu_tensor *value, uint32_t sequence,
     uint32_t heads, uint32_t head_dim, float scale) {
-    return h3_gpu_sdpa_bf16_impl(gpu, output, query, key, value, sequence,
-                                 heads, head_dim, scale, 1);
+    h3_gpu_op_begin(gpu, H3_GPU_OP_SDPA);
+    int ok = h3_gpu_sdpa_bf16_impl(gpu, output, query, key, value, sequence,
+                                   heads, head_dim, scale, 1);
+    h3_gpu_op_end(gpu);
+    return ok;
 }
 
 int h3_gpu_embedding_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -3426,6 +3754,115 @@ __global__ static void h3_sdpa_f32_kernel(const float *query, const float *key,
     }
 }
 
+__global__ static void __launch_bounds__(32)
+h3_sdpa_f32_wave_kernel(const float *query, const float *key,
+                        const float *value, float *output, h3_sdpa_args args) {
+    uint32_t q_pos = (uint32_t)blockIdx.x;
+    uint32_t head = (uint32_t)blockIdx.y;
+    uint32_t lane = (uint32_t)threadIdx.x;
+    if (q_pos >= args.sequence || head >= args.heads) return;
+    uint32_t q_base = (q_pos * args.heads + head) * args.head_dim;
+    float q[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int item = 0; item < 4; item++) {
+        uint32_t dimension = lane + (uint32_t)item * 32u;
+        if (dimension < args.head_dim)
+            q[item] = query[q_base + dimension] * args.scale;
+    }
+    float maximum = -1e30f;
+    float sum = 0.0f;
+    uint32_t stride = args.heads * args.head_dim;
+    uint32_t k_base = head * args.head_dim;
+    for (uint32_t k_pos = 0; k_pos < args.sequence; k_pos++) {
+        float partial = 0.0f;
+#pragma unroll
+        for (int item = 0; item < 4; item++) {
+            uint32_t dimension = lane + (uint32_t)item * 32u;
+            if (dimension < args.head_dim)
+                partial = fmaf(q[item], key[k_base + dimension], partial);
+        }
+        float score = h3_warp_reduce_sum(partial);
+        float new_max = fmaxf(maximum, score);
+        float alpha = expf(maximum - new_max);
+        float probability = expf(score - new_max);
+#pragma unroll
+        for (int item = 0; item < 4; item++) {
+            uint32_t dimension = lane + (uint32_t)item * 32u;
+            float v = dimension < args.head_dim ? value[k_base + dimension]
+                                                : 0.0f;
+            acc[item] = fmaf(probability, v, acc[item] * alpha);
+        }
+        sum = fmaf(sum, alpha, probability);
+        maximum = new_max;
+        k_base += stride;
+    }
+    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+#pragma unroll
+    for (int item = 0; item < 4; item++) {
+        uint32_t dimension = lane + (uint32_t)item * 32u;
+        if (dimension < args.head_dim)
+            output[q_base + dimension] = acc[item] * inv;
+    }
+}
+
+__global__ static void __launch_bounds__(32)
+h3_sdpa_f32_wave_d64_q2_kernel(const float *query, const float *key,
+                               const float *value, float *output,
+                               h3_sdpa_args args) {
+    uint32_t q_pos = (uint32_t)blockIdx.x * 2u;
+    uint32_t head = (uint32_t)blockIdx.y;
+    uint32_t lane = (uint32_t)threadIdx.x;
+    if (q_pos >= args.sequence || head >= args.heads) return;
+    int q1_live = (q_pos + 1u) < args.sequence;
+    uint32_t q_base0 = (q_pos * args.heads + head) * 64u;
+    uint32_t q_base1 = q_base0 + args.heads * 64u;
+    float a0 = query[q_base0 + lane] * args.scale;
+    float a1 = query[q_base0 + 32u + lane] * args.scale;
+    float b0 = 0.0f, b1 = 0.0f;
+    if (q1_live) {
+        b0 = query[q_base1 + lane] * args.scale;
+        b1 = query[q_base1 + 32u + lane] * args.scale;
+    }
+    float acc_a0 = 0.0f, acc_a1 = 0.0f, acc_b0 = 0.0f, acc_b1 = 0.0f;
+    float max_a = -1e30f, max_b = -1e30f, sum_a = 0.0f, sum_b = 0.0f;
+    uint32_t stride = args.heads * 64u;
+    uint32_t k_base = head * 64u;
+    for (uint32_t k_pos = 0; k_pos < args.sequence; k_pos++) {
+        float k0 = key[k_base + lane];
+        float k1v = key[k_base + 32u + lane];
+        float v0 = value[k_base + lane];
+        float v1 = value[k_base + 32u + lane];
+        float score_a = h3_warp_reduce_sum(a0 * k0 + a1 * k1v);
+        float new_a = fmaxf(max_a, score_a);
+        float alpha_a = expf(max_a - new_a);
+        float pa = expf(score_a - new_a);
+        acc_a0 = fmaf(pa, v0, acc_a0 * alpha_a);
+        acc_a1 = fmaf(pa, v1, acc_a1 * alpha_a);
+        sum_a = fmaf(sum_a, alpha_a, pa);
+        max_a = new_a;
+        if (q1_live) {
+            float score_b = h3_warp_reduce_sum(b0 * k0 + b1 * k1v);
+            float new_b = fmaxf(max_b, score_b);
+            float alpha_b = expf(max_b - new_b);
+            float pb = expf(score_b - new_b);
+            acc_b0 = fmaf(pb, v0, acc_b0 * alpha_b);
+            acc_b1 = fmaf(pb, v1, acc_b1 * alpha_b);
+            sum_b = fmaf(sum_b, alpha_b, pb);
+            max_b = new_b;
+        }
+        k_base += stride;
+    }
+    float inv_a = sum_a > 0.0f ? 1.0f / sum_a : 0.0f;
+    output[q_base0 + lane] = acc_a0 * inv_a;
+    output[q_base0 + 32u + lane] = acc_a1 * inv_a;
+    if (q1_live) {
+        float inv_b = sum_b > 0.0f ? 1.0f / sum_b : 0.0f;
+        output[q_base1 + lane] = acc_b0 * inv_b;
+        output[q_base1 + 32u + lane] = acc_b1 * inv_b;
+    }
+}
+
 int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                     const h3_gpu_tensor *value, uint32_t sequence,
@@ -3438,20 +3875,48 @@ int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         key->elements < count || value->elements < count || !sequence ||
         !heads || !head_dim)
         return h3_gpu_fail(gpu, "invalid F32 SDPA request");
-    h3_sdpa_args args = {sequence, heads, head_dim, scale, 0u};
+    h3_gpu_op_begin(gpu, H3_GPU_OP_SDPA);
+    h3_sdpa_args args = {sequence, heads, head_dim, scale, 0u, 0u};
+    int ok = 1;
+    if (head_dim <= 128u && !h3_env_on("H3_SDPA_PARALLEL") &&
+        !h3_env_on("H3_SDPA_WAVE_OFF")) {
+        dim3 threads(32, 1, 1);
+        if (head_dim == 64u && !h3_env_on("H3_SDPA_D64_Q1")) {
+            dim3 blocks((sequence + 1u) / 2u, heads, 1);
+            h3_sdpa_f32_wave_d64_q2_kernel<<<blocks, threads, 0, gpu->stream>>>(
+                (const float *)query->device, (const float *)key->device,
+                (const float *)value->device, (float *)output->device, args);
+            gpu->stats.mps_sdpa_dispatches++;
+            ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_f32_wave_q2");
+            h3_gpu_op_end(gpu);
+            return ok;
+        }
+        dim3 blocks(sequence, heads, 1);
+        h3_sdpa_f32_wave_kernel<<<blocks, threads, 0, gpu->stream>>>(
+            (const float *)query->device, (const float *)key->device,
+            (const float *)value->device, (float *)output->device, args);
+        gpu->stats.mps_sdpa_dispatches++;
+        ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_f32_wave");
+        h3_gpu_op_end(gpu);
+        return ok;
+    }
     unsigned threads = 128;
     while (threads > head_dim && threads > 32) threads >>= 1;
     if (threads < 32) threads = 32;
     size_t shared_bytes =
         (size_t)sequence * sizeof(float) + (size_t)threads * sizeof(float);
-    if (shared_bytes > 48u * 1024u)
+    if (shared_bytes > 48u * 1024u) {
+        h3_gpu_op_end(gpu);
         return h3_gpu_fail(gpu, "F32 SDPA shared memory exceeds 48KiB");
+    }
     dim3 blocks(heads, sequence, 1);
     h3_sdpa_f32_kernel<<<blocks, threads, shared_bytes, gpu->stream>>>(
         (const float *)query->device, (const float *)key->device,
         (const float *)value->device, (float *)output->device, args);
     gpu->stats.mps_sdpa_dispatches++;
-    return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_f32");
+    ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_f32");
+    h3_gpu_op_end(gpu);
+    return ok;
 }
 
 __global__ static void h3_weight_norm_f32_kernel(const float *vector,
@@ -3560,6 +4025,7 @@ static int h3_gpu_conv1d_impl(h3_gpu *gpu, h3_gpu_tensor *output,
         weight->elements < weight_count ||
         (bias && bias->elements < output_channels))
         return h3_gpu_fail(gpu, "invalid Conv1d tensor shapes");
+    h3_gpu_op_begin(gpu, H3_GPU_OP_CONV);
     h3_conv1d_args args = {batch,         length,         output_length,
                            input_channels, output_channels, kernel,
                            stride,        padding,        dilation,
@@ -3572,7 +4038,9 @@ static int h3_gpu_conv1d_impl(h3_gpu *gpu, h3_gpu_tensor *output,
         bias ? (const float *)bias->device : NULL, (float *)output->device,
         args);
     gpu->stats.mps_conv_dispatches++;
-    return h3_cuda_check(gpu, cudaGetLastError(), "h3_conv1d_f32");
+    int conv_ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_conv1d_f32");
+    h3_gpu_op_end(gpu);
+    return conv_ok;
 }
 
 int h3_gpu_conv1d_stride_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -3667,6 +4135,7 @@ int h3_gpu_conv_transpose1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         weight->elements < weight_count ||
         (bias && bias->elements < output_channels))
         return h3_gpu_fail(gpu, "invalid ConvTranspose1d tensor shapes");
+    h3_gpu_op_begin(gpu, H3_GPU_OP_CONV);
     h3_conv_transpose1d_args args = {
         batch,         length,         output_length, input_channels,
         output_channels, kernel,       stride,        padding,
@@ -3679,7 +4148,9 @@ int h3_gpu_conv_transpose1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         bias ? (const float *)bias->device : NULL, (float *)output->device,
         args);
     gpu->stats.mps_conv_dispatches++;
-    return h3_cuda_check(gpu, cudaGetLastError(), "h3_conv_transpose1d_f32");
+    int ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_conv_transpose1d_f32");
+    h3_gpu_op_end(gpu);
+    return ok;
 }
 
 struct h3_audio_activation_args {
@@ -4078,6 +4549,7 @@ int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         weight->elements < weight_count ||
         (bias && bias->elements < output_channels))
         return h3_gpu_fail(gpu, "invalid Conv3d tensor shapes");
+    h3_gpu_op_begin(gpu, H3_GPU_OP_CONV);
     h3_conv3d_args args = {
         batch,         depth,          height,         width,
         output_depth,  output_height,  output_width,   input_channels,
@@ -4091,7 +4563,9 @@ int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         bias ? (const float *)bias->device : NULL, (float *)output->device,
         args);
     gpu->stats.mps_conv_dispatches++;
-    return h3_cuda_check(gpu, cudaGetLastError(), "h3_conv3d_f32");
+    int conv3d_ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_conv3d_f32");
+    h3_gpu_op_end(gpu);
+    return conv3d_ok;
 }
 
 struct h3_audio_qkv_args {
@@ -4247,6 +4721,7 @@ int h3_gpu_sdpa_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         key->elements < count || value->elements < count || !batch ||
         !sequence || !heads || !head_dim)
         return h3_gpu_fail(gpu, "invalid causal SDPA request");
+    h3_gpu_op_begin(gpu, H3_GPU_OP_SDPA);
     h3_sdpa_causal_args args = {batch, sequence, heads, head_dim, scale};
     unsigned threads = 128;
     while (threads > head_dim && threads > 32) threads >>= 1;
@@ -4260,7 +4735,10 @@ int h3_gpu_sdpa_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         (const float *)query->device, (const float *)key->device,
         (const float *)value->device, (float *)output->device, args);
     gpu->stats.mps_sdpa_dispatches++;
-    return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_causal_f32");
+    int causal_ok =
+        h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_causal_f32");
+    h3_gpu_op_end(gpu);
+    return causal_ok;
 }
 
 struct h3_audio_pool_args {
@@ -4464,37 +4942,50 @@ static int h3_gpu_linear_int8_bf16_impl(
             return 0;
     }
 
-    /* Prefer cuBLAS INT8 GEMM when available; fall back to a naive kernel. */
-    int32_t *accum = NULL;
-    cudaError_t alloc_status =
-        cudaMalloc((void **)&accum, output_count * sizeof(*accum));
-    if (alloc_status == cudaSuccess) {
+    /* Prefer cuBLAS INT8 GEMM; keep a persistent accum buffer. */
+    size_t accum_bytes = output_count * sizeof(int32_t);
+    if (gpu->int8_accum_bytes < accum_bytes) {
+        if (gpu->int8_accum) cudaFree(gpu->int8_accum);
+        gpu->int8_accum = NULL;
+        gpu->int8_accum_bytes = 0;
+        if (cudaMalloc((void **)&gpu->int8_accum, accum_bytes) == cudaSuccess)
+            gpu->int8_accum_bytes = accum_bytes;
+    }
+    if (gpu->int8_accum) {
         int32_t alpha = 1;
         int32_t beta = 0;
         cublasStatus_t status = cublasGemmEx(
             gpu->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)output_dim, (int)rows,
             (int)input_dim, &alpha, weight->device, CUDA_R_8I, (int)input_dim,
-            quantized_input->device, CUDA_R_8I, (int)input_dim, &beta, accum,
-            CUDA_R_32I, (int)output_dim, CUBLAS_COMPUTE_32I,
-            CUBLAS_GEMM_DEFAULT);
+            quantized_input->device, CUDA_R_8I, (int)input_dim, &beta,
+            gpu->int8_accum, CUDA_R_32I, (int)output_dim, CUBLAS_COMPUTE_32I,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (status != CUBLAS_STATUS_SUCCESS)
+            status = cublasGemmEx(
+                gpu->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)output_dim,
+                (int)rows, (int)input_dim, &alpha, weight->device, CUDA_R_8I,
+                (int)input_dim, quantized_input->device, CUDA_R_8I,
+                (int)input_dim, &beta, gpu->int8_accum, CUDA_R_32I,
+                (int)output_dim, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
         if (status == CUBLAS_STATUS_SUCCESS) {
+            gpu->int8_cublas_ok++;
             gpu->stats.direct_dispatches++;
             unsigned threads = 256;
             unsigned blocks =
                 (unsigned)((output_count + threads - 1) / threads);
             h3_int8_apply_scales_bf16_kernel<<<blocks, threads, 0,
                                                  gpu->stream>>>(
-                accum, (const float *)input_scales->device,
+                gpu->int8_accum, (const float *)input_scales->device,
                 (const float *)weight_scales->device, (uint16_t *)output->device,
                 rows, output_dim);
-            cudaFree(accum);
             gpu->stats.direct_dispatches++;
             return h3_cuda_check(gpu, cudaGetLastError(),
                                  "h3_int8_apply_scales_bf16");
         }
-        cudaFree(accum);
     }
 
+    if (gpu->int8_naive_fallback++ == 0)
+        fprintf(stderr, "h3: INT8 linear falling back to naive GEMM\n");
     dim3 threads(256, 1, 1);
     dim3 blocks((output_dim + threads.x - 1) / threads.x, rows, 1);
     h3_linear_int8_naive_kernel<<<blocks, threads, 0, gpu->stream>>>(
@@ -4515,10 +5006,13 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim,
                             int use_slower_uncached_int8_scales) {
-    return h3_gpu_linear_int8_bf16_impl(
+    h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
+    int ok = h3_gpu_linear_int8_bf16_impl(
         gpu, output, quantized_input, input_scales, input, weight,
         weight_scales, rows, input_dim, output_dim,
         use_slower_uncached_int8_scales, 0);
+    h3_gpu_op_end(gpu);
+    return ok;
 }
 
 __global__ static void h3_quantize_bf16_int8_head_major_kernel(
@@ -4593,6 +5087,7 @@ int h3_gpu_linear_int8_head_major_bf16(
         input_scales->elements < padded_rows)
         return h3_gpu_fail(gpu, "invalid head-major INT8 linear request");
 
+    h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
     unsigned threads = 256;
     h3_quantize_bf16_int8_head_major_kernel<<<padded_rows, threads,
                                                 threads * sizeof(float),
@@ -4601,11 +5096,15 @@ int h3_gpu_linear_int8_head_major_bf16(
         (float *)input_scales->device, rows, padded_rows, heads, head_dim);
     gpu->stats.direct_dispatches++;
     if (!h3_cuda_check(gpu, cudaGetLastError(),
-                       "h3_quantize_bf16_int8_head_major"))
+                       "h3_quantize_bf16_int8_head_major")) {
+        h3_gpu_op_end(gpu);
         return 0;
-    return h3_gpu_linear_int8_bf16_impl(
+    }
+    int ok = h3_gpu_linear_int8_bf16_impl(
         gpu, output, quantized_input, input_scales, NULL, weight,
         weight_scales, rows, input_dim, output_dim, 0, 1);
+    h3_gpu_op_end(gpu);
+    return ok;
 }
 
 struct h3_int8_group_quant_args {
@@ -4717,6 +5216,104 @@ __global__ static void h3_linear_int8_grouped_naive_kernel(
     output[(size_t)row * output_dim + column] = h3_f32_to_bf16_bits(total);
 }
 
+/* 64x64 output tiles, K=32. Applies per-group input scales (MLP FC2). */
+__global__ static void h3_linear_int8_grouped_tiled_kernel(
+    const int8_t *input, const int8_t *weight, const float *input_scales,
+    const float *weight_scales, uint16_t *output, uint32_t rows,
+    uint32_t input_dim, uint32_t output_dim, uint32_t group_size,
+    uint32_t groups) {
+    constexpr int BM = 64;
+    constexpr int BN = 64;
+    constexpr int BK = 32;
+    __shared__ int8_t tile_a[BM][BK];
+    __shared__ int8_t tile_b[BN][BK];
+
+    uint32_t row0 = (uint32_t)blockIdx.y * (uint32_t)BM;
+    uint32_t col0 = (uint32_t)blockIdx.x * (uint32_t)BN;
+    uint32_t tx = (uint32_t)threadIdx.x;
+    uint32_t ty = (uint32_t)threadIdx.y;
+    uint32_t tid = ty * 16u + tx;
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    for (uint32_t group = 0; group < groups; group++) {
+        int32_t iacc[4][4];
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) iacc[i][j] = 0;
+        uint32_t k_origin = group * group_size;
+        for (uint32_t kk = 0; kk < group_size; kk += (uint32_t)BK) {
+#pragma unroll
+            for (int step = 0; step < (BM * BK) / 256; step++) {
+                uint32_t idx = tid + (uint32_t)step * 256u;
+                uint32_t r = idx / (uint32_t)BK;
+                uint32_t c = idx % (uint32_t)BK;
+                uint32_t gr = row0 + r;
+                uint32_t gc = k_origin + kk + c;
+                tile_a[r][c] =
+                    (gr < rows && gc < input_dim)
+                        ? input[(size_t)gr * input_dim + gc]
+                        : (int8_t)0;
+            }
+#pragma unroll
+            for (int step = 0; step < (BN * BK) / 256; step++) {
+                uint32_t idx = tid + (uint32_t)step * 256u;
+                uint32_t r = idx / (uint32_t)BK;
+                uint32_t c = idx % (uint32_t)BK;
+                uint32_t gc = col0 + r;
+                uint32_t gk = k_origin + kk + c;
+                tile_b[r][c] =
+                    (gc < output_dim && gk < input_dim)
+                        ? weight[(size_t)gc * input_dim + gk]
+                        : (int8_t)0;
+            }
+            __syncthreads();
+#pragma unroll
+            for (int k = 0; k < BK; k++) {
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    int32_t a = (int32_t)tile_a[ty * 4u + (uint32_t)i][k];
+#pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        iacc[i][j] +=
+                            a * (int32_t)tile_b[tx * 4u + (uint32_t)j][k];
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            uint32_t row = row0 + ty * 4u + (uint32_t)i;
+            float in_scale =
+                row < rows ? input_scales[(size_t)row * groups + group] : 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                uint32_t col = col0 + tx * 4u + (uint32_t)j;
+                float w_scale =
+                    col < output_dim ? weight_scales[col] : 0.0f;
+                acc[i][j] = fmaf((float)iacc[i][j], in_scale * w_scale,
+                                 acc[i][j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        uint32_t row = row0 + ty * 4u + (uint32_t)i;
+        if (row >= rows) continue;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint32_t col = col0 + tx * 4u + (uint32_t)j;
+            if (col >= output_dim) continue;
+            output[(size_t)row * output_dim + col] =
+                h3_f32_to_bf16_bits(acc[i][j]);
+        }
+    }
+}
+
 static int h3_gpu_linear_int8_grouped_bf16(
     h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *quantized_input,
     const h3_gpu_tensor *input_scales, const h3_gpu_tensor *weight,
@@ -4741,16 +5338,36 @@ static int h3_gpu_linear_int8_grouped_bf16(
         !output_dim)
         return h3_gpu_fail(gpu, "invalid grouped INT8 linear request");
 
-    dim3 threads(256, 1, 1);
-    dim3 blocks((output_dim + threads.x - 1) / threads.x, rows, 1);
-    h3_linear_int8_grouped_naive_kernel<<<blocks, threads, 0, gpu->stream>>>(
-        (const int8_t *)quantized_input->device, (const int8_t *)weight->device,
-        (const float *)input_scales->device,
-        (const float *)weight_scales->device, (uint16_t *)output->device, rows,
-        input_dim, output_dim, group_size, groups);
-    gpu->stats.direct_dispatches++;
-    return h3_cuda_check(gpu, cudaGetLastError(),
-                         "h3_linear_int8_grouped_naive");
+    h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
+    int grouped_ok;
+    if (!h3_env_on("H3_INT8_GROUP_NAIVE") && (group_size % 32u) == 0u) {
+        dim3 threads(16, 16, 1);
+        dim3 blocks((output_dim + 63u) / 64u, (rows + 63u) / 64u, 1);
+        h3_linear_int8_grouped_tiled_kernel<<<blocks, threads, 0,
+                                              gpu->stream>>>(
+            (const int8_t *)quantized_input->device,
+            (const int8_t *)weight->device,
+            (const float *)input_scales->device,
+            (const float *)weight_scales->device, (uint16_t *)output->device,
+            rows, input_dim, output_dim, group_size, groups);
+        gpu->stats.direct_dispatches++;
+        grouped_ok = h3_cuda_check(gpu, cudaGetLastError(),
+                                   "h3_linear_int8_grouped_tiled");
+    } else {
+        dim3 threads(256, 1, 1);
+        dim3 blocks((output_dim + threads.x - 1) / threads.x, rows, 1);
+        h3_linear_int8_grouped_naive_kernel<<<blocks, threads, 0, gpu->stream>>>(
+            (const int8_t *)quantized_input->device,
+            (const int8_t *)weight->device,
+            (const float *)input_scales->device,
+            (const float *)weight_scales->device, (uint16_t *)output->device,
+            rows, input_dim, output_dim, group_size, groups);
+        gpu->stats.direct_dispatches++;
+        grouped_ok = h3_cuda_check(gpu, cudaGetLastError(),
+                                   "h3_linear_int8_grouped_naive");
+    }
+    h3_gpu_op_end(gpu);
+    return grouped_ok;
 }
 
 int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

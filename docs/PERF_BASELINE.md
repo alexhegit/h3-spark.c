@@ -183,5 +183,48 @@ reference win. Log: `/tmp/h3_perf/fox-fast-512-sdpa-v2.log`.
 - Parallel F32 / causal SDPA (VAE paths)
 - Documented ~**1.61×** denoise / **1.48×** e2e vs naive baseline
 
-Not merged to `main` yet. Next: GEMM/Flash SDPA, VAE decode, re-profile with
-VAE parallel SDPA binary.
+Merged to `main` as `f64b726`. Work continued on `perf/dit-denoise-opt`.
+
+---
+
+## 2026-08-22 — Wave / Q2 SDPA (HIP port)
+
+**KEEP** default warp online-softmax SDPA (d128 Q2, F32 d64 Q2). Opt-out:
+`H3_SDPA_PARALLEL=1`, `H3_SDPA_D128_Q1=1`, `H3_SDPA_D64_Q1=1`.
+`--profile` prints exclusive `gpu-op linear/sdpa/conv`.
+
+Fox-s2 (`512² / 22f / steps=2 / L35 / reuse=1`):
+
+| Metric | Parallel SDPA | Wave + Q2 | Speedup |
+|--------|--------------:|----------:|--------:|
+| GPU Euler denoise wall | 131.1 s | **99.9 s** | 1.31× |
+| denoise gpu-op **sdpa** | 33.9 s | **2.86 s** | **11.9×** |
+| denoise gpu-op **linear** | 94.1 s | 94.1 s | — |
+| video VAE wall | 44.1 s | **19.2 s** | 2.29× |
+| VAE gpu-op sdpa | 27.7 s | **4.02 s** | **6.9×** |
+| E2E wall | 247.0 s | **189.2 s** | 1.31× |
+
+Logs: `/tmp/h3_perf_day5/fox-s2-wave.log`. After this, denoise is ~94% linear
+(INT8 MLP/QKV). Next: tiled grouped INT8 FC2.
+
+---
+
+## 2026-08-23 — Tiled grouped INT8 FC2
+
+**KEEP** `h3_linear_int8_grouped_tiled_kernel` (64×64, K=32) as default MLP
+FC2. Opt-out `H3_INT8_GROUP_NAIVE=1`. Persistent cuBLAS INT8 accum buffer
+(no per-call `cudaMalloc`). Profile: `int8-cublas=210 naive=0` on fox-s2.
+
+Same fox-s2 preset, wave SDPA on both sides:
+
+| Metric | Naive grouped FC2 | Tiled FC2 | Speedup |
+|--------|------------------:|----------:|--------:|
+| GPU Euler denoise wall | 98.9 s | **18.0 s** | **5.5×** |
+| denoise gpu-op linear | 94.3 s | **13.4 s** | **7.0×** |
+| denoise gpu-op sdpa | 2.84 s | 2.85 s | — |
+| E2E wall | 190.3 s | **112.3 s** | 1.69× |
+
+vs original CUDA naive-SDPA baseline denoise 1472 s / e2e 1726 s, fox-s2 is a
+different step count; on this 2-step gate, denoise is now **18 s**. Remaining
+denoise split: linear 13.4 · sdpa 2.9. Next: FC1/QKV INT8 tensor-op, then
+fox-fast (20 step) remeasure.

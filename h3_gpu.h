@@ -30,6 +30,10 @@ typedef struct {
     /* Root MTLCommandBuffer timestamps; MPSGraph may schedule child buffers,
      * so command_wait_seconds is the complete turnaround measurement. */
     double gpu_seconds;
+    /* CUDA: exclusive GPU time from event pairs around linear / SDPA / conv. */
+    double gpu_linear_seconds;
+    double gpu_sdpa_seconds;
+    double gpu_conv_seconds;
 } h3_gpu_stats;
 
 h3_gpu *h3_gpu_create(const char *shader_source_path,

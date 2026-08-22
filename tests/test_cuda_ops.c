@@ -1956,6 +1956,76 @@ int main(void) {
         }
     }
 
+    {
+        const uint32_t d128_seq = 5;
+        const uint32_t d128_heads = 2;
+        const uint32_t d128_dim = 128;
+        const size_t d128_count = (size_t)d128_seq * d128_heads * d128_dim;
+        const float d128_scale = 1.0f / sqrtf((float)d128_dim);
+        float *d128_q = (float *)malloc(d128_count * sizeof(float));
+        float *d128_k = (float *)malloc(d128_count * sizeof(float));
+        float *d128_v = (float *)malloc(d128_count * sizeof(float));
+        float *d128_ref = (float *)malloc(d128_count * sizeof(float));
+        uint16_t *d128_q_b = (uint16_t *)malloc(d128_count * sizeof(uint16_t));
+        uint16_t *d128_k_b = (uint16_t *)malloc(d128_count * sizeof(uint16_t));
+        uint16_t *d128_v_b = (uint16_t *)malloc(d128_count * sizeof(uint16_t));
+        uint16_t *d128_out_b = (uint16_t *)malloc(d128_count * sizeof(uint16_t));
+        check(d128_q && d128_k && d128_v && d128_ref && d128_q_b && d128_k_b &&
+                  d128_v_b && d128_out_b,
+              "d128 sdpa host alloc");
+        if (d128_q && d128_k && d128_v && d128_ref) {
+            for (size_t i = 0; i < d128_count; i++) {
+                d128_q[i] = sinf((float)i * 0.013f);
+                d128_k[i] = cosf((float)i * 0.017f);
+                d128_v[i] = sinf((float)i * 0.011f) * 0.5f;
+                d128_q_b[i] = f32_to_bf16(d128_q[i]);
+                d128_k_b[i] = f32_to_bf16(d128_k[i]);
+                d128_v_b[i] = f32_to_bf16(d128_v[i]);
+            }
+            sdpa_ref(d128_q, d128_k, d128_v, d128_ref, d128_seq, d128_heads,
+                     d128_dim, d128_scale);
+            h3_gpu_tensor *tq =
+                h3_gpu_tensor_from_bf16(gpu, d128_q_b, d128_count);
+            h3_gpu_tensor *tk =
+                h3_gpu_tensor_from_bf16(gpu, d128_k_b, d128_count);
+            h3_gpu_tensor *tv =
+                h3_gpu_tensor_from_bf16(gpu, d128_v_b, d128_count);
+            h3_gpu_tensor *to = h3_gpu_tensor_new_bf16(gpu, d128_count);
+            check(tq && tk && tv && to, "d128 sdpa tensor alloc");
+            if (tq && tk && tv && to) {
+                check(h3_gpu_sdpa_bf16(gpu, to, tq, tk, tv, d128_seq,
+                                       d128_heads, d128_dim, d128_scale),
+                      "sdpa d128 q2");
+                check(h3_gpu_submit(gpu), "submit sdpa d128");
+                check(h3_gpu_tensor_read_bf16(to, d128_out_b, d128_count),
+                      "read sdpa d128");
+                for (size_t i = 0; i < d128_count; i++) {
+                    float got = bf16_to_f32(d128_out_b[i]);
+                    if (fabsf(got - d128_ref[i]) >= 8e-2f) {
+                        fprintf(stderr,
+                                "FAIL: sdpa d128 mismatch at %zu got=%f "
+                                "expected=%f\n",
+                                i, got, d128_ref[i]);
+                        failures++;
+                        break;
+                    }
+                }
+            }
+            h3_gpu_tensor_free(tq);
+            h3_gpu_tensor_free(tk);
+            h3_gpu_tensor_free(tv);
+            h3_gpu_tensor_free(to);
+        }
+        free(d128_q);
+        free(d128_k);
+        free(d128_v);
+        free(d128_ref);
+        free(d128_q_b);
+        free(d128_k_b);
+        free(d128_v_b);
+        free(d128_out_b);
+    }
+
     const uint32_t head_norm_sequence = 3;
     const uint32_t head_norm_heads = 2;
     const uint32_t head_norm_dim = 8;
