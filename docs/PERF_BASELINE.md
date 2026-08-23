@@ -612,3 +612,12 @@ denoise: **3.18 / 3.14 s** (1D) vs **3.16 / 3.19 s** (2D); linear
 fox-s2 denoise: **3.08 / 3.13 s** (default cache) vs **3.11 / 3.29 s**
 (PreferL1); sdpa **1.67 / 1.70 s** vs **1.69 / 1.76 s**. Reverted. Logs:
 `/tmp/h3_perf_day8/fox-s2-q8-cache-def-ab1.log`, `fox-s2-q8-cache-l1-ab1.log`.
+
+---
+
+## 2026-08-24 — REJECT warp-shuffle INT8 row quantize
+
+Warp `__shfl_xor` max plus packed BF16 loads did not beat the shared-memory
+tree. fox-s2 denoise **3.19 / 3.15 s** (smem) vs **3.09 / 3.23 s** (warp);
+linear **1.16 / 1.14 s** vs **1.13 / 1.21 s**. Reverted. Logs:
+`/tmp/h3_perf_day8/fox-s2-quant-smem-ab1.log`, `fox-s2-quant-warp-ab1.log`.
