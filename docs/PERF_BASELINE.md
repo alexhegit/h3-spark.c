@@ -660,3 +660,13 @@ denoise: **3.05 / 3.07 s** (scalar) vs **3.00 / 3.07 s** (vec4); linear
 **1.16 / 1.18 s** vs **1.12 / 1.17 s**. Reverted. Logs:
 `/tmp/h3_perf_day8/fox-s2-iscale-1d-ab1.log`, `fox-s2-iscale-vec4-ab1.log`.
 
+---
+
+## 2026-08-24 — REJECT Q8 SDPA interleaved warp-reduce
+
+A separate Q8 kernel that shuffles all 8 query scores each mask step did not
+drop fox-s2 denoise vs serial `h3_warp_reduce_sum`. Interleaved warm A/B:
+**3.11 / 3.02 s** (serial) vs **3.00 / 3.11 s** (ILP); sdpa **1.75 / 1.69 s**
+vs **1.69 / 1.73 s**. Reverted. Logs: `/tmp/h3_perf_day8/fox-s2-q8-serial-ab3.log`,
+`fox-s2-q8-ilp-ab3.log`.
+
