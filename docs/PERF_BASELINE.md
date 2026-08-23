@@ -670,3 +670,12 @@ drop fox-s2 denoise vs serial `h3_warp_reduce_sum`. Interleaved warm A/B:
 vs **1.69 / 1.73 s**. Reverted. Logs: `/tmp/h3_perf_day8/fox-s2-q8-serial-ab3.log`,
 `fox-s2-q8-ilp-ab3.log`.
 
+---
+
+## 2026-08-24 — REJECT scalar SwiGLU __expf/__frcp_rn
+
+Isolating fast math on the scalar SwiGLU kernel (not vec4) did not drop fox-s2
+denoise. Interleaved A/B: **3.04 / 3.06 s** (`expf`) vs **3.07 / 3.07 s**
+(`__expf`+`__frcp_rn`). Reverted. Logs:
+`/tmp/h3_perf_day8/fox-s2-swiglu-expf-ab1.log`, `fox-s2-swiglu-fast-ab1.log`.
+
