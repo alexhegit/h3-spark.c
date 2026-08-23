@@ -2101,6 +2101,84 @@ h3_sdpa_bf16_wave_d128_q2_kernel(const uint16_t *query, const uint16_t *key,
     }
 }
 
+__global__ static void __launch_bounds__(32)
+h3_sdpa_bf16_wave_d128_q4_kernel(const uint16_t *query, const uint16_t *key,
+                                 const uint16_t *value, uint16_t *output,
+                                 h3_sdpa_args args) {
+    uint32_t q_pos = (uint32_t)blockIdx.x * 4u;
+    uint32_t head = (uint32_t)blockIdx.y;
+    uint32_t lane = (uint32_t)threadIdx.x;
+    if (q_pos >= args.sequence || head >= args.heads) return;
+    uint32_t q_live = args.sequence - q_pos;
+    if (q_live > 4u) q_live = 4u;
+    uint32_t q_base0 = (q_pos * args.heads + head) * 128u;
+    uint32_t q_step = args.heads * 128u;
+    float q[4][4];
+    float acc[4][4];
+    float maximum[4];
+    float sum[4];
+#pragma unroll
+    for (int qi = 0; qi < 4; qi++) {
+        maximum[qi] = -1e30f;
+        sum[qi] = 0.0f;
+#pragma unroll
+        for (int d = 0; d < 4; d++) {
+            acc[qi][d] = 0.0f;
+            q[qi][d] = 0.0f;
+        }
+        if ((uint32_t)qi < q_live) {
+            uint32_t qb = q_base0 + (uint32_t)qi * q_step;
+#pragma unroll
+            for (int d = 0; d < 4; d++)
+                q[qi][d] = h3_bf16_bits_to_f32(
+                               query[qb + (uint32_t)d * 32u + lane]) *
+                           args.scale;
+        }
+    }
+    uint32_t stride = args.kv_head_major ? 128u : args.heads * 128u;
+    uint32_t k_base = args.kv_head_major ? head * args.sequence * 128u
+                                         : head * 128u;
+    for (uint32_t k_pos = 0; k_pos < args.sequence; k_pos++) {
+        float k0 = h3_bf16_bits_to_f32(key[k_base + lane]);
+        float k1 = h3_bf16_bits_to_f32(key[k_base + 32u + lane]);
+        float k2 = h3_bf16_bits_to_f32(key[k_base + 64u + lane]);
+        float k3 = h3_bf16_bits_to_f32(key[k_base + 96u + lane]);
+        float v0 = h3_bf16_bits_to_f32(value[k_base + lane]);
+        float v1 = h3_bf16_bits_to_f32(value[k_base + 32u + lane]);
+        float v2 = h3_bf16_bits_to_f32(value[k_base + 64u + lane]);
+        float v3 = h3_bf16_bits_to_f32(value[k_base + 96u + lane]);
+#pragma unroll
+        for (int qi = 0; qi < 4; qi++) {
+            if ((uint32_t)qi < q_live) {
+            float score = h3_warp_reduce_sum(q[qi][0] * k0 + q[qi][1] * k1 +
+                                             q[qi][2] * k2 + q[qi][3] * k3);
+            float new_max = fmaxf(maximum[qi], score);
+            float alpha = expf(maximum[qi] - new_max);
+            float p = expf(score - new_max);
+            acc[qi][0] = fmaf(p, v0, acc[qi][0] * alpha);
+            acc[qi][1] = fmaf(p, v1, acc[qi][1] * alpha);
+            acc[qi][2] = fmaf(p, v2, acc[qi][2] * alpha);
+            acc[qi][3] = fmaf(p, v3, acc[qi][3] * alpha);
+            sum[qi] = fmaf(sum[qi], alpha, p);
+            maximum[qi] = new_max;
+            }
+        }
+        k_base += stride;
+    }
+#pragma unroll
+    for (int qi = 0; qi < 4; qi++) {
+        if ((uint32_t)qi < q_live) {
+            float inv = sum[qi] > 0.0f ? 1.0f / sum[qi] : 0.0f;
+            uint32_t qp = q_pos + (uint32_t)qi;
+#pragma unroll
+            for (int d = 0; d < 4; d++)
+                output[h3_sdpa_output_index(args, qp, head,
+                                            (uint32_t)d * 32u + lane)] =
+                    h3_f32_to_bf16_bits(acc[qi][d] * inv);
+        }
+    }
+}
+
 static int h3_gpu_sdpa_bf16_wave(h3_gpu *gpu, h3_gpu_tensor *output,
                                  const h3_gpu_tensor *query,
                                  const h3_gpu_tensor *key,
@@ -2112,6 +2190,19 @@ static int h3_gpu_sdpa_bf16_wave(h3_gpu *gpu, h3_gpu_tensor *output,
                          head_major_output ? 1u : 0u, 0u};
     dim3 threads(32, 1, 1);
     if (head_dim == 128u && !h3_env_on("H3_SDPA_D128_Q1")) {
+        /* Q4 shares K/V across four queries; fox-s2 DiT sdpa 3.08s → 2.57s.
+         * Opt back to Q2 with H3_SDPA_D128_Q2=1. */
+        if (!h3_env_on("H3_SDPA_D128_Q2")) {
+            dim3 blocks((sequence + 3u) / 4u, heads, 1);
+            h3_sdpa_bf16_wave_d128_q4_kernel<<<blocks, threads, 0,
+                                               gpu->stream>>>(
+                (const uint16_t *)query->device, (const uint16_t *)key->device,
+                (const uint16_t *)value->device, (uint16_t *)output->device,
+                args);
+            gpu->stats.mps_sdpa_dispatches++;
+            return h3_cuda_check(gpu, cudaGetLastError(),
+                                 "h3_sdpa_bf16_wave_q4");
+        }
         dim3 blocks((sequence + 1u) / 2u, heads, 1);
         h3_sdpa_bf16_wave_d128_q2_kernel<<<blocks, threads, 0, gpu->stream>>>(
             (const uint16_t *)query->device, (const uint16_t *)key->device,

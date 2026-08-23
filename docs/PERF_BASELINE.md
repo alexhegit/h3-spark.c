@@ -289,3 +289,30 @@ Log: `/tmp/h3_perf_day7/fox-fast-bf16mlp.log`.
 vs naive CUDA baseline denoise 1472 s / e2e 1726 s: **41.7× / 20.6×**.
 Metal M5 docs denoise ~16.7 s → Spark now ~**2.1×**. Remaining fox-fast
 denoise is **SDPA ~62%** (22 / 35). Next: SDPA, then load I/O on a cold cache.
+
+---
+
+## 2026-08-23 — Wave SDPA d128 Q4
+
+**KEEP** default d128 Q4 (four queries share K/V). Opt-out `H3_SDPA_D128_Q2=1`.
+VAE still uses d64 Q2. Logs: `/tmp/h3_perf_day7/fox-s2-sdpa-q4.log`,
+`/tmp/h3_perf_day7/fox-fast-sdpa-q4.log`.
+
+fox-s2 DiT:
+
+| Metric | Q2 | **Q4 default** |
+|--------|---:|---------------:|
+| GPU Euler denoise | 4.96 s | **4.42 s** |
+| denoise gpu-op sdpa | 3.08 s | **2.55 s** |
+
+fox-fast (load is cache-noisy):
+
+| Metric | BF16 MLP + Q2 | **+ Q4** |
+|--------|--------------:|---------:|
+| GPU Euler denoise | 35.3 s | **31.6 s** |
+| denoise gpu-op sdpa | 22.0 s | **18.3 s** |
+| denoise gpu-op linear | 7.84 s | 7.82 s |
+| **E2E wall** | 83.8 s (warm load 18 s) | 100 s (colder load 36 s) |
+
+Denoise SDPA **1.20×**. Remaining fox-fast denoise is still mostly SDPA
+(18.3 / 31.6). Next: d64 VAE SDPA, then load I/O.
