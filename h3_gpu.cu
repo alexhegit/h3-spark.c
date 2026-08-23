@@ -1689,13 +1689,109 @@ __global__ static void h3_qkv_rope_bf16_kernel(
     value[output_index] = qkv[v_base + dimension];
 }
 
+/* Cooperative RMS: one load per thread, warp+block reduce, then RoPE.
+ * Default. Opt out with H3_QKV_ROPE_SERIAL_RMS=1. */
+__global__ static void h3_qkv_rope_bf16_coop_kernel(
+    const uint16_t *qkv, const uint16_t *q_weight, const uint16_t *k_weight,
+    const uint16_t *rope_cos, const uint16_t *rope_sin, uint16_t *query,
+    uint16_t *key, uint16_t *value, h3_qkv_rope_args args) {
+    uint32_t dimension = (uint32_t)threadIdx.x;
+    uint32_t head = (uint32_t)blockIdx.y;
+    uint32_t row = (uint32_t)blockIdx.z;
+    if (head >= args.heads || row >= args.sequence) return;
+    uint32_t inner = args.heads * args.head_dim;
+    uint32_t row_base = row * inner * 3u;
+    uint32_t q_base = row_base + head * args.head_dim;
+    uint32_t k_base = q_base + inner;
+    uint32_t v_base = q_base + inner * 2u;
+    if (args.grouped) {
+        q_base = row_base + head * args.head_dim * 3u;
+        k_base = q_base + args.head_dim;
+        v_base = k_base + args.head_dim;
+    }
+    float q = 0.0f;
+    float k = 0.0f;
+    uint16_t v_bits = 0;
+    if (dimension < args.head_dim) {
+        q = h3_bf16_bits_to_f32(qkv[q_base + dimension]);
+        k = h3_bf16_bits_to_f32(qkv[k_base + dimension]);
+        v_bits = qkv[v_base + dimension];
+    }
+    float q_sum = q * q;
+    float k_sum = k * k;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        q_sum += __shfl_down_sync(0xffffffff, q_sum, offset);
+        k_sum += __shfl_down_sync(0xffffffff, k_sum, offset);
+    }
+    __shared__ float q_warp[32];
+    __shared__ float k_warp[32];
+    uint32_t warp = (uint32_t)threadIdx.x >> 5;
+    uint32_t lane = (uint32_t)threadIdx.x & 31u;
+    if (lane == 0u) {
+        q_warp[warp] = q_sum;
+        k_warp[warp] = k_sum;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint32_t nwarps = ((uint32_t)blockDim.x + 31u) >> 5;
+        float qs = 0.0f;
+        float ks = 0.0f;
+        for (uint32_t w = 0; w < nwarps; w++) {
+            qs += q_warp[w];
+            ks += k_warp[w];
+        }
+        q_warp[0] = rsqrtf(qs / (float)args.head_dim + args.epsilon);
+        k_warp[0] = rsqrtf(ks / (float)args.head_dim + args.epsilon);
+    }
+    __syncthreads();
+    float q_inverse = q_warp[0];
+    float k_inverse = k_warp[0];
+    extern __shared__ float pair_smem[];
+    float *q_sh = pair_smem;
+    float *k_sh = pair_smem + args.head_dim;
+    float q0 = 0.0f;
+    float k0 = 0.0f;
+    if (dimension < args.head_dim) {
+        q0 = q * q_inverse * h3_bf16_bits_to_f32(q_weight[dimension]);
+        k0 = k * k_inverse * h3_bf16_bits_to_f32(k_weight[dimension]);
+        q_sh[dimension] = q0;
+        k_sh[dimension] = k0;
+    }
+    __syncthreads();
+    if (dimension >= args.head_dim) return;
+    if (dimension < args.rope_half) {
+        float q1 = q_sh[dimension + args.rope_half];
+        float k1 = k_sh[dimension + args.rope_half];
+        float c =
+            h3_bf16_bits_to_f32(rope_cos[row * args.rope_half + dimension]);
+        float s =
+            h3_bf16_bits_to_f32(rope_sin[row * args.rope_half + dimension]);
+        q0 = q0 * c - q1 * s;
+        k0 = k0 * c - k1 * s;
+    } else if (dimension < args.rope_half * 2u) {
+        uint32_t pair = dimension - args.rope_half;
+        float q1 = q_sh[pair];
+        float k1 = k_sh[pair];
+        float c = h3_bf16_bits_to_f32(rope_cos[row * args.rope_half + pair]);
+        float s = h3_bf16_bits_to_f32(rope_sin[row * args.rope_half + pair]);
+        q0 = q0 * c + q1 * s;
+        k0 = k0 * c + k1 * s;
+    }
+    uint32_t output_index =
+        (row * args.heads + head) * args.head_dim + dimension;
+    query[output_index] = h3_f32_to_bf16_bits(q0);
+    key[output_index] = h3_f32_to_bf16_bits(k0);
+    value[output_index] = v_bits;
+}
+
 static int h3_gpu_qkv_rope_bf16_layout(
     h3_gpu *gpu, h3_gpu_tensor *query, h3_gpu_tensor *key,
     h3_gpu_tensor *value, const h3_gpu_tensor *qkv,
     const h3_gpu_tensor *q_norm, const h3_gpu_tensor *k_norm,
     const h3_gpu_tensor *rope_cos, const h3_gpu_tensor *rope_sin,
     uint32_t sequence, uint32_t heads, uint32_t head_dim, uint32_t rope_half,
-    uint32_t grouped, float epsilon) {
+    uint32_t grouped, float epsilon, int force_serial_rms) {
     size_t inner = (size_t)heads * head_dim;
     size_t count = (size_t)sequence * inner;
     size_t rope_count = (size_t)sequence * rope_half;
@@ -1713,8 +1809,22 @@ static int h3_gpu_qkv_rope_bf16_layout(
         return h3_gpu_fail(gpu, "invalid QKV/RoPE request");
     h3_qkv_rope_args args = {sequence, heads, head_dim, rope_half, grouped,
                              epsilon};
-    dim3 threads(head_dim, 1, 1);
     dim3 blocks(1, heads, sequence);
+    int serial_rms = force_serial_rms || h3_env_on("H3_QKV_ROPE_SERIAL_RMS");
+    if (!serial_rms) {
+        uint32_t threads_x = (head_dim + 31u) & ~31u;
+        if (threads_x < 32u) threads_x = 32u;
+        dim3 threads(threads_x, 1, 1);
+        size_t smem = (size_t)head_dim * 2u * sizeof(float);
+        h3_qkv_rope_bf16_coop_kernel<<<blocks, threads, smem, gpu->stream>>>(
+            (const uint16_t *)qkv->device, (const uint16_t *)q_norm->device,
+            (const uint16_t *)k_norm->device, (const uint16_t *)rope_cos->device,
+            (const uint16_t *)rope_sin->device, (uint16_t *)query->device,
+            (uint16_t *)key->device, (uint16_t *)value->device, args);
+        gpu->stats.direct_dispatches++;
+        return h3_cuda_check(gpu, cudaGetLastError(), "h3_qkv_rope_bf16_coop");
+    }
+    dim3 threads(head_dim, 1, 1);
     h3_qkv_rope_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
         (const uint16_t *)qkv->device, (const uint16_t *)q_norm->device,
         (const uint16_t *)k_norm->device, (const uint16_t *)rope_cos->device,
@@ -1734,7 +1844,7 @@ int h3_gpu_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query, h3_gpu_tensor *key,
                          float epsilon) {
     return h3_gpu_qkv_rope_bf16_layout(
         gpu, query, key, value, qkv, q_norm, k_norm, rope_cos, rope_sin,
-        sequence, heads, head_dim, rope_half, 0u, epsilon);
+        sequence, heads, head_dim, rope_half, 0u, epsilon, 0);
 }
 
 int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
@@ -1749,7 +1859,7 @@ int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                                  float epsilon) {
     return h3_gpu_qkv_rope_bf16_layout(
         gpu, query, key, value, qkv, q_norm, k_norm, rope_cos, rope_sin,
-        sequence, heads, head_dim, rope_half, 1u, epsilon);
+        sequence, heads, head_dim, rope_half, 1u, epsilon, 0);
 }
 
 int h3_gpu_grouped_qkv_linear_rope_bf16(
@@ -1764,7 +1874,7 @@ int h3_gpu_grouped_qkv_linear_rope_bf16(
                               inner * 3u) &&
            h3_gpu_qkv_rope_bf16_layout(
                gpu, query, key, value, qkv, q_norm, k_norm, rope_cos, rope_sin,
-               rows, heads, head_dim, rope_half, 1u, epsilon);
+               rows, heads, head_dim, rope_half, 1u, epsilon, 0);
 }
 
 struct h3_sdpa_args {
@@ -6009,7 +6119,6 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     int use_slower_unfused_qkv_rope, int use_slower_scalar_qkv_rms,
     int use_slower_uncached_int8_scales) {
     (void)use_slower_unfused_qkv_rope;
-    (void)use_slower_scalar_qkv_rms;
     (void)use_slower_uncached_int8_scales;
     uint32_t inner = heads * head_dim;
     uint32_t padded_rows = (rows + 127u) & ~127u;
@@ -6055,7 +6164,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     ok = ok &&
         h3_gpu_qkv_rope_bf16_layout(gpu, query, key, value, qkv, q_norm,
                                     k_norm, rope_cos, rope_sin, rows, heads,
-                                    head_dim, rope_half, 1u, epsilon);
+                                    head_dim, rope_half, 1u, epsilon,
+                                    use_slower_scalar_qkv_rms);
     h3_gpu_workspace_release(qkv);
     return ok;
 }

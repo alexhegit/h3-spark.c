@@ -621,3 +621,32 @@ Warp `__shfl_xor` max plus packed BF16 loads did not beat the shared-memory
 tree. fox-s2 denoise **3.19 / 3.15 s** (smem) vs **3.09 / 3.23 s** (warp);
 linear **1.16 / 1.14 s** vs **1.13 / 1.21 s**. Reverted. Logs:
 `/tmp/h3_perf_day8/fox-s2-quant-smem-ab1.log`, `fox-s2-quant-warp-ab1.log`.
+
+---
+
+## 2026-08-24 — KEEP cooperative QKV/RoPE RMS
+
+Each QKV/RoPE thread used to square **all** `head_dim` values (O(d²) loads).
+Default is now one load per thread plus warp/block reduce. Opt out with
+`H3_QKV_ROPE_SERIAL_RMS=1` (or `--use-slower-scalar-qkv-rms` on the INT8 path).
+
+fox-s2 (steps 2 / L35 / reuse 1), contemporaneous A/B (two warm runs):
+
+| Metric | serial RMS | **coop RMS** |
+|--------|-----------:|-------------:|
+| GPU Euler denoise | 3.19 / 3.14 s | **3.01 / 3.06 s** |
+| denoise leftover (wall − sdpa − linear) | 0.29 / 0.29 s | **0.18 / 0.18 s** |
+| denoise gpu-op sdpa | 1.73 / 1.71 s | 1.69 / 1.70 s |
+| denoise gpu-op linear | 1.18 / 1.15 s | 1.14 / 1.18 s |
+
+fox-fast (steps 20 / L45 / reuse 2) vs workspace KEEP 22.0 s:
+
+| Metric | workspace | **+ coop RMS** |
+|--------|----------:|---------------:|
+| GPU Euler denoise | 22.0 s | **21.1 s** |
+| denoise leftover | 1.96 s | **1.19 s** |
+| denoise gpu-op sdpa | 12.2 s | 12.1 s |
+| denoise gpu-op linear | 7.87 s | 7.78 s |
+
+Logs: `/tmp/h3_perf_day8/fox-s2-qkvrms-serial-ab1.log`, `fox-s2-qkvrms-coop-ab1.log`,
+`fox-fast-qkvrms.log`.
