@@ -337,3 +337,38 @@ Logs: `/tmp/h3_perf_day8/`.
 fox-fast (`82f2936`, colder load): denoise **31.4 s** (sdpa 18.4), VAE **16.6 s**
 (sdpa 3.57 vs ~4.1 on Q2), DiT load **42.8 s**, e2e **107 s**. Compute moved;
 e2e still tracks load temperature.
+
+---
+
+## 2026-08-23 — Prefetch video VAE weights during DiT denoise
+
+**KEEP** a background `read()` of `FL2VA/video_vae/source/*.safetensors` (~9.7 GiB)
+started after DiT load and joined before video VAE load. Opt-out
+`H3_VAE_NO_PREFETCH=1`.
+
+`readahead(2)` / `POSIX_FADV_WILLNEED` return immediately on this kernel and
+do not populate ~10 GiB, so the thread uses a real 8 MiB `read` loop.
+
+Cold VAE file (`posix_fadvise DONTNEED` between runs). GPU compute unchanged.
+
+fox-s2 (steps 2 / L35 / reuse 1):
+
+| Metric | No prefetch | **Prefetch** |
+|--------|------------:|-------------:|
+| video VAE decoder wall | 17.0 s | **8.9 s** |
+| prefetch thread | — | 6.8 s (partially overlaps 4.5 s denoise) |
+| denoise gpu-op sdpa / linear | 2.56 / 1.11 | 2.57 / 1.11 |
+
+fox-fast (steps 20 / L45 / reuse 2):
+
+| Metric | No prefetch | **Prefetch** |
+|--------|------------:|-------------:|
+| video VAE decoder wall | 16.7 s | **9.0 s** |
+| prefetch thread | — | 5.2 s (fully hidden in 31.8 s denoise) |
+| GPU Euler denoise | 31.7 s | 31.8 s |
+| denoise gpu-op sdpa | 18.4 s | 18.4 s |
+
+VAE wall **~1.85–1.91×**. Remaining fox-fast VAE (~9 s) is mostly GPU
+(linear 3.7 + sdpa 3.6). Remaining fox-fast denoise is still mostly SDPA
+(18.4 / 31.8). Logs: `/tmp/h3_perf_day8/fox-s2-prefetch-read.log`,
+`fox-s2-noprefetch-read.log`, `fox-fast-prefetch.log`, `fox-fast-noprefetch.log`.

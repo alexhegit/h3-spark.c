@@ -12,15 +12,85 @@
 #include "h3_video_vae.h"
 #include "h3_vision_encoder.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
 static char h3_global_error[512];
+
+static int h3_env_on(const char *name) {
+    const char *value = getenv(name);
+    return value && *value && strcmp(value, "0") != 0;
+}
+
+static double h3_monotonic_seconds(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)now.tv_sec + (double)now.tv_nsec * 1e-9;
+}
+
+static void *h3_prefetch_safetensors_thread(void *argument) {
+    const char *directory = (const char *)argument;
+    if (!directory || !*directory) return NULL;
+    double started = h3_monotonic_seconds();
+    DIR *stream = opendir(directory);
+    if (!stream) return NULL;
+    unsigned char *buffer = malloc(8u << 20);
+    if (!buffer) {
+        closedir(stream);
+        return NULL;
+    }
+    struct dirent *entry;
+    unsigned long long bytes = 0;
+    while ((entry = readdir(stream))) {
+        size_t name_length = strlen(entry->d_name);
+        if (name_length < 12 ||
+            strcmp(entry->d_name + name_length - 12, ".safetensors") != 0)
+            continue;
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+#ifdef POSIX_FADV_SEQUENTIAL
+        (void)posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+        /* readahead(2) returns immediately on this kernel and does not
+         * populate ~10 GiB; a real read loop is what fills page cache. */
+        ssize_t got;
+        while ((got = read(fd, buffer, 8u << 20)) > 0)
+            bytes += (unsigned long long)got;
+        close(fd);
+    }
+    free(buffer);
+    closedir(stream);
+    fprintf(stderr, "h3: video VAE prefetch finished in %.3fs (%llu MiB)\n",
+            h3_monotonic_seconds() - started, bytes / (1024ull * 1024ull));
+    return NULL;
+}
+
+static int h3_prefetch_start(pthread_t *thread, const char *directory) {
+    if (!thread || !directory || h3_env_on("H3_VAE_NO_PREFETCH")) return 0;
+    if (pthread_create(thread, NULL, h3_prefetch_safetensors_thread,
+                       (void *)directory) != 0)
+        return 0;
+    fprintf(stderr, "h3: prefetching video VAE weights in background\n");
+    return 1;
+}
+
+static void h3_prefetch_join(pthread_t thread, int started) {
+    if (!started) return;
+    pthread_join(thread, NULL);
+    fprintf(stderr, "h3: video VAE prefetch joined\n");
+}
 
 typedef struct {
     char *text;
@@ -907,6 +977,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     memset(&layout, 0, sizeof(layout));
     h3_dit *dit = NULL;
     h3_video_vae_decoder *preview_decoder = NULL;
+    pthread_t vae_prefetch = 0;
+    int vae_prefetch_started = 0;
     h3_live_preview live_preview;
     memset(&live_preview, 0, sizeof(live_preview));
     float *video = NULL, *audio = NULL;
@@ -1563,6 +1635,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         live_preview.output_height = params->height;
         if (progress.cancelled) goto cleanup;
     }
+    if (!preview_decoder)
+        vae_prefetch_started = h3_prefetch_start(&vae_prefetch, vae_path);
     size_t video_count = h3_dit_video_elements(dit);
     size_t audio_count = h3_dit_audio_elements(dit);
     video = malloc(video_count * sizeof(*video));
@@ -1596,6 +1670,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
     if (progress.cancelled) goto cleanup;
+    h3_prefetch_join(vae_prefetch, vae_prefetch_started);
+    vae_prefetch_started = 0;
     h3_progress_emit(&progress, "audio VAE", 0, 7);
     if (!h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
                              temporal.audio_t, h3_audio_vae_progress_bridge,
@@ -1695,6 +1771,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     result->seed = params->seed;
 
 cleanup:
+    h3_prefetch_join(vae_prefetch, vae_prefetch_started);
     free(conditioning_key);
     free(prepared_key);
     free(decoder_key);
