@@ -594,3 +594,12 @@ Reverted. Logs: `/tmp/h3_perf_day8/fox-s2-swiglu-scalar-ab1.log`,
 vs **1.88 / 1.86 s**. The dual-path kernel also inflated both vs the
 single-`__ldg` baseline (~1.70 s sdpa). Reverted. Logs:
 `/tmp/h3_perf_day8/fox-s2-q8-ldg-ab1.log`, `fox-s2-q8-ldcs-ab1.log`.
+
+---
+
+## 2026-08-24 — REJECT 2D INT8 scale epilogue
+
+A 2D grid (row × column) to avoid `index / output_dim` did not drop fox-s2
+denoise: **3.18 / 3.14 s** (1D) vs **3.16 / 3.19 s** (2D); linear
+**1.19 / 1.15 s** vs **1.16 / 1.17 s**. Reverted. Logs:
+`/tmp/h3_perf_day8/fox-s2-iscale-1d-ab1.log`, `fox-s2-iscale-2d-ab1.log`.
