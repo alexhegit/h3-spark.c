@@ -650,3 +650,13 @@ fox-fast (steps 20 / L45 / reuse 2) vs workspace KEEP 22.0 s:
 
 Logs: `/tmp/h3_perf_day8/fox-s2-qkvrms-serial-ab1.log`, `fox-s2-qkvrms-coop-ab1.log`,
 `fox-fast-qkvrms.log`.
+
+---
+
+## 2026-08-24 — REJECT vec4 INT8 scale epilogue
+
+Vector `int4`/`float4` loads on the 1D INT8 scale kernel did not drop fox-s2
+denoise: **3.05 / 3.07 s** (scalar) vs **3.00 / 3.07 s** (vec4); linear
+**1.16 / 1.18 s** vs **1.12 / 1.17 s**. Reverted. Logs:
+`/tmp/h3_perf_day8/fox-s2-iscale-1d-ab1.log`, `fox-s2-iscale-vec4-ab1.log`.
+
