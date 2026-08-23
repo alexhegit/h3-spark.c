@@ -705,17 +705,26 @@ static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
                  FFN * 2, HIDDEN) &&
              h3_gpu_quantize_weight_int8(
                  dit->gpu, block->fc2_int8, block->fc2_scales, block->fc2,
-                 HIDDEN, FFN) &&
-             h3_gpu_submit(dit->gpu);
+                 HIDDEN, FFN);
     if (!ok) {
         fail(error, error_size, "cannot quantize DiT MLP weights: %s",
              h3_gpu_error(dit->gpu));
         return 0;
     }
-    if (!dit->keep_bf16_mlp) {
+    return 1;
+}
+
+static int release_block_bf16_after_int8(h3_dit *dit, h3_dit_block *block) {
+    if (!h3_gpu_submit(dit->gpu)) {
+        return 0;
+    }
+    if (dit->int8_mlp && !dit->keep_bf16_mlp) {
         free_tensor(&block->fc1);
         free_tensor(&block->fc2);
     }
+    if (dit->int8_qkv && !dit->keep_bf16_qkv) free_tensor(&block->qkv);
+    if (dit->int8_attention_out && !dit->keep_bf16_attention_out)
+        free_tensor(&block->out);
     return 1;
 }
 
@@ -728,14 +737,12 @@ static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
              h3_gpu_begin(dit->gpu) &&
              h3_gpu_quantize_weight_int8(
                  dit->gpu, block->qkv_int8, block->qkv_scales, block->qkv,
-                 INNER * 3, HIDDEN) &&
-             h3_gpu_submit(dit->gpu);
+                 INNER * 3, HIDDEN);
     if (!ok) {
         fail(error, error_size, "cannot quantize DiT QKV weight: %s",
              h3_gpu_error(dit->gpu));
         return 0;
     }
-    if (!dit->keep_bf16_qkv) free_tensor(&block->qkv);
     return 1;
 }
 
@@ -748,15 +755,13 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
              h3_gpu_begin(dit->gpu) &&
              h3_gpu_quantize_weight_int8(
                  dit->gpu, block->out_int8, block->out_scales, block->out,
-                 HIDDEN, INNER) &&
-             h3_gpu_submit(dit->gpu);
+                 HIDDEN, INNER);
     if (!ok) {
         fail(error, error_size,
              "cannot quantize DiT attention-output weight: %s",
              h3_gpu_error(dit->gpu));
         return 0;
     }
-    if (!dit->keep_bf16_attention_out) free_tensor(&block->out);
     return 1;
 }
 
@@ -1265,6 +1270,13 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
             if (dit->int8_attention_out &&
                 !quantize_block_attention_out(
                     dit, &dit->blocks[index], error, error_size)) return 0;
+            if ((dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out) &&
+                !release_block_bf16_after_int8(dit, &dit->blocks[index])) {
+                fail(error, error_size,
+                     "cannot finish DiT INT8 weight quantize: %s",
+                     h3_gpu_error(dit->gpu));
+                return 0;
+            }
         }
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
@@ -1630,9 +1642,13 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
+    /* GB10 BF16 tensor cores beat the runtime INT8 MLP (fox-s2 denoise
+     * 18s INT8 vs 4.9s BF16). Opt back in with H3_INT8_MLP=1. */
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
-                    h3_gpu_has_int8_mlp(dit->gpu);
+                    h3_gpu_has_int8_mlp(dit->gpu) &&
+                    getenv("H3_INT8_MLP") &&
+                    strcmp(getenv("H3_INT8_MLP"), "0") != 0;
     dit->int8_qkv = !dit->ssd_streaming && !use_slower_bf16_qkv &&
                     dit->sequence >= 128 &&
                     h3_gpu_has_int8_mlp(dit->gpu);

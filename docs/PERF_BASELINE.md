@@ -226,5 +226,66 @@ Same fox-s2 preset, wave SDPA on both sides:
 
 vs original CUDA naive-SDPA baseline denoise 1472 s / e2e 1726 s, fox-s2 is a
 different step count; on this 2-step gate, denoise is now **18 s**. Remaining
-denoise split: linear 13.4 · sdpa 2.9. Next: FC1/QKV INT8 tensor-op, then
-fox-fast (20 step) remeasure.
+denoise split: linear 13.4 · sdpa 2.9.
+
+### Fox-fast remeasure (`55a2710`, 2026-08-23 02:54 CST)
+
+Same 512² / 22f / steps20 / L45 / reuse2 preset as the original baseline.
+Log: `/tmp/h3_perf_day6/fox-fast-wave-int8tile.log`.
+
+| Metric | Naive SDPA baseline | Parallel SDPA | **Wave + tiled FC2** | vs naive |
+|--------|--------------------:|--------------:|---------------------:|---------:|
+| GPU Euler denoise | 1471.7 s | 912.3 s | **127.3 s** | **11.6×** |
+| denoise gpu-op linear | — | — | 94.8 s | — |
+| denoise gpu-op sdpa | — | — | 20.5 s | — |
+| DiT load | 53.0 s | 58.5 s | 65.8 s | — |
+| video VAE | 183.6 s | 178.2 s | **20.6 s** | **8.9×** |
+| **E2E wall** | **1725.7 s** | **1166.1 s** | **232.0 s** | **7.4×** |
+
+Remaining fox-fast denoise: **linear ~75%** (94.8 / 127). Metal M5 docs denoise
+~16.7 s → still ~**7.6×**. Next: FC1/QKV INT8 GEMM, then load I/O.
+
+---
+
+## 2026-08-23 — Spark defaults to BF16 MLP
+
+GB10 BF16 tensor cores beat the Metal-aligned runtime INT8 MLP. fox-s2
+(`512² / 22f / steps=2 / L35 / reuse=1`):
+
+| Path | Denoise | gpu-op linear | Load | E2E |
+|------|--------:|--------------:|-----:|----:|
+| Tiled FC2 + cuBLAS INT8 FC1 (`55a2710`) | 18.0 s | 13.4 s | ~52 s | 112 s |
+| Same + tiled FC1 (`groups=1`) | 69.3 s | 19.9 s† | 51.5 s | 158 s |
+| cuBLASLt INT8 (vs GemmEx) | 18.1 s | 14.0 s | 53 s | 110 s |
+| INT8 MLP + dp4a FC2 (`H3_INT8_MLP=1`) | 7.24 s | 3.22 s | 42.9 s | 82 s |
+| **BF16 MLP default** (INT8 QKV/out kept) | **4.87 s** | **1.10 s** | **35.0 s** | **71.6 s** |
+
+† FC1 was not in `gpu-op linear` until this pass, so tiled-FC1 denoise (69 s)
+is the real signal. **REJECT** default tiled FC1 (`H3_INT8_TILED=1` opt-in).
+**REJECT** cuBLASLt (no faster than `cublasGemmEx`). **REJECT**
+`H3_DISABLE_INT8_QKV=1` (DiT QKV linear request failed).
+
+**KEEP**
+
+- Default **BF16 MLP** on Spark. Restore INT8 MLP with `H3_INT8_MLP=1`.
+- `__dp4a` inner loop on grouped INT8 FC2 (opt-in INT8 path: linear 13.4 s → 3.2 s).
+- Compile `h3_gpu.cu` for `sm_121`.
+- Pinned host staging for weight `pread`; one GPU submit per block after INT8 quantize.
+- Count MLP FC1 / QKV INT8 GEMM in `gpu-op linear`.
+
+### Fox-fast remeasure (BF16 MLP default, 2026-08-23 08:53 CST)
+
+Log: `/tmp/h3_perf_day7/fox-fast-bf16mlp.log`.
+
+| Metric | Wave + tiled INT8 FC2 | **BF16 MLP default** | vs prior |
+|--------|----------------------:|---------------------:|---------:|
+| GPU Euler denoise | 127.3 s | **35.3 s** | **3.6×** |
+| denoise gpu-op linear | 94.8 s | **7.84 s** | **12.1×** |
+| denoise gpu-op sdpa | 20.5 s | 22.0 s | — |
+| DiT load | 65.8 s | **18.3 s** | **3.6×** |
+| video VAE | 20.6 s | **17.1 s** | — |
+| **E2E wall** | **232.0 s** | **83.8 s** | **2.8×** |
+
+vs naive CUDA baseline denoise 1472 s / e2e 1726 s: **41.7× / 20.6×**.
+Metal M5 docs denoise ~16.7 s → Spark now ~**2.1×**. Remaining fox-fast
+denoise is **SDPA ~62%** (22 / 35). Next: SDPA, then load I/O on a cold cache.

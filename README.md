@@ -55,7 +55,7 @@ MiniMax-H3 demo assets (`ref2va.mp4` / `fl2va.mp4`).
 | T2VA (text → video+audio) | ✅ |
 | FL2VA (`--first-frame` / `--last-frame`) | ✅ |
 | Ref2VA (`--ref-image`, `--ref-video`, …) | ✅ |
-| Runtime INT8 MLP (Metal-aligned) | ✅ |
+| Runtime INT8 MLP (opt-in `H3_INT8_MLP=1`; BF16 MLP is faster on GB10) | ✅ |
 | `--ref-audio` + preview UX (`--frames-dir`, `--show`) | ✅ |
 | Performance vs Metal / CUDA `--profile` phases | 📋 baseline — [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) |
 

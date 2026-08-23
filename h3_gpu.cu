@@ -28,6 +28,9 @@ struct h3_gpu_tensor {
 struct h3_gpu {
     cudaStream_t stream;
     cublasHandle_t cublas;
+    void *stage_host;
+    size_t stage_host_bytes;
+    int stage_host_pinned;
     int device;
     int fast_path;
     int tensor_fast_path;
@@ -323,6 +326,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path, char *error,
         return NULL;
     }
     cublasSetStream(gpu->cublas, gpu->stream);
+    gpu->stage_host = NULL;
+    gpu->stage_host_bytes = 0;
+    gpu->stage_host_pinned = 0;
     cudaDeviceProp props;
     if (cudaGetDeviceProperties(&props, 0) == cudaSuccess) {
         gpu->fast_path = props.major >= 12 ? 1 : 0;
@@ -344,6 +350,10 @@ void h3_gpu_free(h3_gpu *gpu) {
                         gpu->profile_start_wall);
     h3_gpu_op_events_destroy(gpu);
     if (gpu->int8_accum) cudaFree(gpu->int8_accum);
+    if (gpu->stage_host) {
+        if (gpu->stage_host_pinned) cudaFreeHost(gpu->stage_host);
+        else free(gpu->stage_host);
+    }
     if (gpu->cublas) cublasDestroy(gpu->cublas);
     if (gpu->stream) cudaStreamDestroy(gpu->stream);
     free(gpu);
@@ -419,78 +429,41 @@ static int h3_read_file_at(const char *path, uint64_t offset, void *buffer,
     return 1;
 }
 
-h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
-                                       uint64_t file_offset, size_t elements) {
-    h3_gpu_tensor *tensor = h3_gpu_tensor_new_bf16(gpu, elements);
-    if (!tensor) return NULL;
-    void *host = malloc(tensor->bytes);
-    if (!host) {
-        h3_gpu_tensor_free(tensor);
-        h3_gpu_fail(gpu, "out of memory staging BF16 weight read");
-        return NULL;
+static int h3_gpu_ensure_stage(h3_gpu *gpu, size_t bytes) {
+    if (!gpu || !bytes) return 0;
+    if (gpu->stage_host && gpu->stage_host_bytes >= bytes) return 1;
+    if (gpu->stage_host) {
+        if (gpu->stage_host_pinned) cudaFreeHost(gpu->stage_host);
+        else free(gpu->stage_host);
     }
-    if (!h3_read_file_at(path, file_offset, host, tensor->bytes, gpu->error,
-                         sizeof(gpu->error))) {
-        free(host);
-        h3_gpu_tensor_free(tensor);
-        return NULL;
+    gpu->stage_host = NULL;
+    gpu->stage_host_bytes = 0;
+    gpu->stage_host_pinned = 0;
+    if (cudaMallocHost(&gpu->stage_host, bytes) == cudaSuccess) {
+        gpu->stage_host_bytes = bytes;
+        gpu->stage_host_pinned = 1;
+        return 1;
     }
-    if (!h3_cuda_check(gpu, cudaMemcpy(tensor->device, host, tensor->bytes,
-                                       cudaMemcpyHostToDevice),
-                       "cudaMemcpy load_bf16")) {
-        free(host);
-        h3_gpu_tensor_free(tensor);
-        return NULL;
-    }
-    free(host);
-    return tensor;
+    gpu->stage_host = malloc(bytes);
+    if (!gpu->stage_host) return 0;
+    gpu->stage_host_bytes = bytes;
+    gpu->stage_host_pinned = 0;
+    return 1;
 }
 
-h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
-                                      uint64_t file_offset, size_t elements) {
-    h3_gpu_tensor *tensor = h3_gpu_tensor_new_f32(gpu, elements);
-    if (!tensor) return NULL;
-    void *host = malloc(tensor->bytes);
-    if (!host) {
-        h3_gpu_tensor_free(tensor);
-        h3_gpu_fail(gpu, "out of memory staging F32 weight read");
-        return NULL;
-    }
-    if (!h3_read_file_at(path, file_offset, host, tensor->bytes, gpu->error,
-                         sizeof(gpu->error))) {
-        free(host);
-        h3_gpu_tensor_free(tensor);
-        return NULL;
-    }
-    if (!h3_cuda_check(gpu, cudaMemcpy(tensor->device, host, tensor->bytes,
-                                       cudaMemcpyHostToDevice),
-                       "cudaMemcpy load_f32")) {
-        free(host);
-        h3_gpu_tensor_free(tensor);
-        return NULL;
-    }
-    free(host);
-    return tensor;
-}
-
-int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
-                                 uint64_t file_offset, size_t elements,
-                                 char *error, size_t error_size) {
-    if (!tensor || tensor->dtype != H3_GPU_BF16 || tensor->elements < elements)
-        return 0;
-    size_t bytes = elements * sizeof(uint16_t);
-    void *host = malloc(bytes);
-    if (!host) {
+static int h3_copy_file_to_device(h3_gpu *gpu, void *device, const char *path,
+                                  uint64_t offset, size_t bytes, char *error,
+                                  size_t error_size) {
+    if (!gpu || !device || !path || !bytes) return 0;
+    if (!h3_gpu_ensure_stage(gpu, bytes)) {
         if (error && error_size) snprintf(error, error_size, "out of memory");
         return 0;
     }
-    if (!h3_read_file_at(path, file_offset, host, bytes, error, error_size)) {
-        free(host);
+    if (!h3_read_file_at(path, offset, gpu->stage_host, bytes, error,
+                         error_size))
         return 0;
-    }
-    cudaError_t status = cudaMemcpy(tensor->device, host, bytes,
-                                    cudaMemcpyHostToDevice);
-    free(host);
+    cudaError_t status =
+        cudaMemcpy(device, gpu->stage_host, bytes, cudaMemcpyHostToDevice);
     if (status != cudaSuccess) {
         if (error && error_size) {
             snprintf(error, error_size, "cudaMemcpy failed: %s",
@@ -499,6 +472,45 @@ int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
         return 0;
     }
     return 1;
+}
+
+h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
+                                       uint64_t file_offset, size_t elements) {
+    h3_gpu_tensor *tensor = h3_gpu_tensor_new_bf16(gpu, elements);
+    if (!tensor) return NULL;
+    if (!h3_copy_file_to_device(gpu, tensor->device, path, file_offset,
+                                tensor->bytes, gpu->error,
+                                sizeof(gpu->error))) {
+        h3_gpu_tensor_free(tensor);
+        return NULL;
+    }
+    gpu->error[0] = '\0';
+    return tensor;
+}
+
+h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
+                                      uint64_t file_offset, size_t elements) {
+    h3_gpu_tensor *tensor = h3_gpu_tensor_new_f32(gpu, elements);
+    if (!tensor) return NULL;
+    if (!h3_copy_file_to_device(gpu, tensor->device, path, file_offset,
+                                tensor->bytes, gpu->error,
+                                sizeof(gpu->error))) {
+        h3_gpu_tensor_free(tensor);
+        return NULL;
+    }
+    gpu->error[0] = '\0';
+    return tensor;
+}
+
+int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
+                                 uint64_t file_offset, size_t elements,
+                                 char *error, size_t error_size) {
+    if (!tensor || !tensor->owner || tensor->dtype != H3_GPU_BF16 ||
+        tensor->elements < elements)
+        return 0;
+    size_t bytes = elements * sizeof(uint16_t);
+    return h3_copy_file_to_device(tensor->owner, tensor->device, path,
+                                  file_offset, bytes, error, error_size);
 }
 
 int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
@@ -4906,6 +4918,12 @@ __global__ static void h3_linear_int8_naive_kernel(
     output[(size_t)row * output_dim + column] = h3_f32_to_bf16_bits(value);
 }
 
+__global__ static void h3_linear_int8_grouped_tiled_kernel(
+    const int8_t *input, const int8_t *weight, const float *input_scales,
+    const float *weight_scales, uint16_t *output, uint32_t rows,
+    uint32_t input_dim, uint32_t output_dim, uint32_t group_size,
+    uint32_t groups);
+
 static int h3_gpu_linear_int8_bf16_impl(
     h3_gpu *gpu, h3_gpu_tensor *output, h3_gpu_tensor *quantized_input,
     h3_gpu_tensor *input_scales, const h3_gpu_tensor *input,
@@ -4942,7 +4960,24 @@ static int h3_gpu_linear_int8_bf16_impl(
             return 0;
     }
 
-    /* Prefer cuBLAS INT8 GEMM; keep a persistent accum buffer. */
+    /* REJECT as default: 64x64 tile loses badly vs cuBLAS on FC1/QKV
+     * (fox-s2 denoise 18s → 69s). Opt in with H3_INT8_TILED=1. */
+    if (h3_env_on("H3_INT8_TILED") && (input_dim % 32u) == 0u) {
+        dim3 threads(16, 16, 1);
+        dim3 blocks((output_dim + 63u) / 64u, (rows + 63u) / 64u, 1);
+        h3_linear_int8_grouped_tiled_kernel<<<blocks, threads, 0,
+                                              gpu->stream>>>(
+            (const int8_t *)quantized_input->device,
+            (const int8_t *)weight->device,
+            (const float *)input_scales->device,
+            (const float *)weight_scales->device, (uint16_t *)output->device,
+            rows, input_dim, output_dim, input_dim, 1u);
+        gpu->stats.direct_dispatches++;
+        return h3_cuda_check(gpu, cudaGetLastError(),
+                             "h3_linear_int8_tiled");
+    }
+
+    /* Prefer cuBLAS INT8 GEMM; keep a persistent accum. */
     size_t accum_bytes = output_count * sizeof(int32_t);
     if (gpu->int8_accum_bytes < accum_bytes) {
         if (gpu->int8_accum) cudaFree(gpu->int8_accum);
@@ -5273,14 +5308,19 @@ __global__ static void h3_linear_int8_grouped_tiled_kernel(
             }
             __syncthreads();
 #pragma unroll
-            for (int k = 0; k < BK; k++) {
+            for (int k = 0; k < BK; k += 4) {
 #pragma unroll
                 for (int i = 0; i < 4; i++) {
-                    int32_t a = (int32_t)tile_a[ty * 4u + (uint32_t)i][k];
+                    int a_pack =
+                        *reinterpret_cast<const int *>(
+                            &tile_a[ty * 4u + (uint32_t)i][k]);
 #pragma unroll
-                    for (int j = 0; j < 4; j++)
-                        iacc[i][j] +=
-                            a * (int32_t)tile_b[tx * 4u + (uint32_t)j][k];
+                    for (int j = 0; j < 4; j++) {
+                        int b_pack =
+                            *reinterpret_cast<const int *>(
+                                &tile_b[tx * 4u + (uint32_t)j][k]);
+                        iacc[i][j] = __dp4a(a_pack, b_pack, iacc[i][j]);
+                    }
                 }
             }
             __syncthreads();
@@ -5443,12 +5483,15 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                 gpu, quantized_activation, activation_scales, input, rows,
                 padded_rows, input_dim, 1.0f))
             ok = 0;
-        if (ok &&
-            !h3_gpu_linear_int8_bf16_impl(
-                gpu, fc1_fused, quantized_activation, activation_scales, NULL,
-                fc1_weight, fc1_scales, rows, input_dim, hidden_dim * 2u, 0,
-                1))
-            ok = 0;
+        if (ok) {
+            h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
+            if (!h3_gpu_linear_int8_bf16_impl(
+                    gpu, fc1_fused, quantized_activation, activation_scales,
+                    NULL, fc1_weight, fc1_scales, rows, input_dim,
+                    hidden_dim * 2u, 0, 1))
+                ok = 0;
+            h3_gpu_op_end(gpu);
+        }
         if (ok && !h3_gpu_swiglu_bf16(gpu, activated, fc1_fused, rows, hidden_dim))
             ok = 0;
     } else if (!h3_gpu_linear_bf16(gpu, fc1_fused, input, fc1_bf16, NULL, rows,
@@ -5568,10 +5611,12 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     h3_gpu_tensor *qkv =
         h3_gpu_tensor_new_bf16(gpu, (size_t)rows * inner * 3u);
     if (!qkv) return h3_gpu_fail(gpu, "INT8 QKV temp alloc failed");
-    int ok =
-        h3_gpu_linear_int8_bf16_impl(
-            gpu, qkv, quantized_input, input_scales, NULL, weight,
-            weight_scales, rows, input_dim, inner * 3u, 0, 1) &&
+    h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
+    int ok = h3_gpu_linear_int8_bf16_impl(
+        gpu, qkv, quantized_input, input_scales, NULL, weight, weight_scales,
+        rows, input_dim, inner * 3u, 0, 1);
+    h3_gpu_op_end(gpu);
+    ok = ok &&
         h3_gpu_qkv_rope_bf16_layout(gpu, query, key, value, qkv, q_norm,
                                     k_norm, rope_cos, rope_sin, rows, heads,
                                     head_dim, rope_half, 1u, epsilon);
