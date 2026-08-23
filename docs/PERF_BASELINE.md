@@ -461,3 +461,11 @@ Prefetching four K/V steps before softmax did not beat K2 outside noise
 (fox-s2 denoise sdpa **1.70 s** vs K2 **1.74 s**; later K2 reruns were 1.78 s).
 Keep K2. Log: `/tmp/h3_perf_day8/fox-s2-q8k4.log`.
 
+---
+
+## 2026-08-23 — REJECT CUBLAS_COMPUTE_32F_FAST_16BF for DiT linear
+
+Ops still passed. fox-s2 denoise gpu-op linear **1.139 s → 1.186 s** (slightly
+slower). Stay on `CUBLAS_COMPUTE_32F`. Logs:
+`/tmp/h3_perf_day8/fox-s2-fast16bf-off.log`, `fox-s2-fast16bf-on.log`.
+
