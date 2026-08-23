@@ -603,3 +603,12 @@ A 2D grid (row × column) to avoid `index / output_dim` did not drop fox-s2
 denoise: **3.18 / 3.14 s** (1D) vs **3.16 / 3.19 s** (2D); linear
 **1.19 / 1.15 s** vs **1.16 / 1.17 s**. Reverted. Logs:
 `/tmp/h3_perf_day8/fox-s2-iscale-1d-ab1.log`, `fox-s2-iscale-2d-ab1.log`.
+
+---
+
+## 2026-08-24 — REJECT Q8 SDPA PreferL1 cache config
+
+`cudaFuncCachePreferL1` plus zero shared-memory carveout did not drop
+fox-s2 denoise: **3.08 / 3.13 s** (default cache) vs **3.11 / 3.29 s**
+(PreferL1); sdpa **1.67 / 1.70 s** vs **1.69 / 1.76 s**. Reverted. Logs:
+`/tmp/h3_perf_day8/fox-s2-q8-cache-def-ab1.log`, `fox-s2-q8-cache-l1-ab1.log`.
