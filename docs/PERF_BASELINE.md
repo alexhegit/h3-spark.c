@@ -453,3 +453,11 @@ Tried `CUBLAS_GEMM_DEFAULT_TENSOR_OP` on BF16 DiT linear
 (noise). Default `CUBLAS_GEMM_DEFAULT` stays. Logs:
 `/tmp/h3_perf_day8/fox-s2-linear-default.log`, `fox-s2-linear-tensor.log`.
 
+---
+
+## 2026-08-23 — REJECT Q8 SDPA K-unroll 4
+
+Prefetching four K/V steps before softmax did not beat K2 outside noise
+(fox-s2 denoise sdpa **1.70 s** vs K2 **1.74 s**; later K2 reruns were 1.78 s).
+Keep K2. Log: `/tmp/h3_perf_day8/fox-s2-q8k4.log`.
+
