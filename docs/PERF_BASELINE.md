@@ -333,3 +333,7 @@ cache. Opt-out `H3_LOAD_SYNC_COPY=1`.
 load did not drop vs open/close per tensor (pread of large tensors dominates).
 
 Logs: `/tmp/h3_perf_day8/`.
+
+fox-fast (`82f2936`, colder load): denoise **31.4 s** (sdpa 18.4), VAE **16.6 s**
+(sdpa 3.57 vs ~4.1 on Q2), DiT load **42.8 s**, e2e **107 s**. Compute moved;
+e2e still tracks load temperature.
