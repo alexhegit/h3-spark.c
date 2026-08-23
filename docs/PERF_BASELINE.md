@@ -498,3 +498,13 @@ linear 7.9 of 25.2 s (~1.51× vs Metal ~16.7 s). Logs:
 `/tmp/h3_perf_day8/fox-s2-k2-ab1.log`, `fox-s2-pipe-ab1.log`,
 `fox-fast-q8k2.log`, `fox-fast-q8pipe.log`.
 
+---
+
+## 2026-08-23 — REJECT Q8 SDPA launch_bounds(32, 8)
+
+Forcing eight blocks per SM compiled, but fox-s2 denoise sdpa stayed inside
+noise (**1.63 / 1.68 s** vs pipelined K2 **1.69 / 1.70 s**). fox-fast denoise
+**25.2 s → 25.0 s**, sdpa **11.86 s → 11.70 s**. Keep default
+`__launch_bounds__(32)`. Logs: `/tmp/h3_perf_day8/fox-s2-q8lb8.log`,
+`fox-s2-q8lb8-b.log`, `fox-fast-q8lb8.log`.
+
