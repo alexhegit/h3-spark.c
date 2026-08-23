@@ -28,9 +28,14 @@ struct h3_gpu_tensor {
 struct h3_gpu {
     cudaStream_t stream;
     cublasHandle_t cublas;
-    void *stage_host;
+    void *stage_host[2];
     size_t stage_host_bytes;
     int stage_host_pinned;
+    int stage_slot;
+    int stage_event_recorded[2];
+    cudaEvent_t stage_copied[2];
+    int stage_fd;
+    char stage_path[4096];
     int device;
     int fast_path;
     int tensor_fast_path;
@@ -326,9 +331,19 @@ h3_gpu *h3_gpu_create(const char *shader_source_path, char *error,
         return NULL;
     }
     cublasSetStream(gpu->cublas, gpu->stream);
-    gpu->stage_host = NULL;
+    gpu->stage_host[0] = NULL;
+    gpu->stage_host[1] = NULL;
     gpu->stage_host_bytes = 0;
     gpu->stage_host_pinned = 0;
+    gpu->stage_slot = 0;
+    gpu->stage_event_recorded[0] = 0;
+    gpu->stage_event_recorded[1] = 0;
+    gpu->stage_copied[0] = NULL;
+    gpu->stage_copied[1] = NULL;
+    gpu->stage_fd = -1;
+    gpu->stage_path[0] = '\0';
+    cudaEventCreateWithFlags(&gpu->stage_copied[0], cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&gpu->stage_copied[1], cudaEventDisableTiming);
     cudaDeviceProp props;
     if (cudaGetDeviceProperties(&props, 0) == cudaSuccess) {
         gpu->fast_path = props.major >= 12 ? 1 : 0;
@@ -350,10 +365,16 @@ void h3_gpu_free(h3_gpu *gpu) {
                         gpu->profile_start_wall);
     h3_gpu_op_events_destroy(gpu);
     if (gpu->int8_accum) cudaFree(gpu->int8_accum);
-    if (gpu->stage_host) {
-        if (gpu->stage_host_pinned) cudaFreeHost(gpu->stage_host);
-        else free(gpu->stage_host);
+    for (int i = 0; i < 2; i++) {
+        if (gpu->stage_event_recorded[i] && gpu->stage_copied[i])
+            cudaEventSynchronize(gpu->stage_copied[i]);
+        if (gpu->stage_host[i]) {
+            if (gpu->stage_host_pinned) cudaFreeHost(gpu->stage_host[i]);
+            else free(gpu->stage_host[i]);
+        }
+        if (gpu->stage_copied[i]) cudaEventDestroy(gpu->stage_copied[i]);
     }
+    if (gpu->stage_fd >= 0) close(gpu->stage_fd);
     if (gpu->cublas) cublasDestroy(gpu->cublas);
     if (gpu->stream) cudaStreamDestroy(gpu->stream);
     free(gpu);
@@ -407,45 +428,97 @@ static int h3_tensor_check(const h3_gpu_tensor *tensor, h3_gpu_dtype dtype,
            tensor->elements >= elements;
 }
 
-static int h3_read_file_at(const char *path, uint64_t offset, void *buffer,
-                           size_t bytes, char *error, size_t error_size) {
+static int h3_gpu_open_stage_fd(h3_gpu *gpu, const char *path, char *error,
+                                size_t error_size) {
+    if (!gpu || !path) return -1;
+    if (!h3_env_on("H3_LOAD_FD_CACHE")) {
+        int fd = open(path, O_RDONLY);
+        if (fd < 0 && error && error_size) {
+            snprintf(error, error_size, "cannot open %s: %s", path,
+                     strerror(errno));
+        }
+        return fd;
+    }
+    if (gpu->stage_fd >= 0 && gpu->stage_path[0] &&
+        strcmp(gpu->stage_path, path) == 0)
+        return gpu->stage_fd;
+    if (gpu->stage_fd >= 0) {
+        close(gpu->stage_fd);
+        gpu->stage_fd = -1;
+        gpu->stage_path[0] = '\0';
+    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         if (error && error_size) {
             snprintf(error, error_size, "cannot open %s: %s", path,
                      strerror(errno));
         }
-        return 0;
+        return -1;
     }
-    ssize_t got = pread(fd, buffer, bytes, (off_t)offset);
-    close(fd);
-    if (got < 0 || (size_t)got != bytes) {
-        if (error && error_size) {
-            snprintf(error, error_size, "cannot read %zu bytes from %s", bytes,
-                     path);
+    gpu->stage_fd = fd;
+    snprintf(gpu->stage_path, sizeof(gpu->stage_path), "%s", path);
+    return fd;
+}
+
+static int h3_read_file_at(h3_gpu *gpu, const char *path, uint64_t offset,
+                           void *buffer, size_t bytes, char *error,
+                           size_t error_size) {
+    int fd = h3_gpu_open_stage_fd(gpu, path, error, error_size);
+    if (fd < 0) return 0;
+    size_t done = 0;
+    while (done < bytes) {
+        size_t chunk = bytes - done;
+        if (chunk > (size_t)1 << 30) chunk = (size_t)1 << 30;
+        ssize_t got = pread(fd, (unsigned char *)buffer + done, chunk,
+                            (off_t)(offset + done));
+        if (got <= 0) {
+            if (error && error_size) {
+                snprintf(error, error_size, "cannot read %zu bytes from %s",
+                         bytes, path);
+            }
+            if (!h3_env_on("H3_LOAD_FD_CACHE") && fd >= 0) close(fd);
+            return 0;
         }
-        return 0;
+        done += (size_t)got;
     }
+    if (!h3_env_on("H3_LOAD_FD_CACHE")) close(fd);
     return 1;
 }
 
 static int h3_gpu_ensure_stage(h3_gpu *gpu, size_t bytes) {
     if (!gpu || !bytes) return 0;
-    if (gpu->stage_host && gpu->stage_host_bytes >= bytes) return 1;
-    if (gpu->stage_host) {
-        if (gpu->stage_host_pinned) cudaFreeHost(gpu->stage_host);
-        else free(gpu->stage_host);
+    if (gpu->stage_host[0] && gpu->stage_host[1] &&
+        gpu->stage_host_bytes >= bytes)
+        return 1;
+    for (int i = 0; i < 2; i++) {
+        if (gpu->stage_event_recorded[i] && gpu->stage_copied[i])
+            cudaEventSynchronize(gpu->stage_copied[i]);
+        gpu->stage_event_recorded[i] = 0;
+        if (gpu->stage_host[i]) {
+            if (gpu->stage_host_pinned) cudaFreeHost(gpu->stage_host[i]);
+            else free(gpu->stage_host[i]);
+            gpu->stage_host[i] = NULL;
+        }
     }
-    gpu->stage_host = NULL;
     gpu->stage_host_bytes = 0;
     gpu->stage_host_pinned = 0;
-    if (cudaMallocHost(&gpu->stage_host, bytes) == cudaSuccess) {
+    if (cudaMallocHost(&gpu->stage_host[0], bytes) == cudaSuccess &&
+        cudaMallocHost(&gpu->stage_host[1], bytes) == cudaSuccess) {
         gpu->stage_host_bytes = bytes;
         gpu->stage_host_pinned = 1;
         return 1;
     }
-    gpu->stage_host = malloc(bytes);
-    if (!gpu->stage_host) return 0;
+    if (gpu->stage_host[0]) cudaFreeHost(gpu->stage_host[0]);
+    if (gpu->stage_host[1]) cudaFreeHost(gpu->stage_host[1]);
+    gpu->stage_host[0] = malloc(bytes);
+    gpu->stage_host[1] = malloc(bytes);
+    if (!gpu->stage_host[0] || !gpu->stage_host[1]) {
+        free(gpu->stage_host[0]);
+        free(gpu->stage_host[1]);
+        gpu->stage_host[0] = NULL;
+        gpu->stage_host[1] = NULL;
+        return 0;
+    }
     gpu->stage_host_bytes = bytes;
     gpu->stage_host_pinned = 0;
     return 1;
@@ -459,11 +532,31 @@ static int h3_copy_file_to_device(h3_gpu *gpu, void *device, const char *path,
         if (error && error_size) snprintf(error, error_size, "out of memory");
         return 0;
     }
-    if (!h3_read_file_at(path, offset, gpu->stage_host, bytes, error,
+    int slot = gpu->stage_slot & 1;
+    if (gpu->stage_event_recorded[slot] && gpu->stage_copied[slot] &&
+        cudaEventSynchronize(gpu->stage_copied[slot]) != cudaSuccess) {
+        if (error && error_size)
+            snprintf(error, error_size, "cudaEventSynchronize staging failed");
+        return 0;
+    }
+    gpu->stage_event_recorded[slot] = 0;
+    if (!h3_read_file_at(gpu, path, offset, gpu->stage_host[slot], bytes, error,
                          error_size))
         return 0;
-    cudaError_t status =
-        cudaMemcpy(device, gpu->stage_host, bytes, cudaMemcpyHostToDevice);
+    cudaError_t status;
+    int overlap = gpu->stage_host_pinned && gpu->stream &&
+                  !h3_env_on("H3_LOAD_SYNC_COPY");
+    if (overlap) {
+        status = cudaMemcpyAsync(device, gpu->stage_host[slot], bytes,
+                                 cudaMemcpyHostToDevice, gpu->stream);
+        if (status == cudaSuccess && gpu->stage_copied[slot]) {
+            status = cudaEventRecord(gpu->stage_copied[slot], gpu->stream);
+            if (status == cudaSuccess) gpu->stage_event_recorded[slot] = 1;
+        }
+    } else {
+        status = cudaMemcpy(device, gpu->stage_host[slot], bytes,
+                            cudaMemcpyHostToDevice);
+    }
     if (status != cudaSuccess) {
         if (error && error_size) {
             snprintf(error, error_size, "cudaMemcpy failed: %s",
@@ -471,6 +564,7 @@ static int h3_copy_file_to_device(h3_gpu *gpu, void *device, const char *path,
         }
         return 0;
     }
+    gpu->stage_slot = slot ^ 1;
     return 1;
 }
 
@@ -3966,6 +4060,67 @@ h3_sdpa_f32_wave_d64_q2_kernel(const float *query, const float *key,
     }
 }
 
+__global__ static void __launch_bounds__(32)
+h3_sdpa_f32_wave_d64_q4_kernel(const float *query, const float *key,
+                               const float *value, float *output,
+                               h3_sdpa_args args) {
+    uint32_t q_pos = (uint32_t)blockIdx.x * 4u;
+    uint32_t head = (uint32_t)blockIdx.y;
+    uint32_t lane = (uint32_t)threadIdx.x;
+    if (q_pos >= args.sequence || head >= args.heads) return;
+    uint32_t q_live = args.sequence - q_pos;
+    if (q_live > 4u) q_live = 4u;
+    uint32_t q_base0 = (q_pos * args.heads + head) * 64u;
+    uint32_t q_step = args.heads * 64u;
+    float q0[4], q1[4];
+    float acc0[4], acc1[4], maximum[4], sum[4];
+#pragma unroll
+    for (int qi = 0; qi < 4; qi++) {
+        maximum[qi] = -1e30f;
+        sum[qi] = 0.0f;
+        acc0[qi] = 0.0f;
+        acc1[qi] = 0.0f;
+        q0[qi] = 0.0f;
+        q1[qi] = 0.0f;
+        if ((uint32_t)qi < q_live) {
+            uint32_t qb = q_base0 + (uint32_t)qi * q_step;
+            q0[qi] = query[qb + lane] * args.scale;
+            q1[qi] = query[qb + 32u + lane] * args.scale;
+        }
+    }
+    uint32_t stride = args.heads * 64u;
+    uint32_t k_base = head * 64u;
+    for (uint32_t k_pos = 0; k_pos < args.sequence; k_pos++) {
+        float k0 = key[k_base + lane];
+        float k1v = key[k_base + 32u + lane];
+        float v0 = value[k_base + lane];
+        float v1 = value[k_base + 32u + lane];
+#pragma unroll
+        for (int qi = 0; qi < 4; qi++) {
+            if ((uint32_t)qi < q_live) {
+                float score = h3_warp_reduce_sum(q0[qi] * k0 + q1[qi] * k1v);
+                float new_max = fmaxf(maximum[qi], score);
+                float alpha = expf(maximum[qi] - new_max);
+                float p = expf(score - new_max);
+                acc0[qi] = fmaf(p, v0, acc0[qi] * alpha);
+                acc1[qi] = fmaf(p, v1, acc1[qi] * alpha);
+                sum[qi] = fmaf(sum[qi], alpha, p);
+                maximum[qi] = new_max;
+            }
+        }
+        k_base += stride;
+    }
+#pragma unroll
+    for (int qi = 0; qi < 4; qi++) {
+        if ((uint32_t)qi < q_live) {
+            float inv = sum[qi] > 0.0f ? 1.0f / sum[qi] : 0.0f;
+            uint32_t qb = q_base0 + (uint32_t)qi * q_step;
+            output[qb + lane] = acc0[qi] * inv;
+            output[qb + 32u + lane] = acc1[qi] * inv;
+        }
+    }
+}
+
 int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                     const h3_gpu_tensor *value, uint32_t sequence,
@@ -3985,6 +4140,19 @@ int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         !h3_env_on("H3_SDPA_WAVE_OFF")) {
         dim3 threads(32, 1, 1);
         if (head_dim == 64u && !h3_env_on("H3_SDPA_D64_Q1")) {
+            if (!h3_env_on("H3_SDPA_D64_Q2")) {
+                dim3 blocks((sequence + 3u) / 4u, heads, 1);
+                h3_sdpa_f32_wave_d64_q4_kernel<<<blocks, threads, 0,
+                                                 gpu->stream>>>(
+                    (const float *)query->device, (const float *)key->device,
+                    (const float *)value->device, (float *)output->device,
+                    args);
+                gpu->stats.mps_sdpa_dispatches++;
+                ok = h3_cuda_check(gpu, cudaGetLastError(),
+                                   "h3_sdpa_f32_wave_q4");
+                h3_gpu_op_end(gpu);
+                return ok;
+            }
             dim3 blocks((sequence + 1u) / 2u, heads, 1);
             h3_sdpa_f32_wave_d64_q2_kernel<<<blocks, threads, 0, gpu->stream>>>(
                 (const float *)query->device, (const float *)key->device,

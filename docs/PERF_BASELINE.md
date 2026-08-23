@@ -316,3 +316,20 @@ fox-fast (load is cache-noisy):
 
 Denoise SDPA **1.20×**. Remaining fox-fast denoise is still mostly SDPA
 (18.3 / 31.6). Next: d64 VAE SDPA, then load I/O.
+
+---
+
+## 2026-08-23 — VAE d64 Q4 + overlapped weight copies
+
+**KEEP** F32 d64 wave Q4 as default VAE SDPA. Opt-out `H3_SDPA_D64_Q2=1`.
+fox-s2 `video VAE` `gpu-op sdpa` **4.11 s → 3.54 s** (~1.16×). VAE wall is
+still ~17 s because the phase includes loading 36 VAE blocks.
+
+**KEEP** double-buffered pinned `pread` + `cudaMemcpyAsync` for weight
+staging. fox-s2 DiT load **38.4 s (sync) → 35.6 s (overlap)** on a warm-ish
+cache. Opt-out `H3_LOAD_SYNC_COPY=1`.
+
+**REJECT** always-on safetensor fd cache (`H3_LOAD_FD_CACHE=1` opt-in): DiT
+load did not drop vs open/close per tensor (pread of large tensors dominates).
+
+Logs: `/tmp/h3_perf_day8/`.
