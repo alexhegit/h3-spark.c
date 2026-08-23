@@ -539,3 +539,11 @@ longer stalls the stream. Remaining fox-fast denoise is SDPA 12.2 + linear
 `/tmp/h3_perf_day8/fox-s2-ws-off-ab1.log`, `fox-s2-ws-on-ab1.log`,
 `fox-fast-q8pipe.log`, `fox-fast-ws.log`.
 
+---
+
+## 2026-08-24 — REJECT 2-warp Q16 SDPA (shared K/V smem)
+
+Two warps per block, 16 queries, K/V staged through shared memory. fox-s2
+denoise sdpa **1.67 / 1.74 s → 3.17 / 3.21 s** (denoise 3.06 / 3.18 s →
+4.54 / 4.62 s). Barrier + split K/V load is slower than pipelined Q8.
+Reverted. Logs: `/tmp/h3_perf_day8/fox-s2-q8-ab1.log`, `fox-s2-q8x2-ab1.log`.
