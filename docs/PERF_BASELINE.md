@@ -441,3 +441,15 @@ Denoise SDPA **~1.07–1.10×**. Remaining fox-fast denoise is SDPA 13.0 + linea
 8.0 of 26.9 s. Logs: `/tmp/h3_perf_day8/fox-s2-q8k2.log`,
 `fox-fast-q8k2.log`.
 
+---
+
+## 2026-08-23 — REJECT cuBLAS tensor-op math / GEMM algo for BF16 linear
+
+Tried `cublasSetMathMode(CUBLAS_TENSOR_OP_MATH)`: F32 linear tests failed
+(TF32 vs reference at ~1e-4). Reverted.
+
+Tried `CUBLAS_GEMM_DEFAULT_TENSOR_OP` on BF16 DiT linear
+(`H3_CUBLAS_TENSOR_ALGO=1`). fox-s2 denoise gpu-op linear **1.177 s → 1.156 s**
+(noise). Default `CUBLAS_GEMM_DEFAULT` stays. Logs:
+`/tmp/h3_perf_day8/fox-s2-linear-default.log`, `fox-s2-linear-tensor.log`.
+
