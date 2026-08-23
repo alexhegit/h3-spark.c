@@ -54,6 +54,11 @@ struct h3_gpu {
     size_t int8_accum_bytes;
     uint64_t int8_cublas_ok;
     uint64_t int8_naive_fallback;
+    h3_gpu_tensor *ws_mlp_fc1;
+    h3_gpu_tensor *ws_mlp_hidden;
+    h3_gpu_tensor *ws_qkv;
+    h3_gpu_tensor *ws_int8_fc1;
+    h3_gpu_tensor *ws_adaln;
 };
 
 enum {
@@ -62,6 +67,8 @@ enum {
     H3_GPU_OP_CONV = 2,
     H3_GPU_OP_EVENT_MAX = 4096
 };
+
+void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
 
 static double h3_gpu_now(void) {
     struct timespec time;
@@ -364,6 +371,13 @@ void h3_gpu_free(h3_gpu *gpu) {
     h3_gpu_profile_emit(gpu, "total", &gpu->profile_start_stats,
                         gpu->profile_start_wall);
     h3_gpu_op_events_destroy(gpu);
+    h3_gpu_tensor_free(gpu->ws_mlp_fc1);
+    h3_gpu_tensor_free(gpu->ws_mlp_hidden);
+    h3_gpu_tensor_free(gpu->ws_qkv);
+    h3_gpu_tensor_free(gpu->ws_int8_fc1);
+    h3_gpu_tensor_free(gpu->ws_adaln);
+    gpu->ws_mlp_fc1 = gpu->ws_mlp_hidden = gpu->ws_qkv = NULL;
+    gpu->ws_int8_fc1 = gpu->ws_adaln = NULL;
     if (gpu->int8_accum) cudaFree(gpu->int8_accum);
     for (int i = 0; i < 2; i++) {
         if (gpu->stage_event_recorded[i] && gpu->stage_copied[i])
@@ -403,6 +417,25 @@ h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements) {
 
 h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements) {
     return h3_tensor_alloc(gpu, elements, H3_GPU_I8);
+}
+
+static int h3_gpu_workspace_disabled(void) {
+    return h3_env_on("H3_DISABLE_GPU_WORKSPACE");
+}
+
+static h3_gpu_tensor *h3_gpu_workspace_bf16(h3_gpu *gpu, h3_gpu_tensor **slot,
+                                            size_t elements) {
+    if (!gpu || !slot || !elements) return NULL;
+    if (h3_gpu_workspace_disabled())
+        return h3_gpu_tensor_new_bf16(gpu, elements);
+    if (*slot && (*slot)->elements >= elements) return *slot;
+    h3_gpu_tensor_free(*slot);
+    *slot = h3_gpu_tensor_new_bf16(gpu, elements);
+    return *slot;
+}
+
+static void h3_gpu_workspace_release(h3_gpu_tensor *tensor) {
+    if (h3_gpu_workspace_disabled()) h3_gpu_tensor_free(tensor);
 }
 
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor) {
@@ -1484,11 +1517,13 @@ int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         !input_dim || !hidden_dim || !output_dim)
         return h3_gpu_fail(gpu, "invalid MLP request");
 
-    h3_gpu_tensor *fc1 = h3_gpu_tensor_new_bf16(gpu, fc1_count);
-    h3_gpu_tensor *hidden = h3_gpu_tensor_new_bf16(gpu, hidden_count);
+    h3_gpu_tensor *fc1 =
+        h3_gpu_workspace_bf16(gpu, &gpu->ws_mlp_fc1, fc1_count);
+    h3_gpu_tensor *hidden =
+        h3_gpu_workspace_bf16(gpu, &gpu->ws_mlp_hidden, hidden_count);
     if (!fc1 || !hidden) {
-        h3_gpu_tensor_free(fc1);
-        h3_gpu_tensor_free(hidden);
+        h3_gpu_workspace_release(fc1);
+        h3_gpu_workspace_release(hidden);
         return h3_gpu_fail(gpu, "MLP temp tensor allocation failed");
     }
 
@@ -1497,8 +1532,8 @@ int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
              h3_gpu_swiglu_bf16(gpu, hidden, fc1, rows, hidden_dim) &&
              h3_gpu_linear_bf16(gpu, output, hidden, fc2_weight, NULL, rows,
                                 hidden_dim, output_dim);
-    h3_gpu_tensor_free(fc1);
-    h3_gpu_tensor_free(hidden);
+    h3_gpu_workspace_release(fc1);
+    h3_gpu_workspace_release(hidden);
     return ok;
 }
 
@@ -5872,8 +5907,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     if (input_is_quantized && !int8_fc1)
         return h3_gpu_fail(gpu, "prequantized MLP input requires int8 FC1");
 
-    h3_gpu_tensor *fc1_fused =
-        h3_gpu_tensor_new_bf16(gpu, (size_t)rows * hidden_dim * 2u);
+    h3_gpu_tensor *fc1_fused = h3_gpu_workspace_bf16(
+        gpu, &gpu->ws_int8_fc1, (size_t)rows * hidden_dim * 2u);
     if (!fc1_fused) return h3_gpu_fail(gpu, "INT8 MLP FC1 temp alloc failed");
 
     int ok = 1;
@@ -5928,7 +5963,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         ok = 0;
     }
 
-    h3_gpu_tensor_free(fc1_fused);
+    h3_gpu_workspace_release(fc1_fused);
     return ok;
 }
 
@@ -5948,7 +5983,8 @@ int h3_gpu_gate_adaln_quantize_int8(
         gate_slot >= slots || shift_slot >= slots || scale_slot >= slots)
         return h3_gpu_fail(gpu, "invalid gate AdaLN quantize request");
 
-    h3_gpu_tensor *adaln = h3_gpu_tensor_new_bf16(gpu, elements);
+    h3_gpu_tensor *adaln =
+        h3_gpu_workspace_bf16(gpu, &gpu->ws_adaln, elements);
     if (!adaln) return h3_gpu_fail(gpu, "gate AdaLN quantize temp alloc failed");
     int ok =
         h3_gpu_gate_adaln_bf16(gpu, gated_residual, adaln, residual, branch,
@@ -5957,7 +5993,7 @@ int h3_gpu_gate_adaln_quantize_int8(
                                shift_slot, scale_slot, epsilon) &&
         h3_gpu_quantize_bf16_int8_rows(gpu, quantized_output, quantized_scales,
                                        adaln, rows, padded_rows, width, 1.0f);
-    h3_gpu_tensor_free(adaln);
+    h3_gpu_workspace_release(adaln);
     return ok;
 }
 
@@ -6008,8 +6044,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                         1.0f))
         return 0;
 
-    h3_gpu_tensor *qkv =
-        h3_gpu_tensor_new_bf16(gpu, (size_t)rows * inner * 3u);
+    h3_gpu_tensor *qkv = h3_gpu_workspace_bf16(
+        gpu, &gpu->ws_qkv, (size_t)rows * inner * 3u);
     if (!qkv) return h3_gpu_fail(gpu, "INT8 QKV temp alloc failed");
     h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
     int ok = h3_gpu_linear_int8_bf16_impl(
@@ -6020,7 +6056,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
         h3_gpu_qkv_rope_bf16_layout(gpu, query, key, value, qkv, q_norm,
                                     k_norm, rope_cos, rope_sin, rows, heads,
                                     head_dim, rope_half, 1u, epsilon);
-    h3_gpu_tensor_free(qkv);
+    h3_gpu_workspace_release(qkv);
     return ok;
 }
 

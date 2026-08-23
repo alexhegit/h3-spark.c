@@ -508,3 +508,34 @@ noise (**1.63 / 1.68 s** vs pipelined K2 **1.69 / 1.70 s**). fox-fast denoise
 `__launch_bounds__(32)`. Logs: `/tmp/h3_perf_day8/fox-s2-q8lb8.log`,
 `fox-s2-q8lb8-b.log`, `fox-fast-q8lb8.log`.
 
+---
+
+## 2026-08-24 — DiT persistent MLP/QKV workspace
+
+**KEEP** caching BF16 temps used by fused MLP, INT8 QKV, INT8 MLP FC1, and
+gate-AdaLN quantize. Those paths called `cudaMalloc`/`cudaFree` every DiT
+block (stream sync). Opt out with `H3_DISABLE_GPU_WORKSPACE=1`.
+
+fox-s2 (steps 2 / L35 / reuse 1), contemporaneous A/B (two warm runs):
+
+| Metric | per-block alloc | **workspace** |
+|--------|----------------:|--------------:|
+| GPU Euler denoise | 3.51 / 3.62 s | **3.11 / 3.14 s** |
+| denoise gpu-op sdpa | 1.65 / 1.68 s | 1.71 / 1.72 s |
+| denoise gpu-op linear | 1.14 / 1.15 s | 1.12 / 1.14 s |
+| denoise alloc | 17.0 GiB | **0.24 GiB** |
+
+fox-fast (steps 20 / L45 / reuse 2):
+
+| Metric | Q8 pipe | **workspace** |
+|--------|--------:|--------------:|
+| GPU Euler denoise | 25.2 s | **22.0 s** |
+| denoise gpu-op sdpa | 11.9 s | 12.2 s |
+| denoise gpu-op linear | 7.92 s | 7.87 s |
+
+Kernel gpu-op times are unchanged; denoise wall dropped because malloc no
+longer stalls the stream. Remaining fox-fast denoise is SDPA 12.2 + linear
+7.9 of 22.0 s (~1.32× vs Metal ~16.7 s). Logs:
+`/tmp/h3_perf_day8/fox-s2-ws-off-ab1.log`, `fox-s2-ws-on-ab1.log`,
+`fox-fast-q8pipe.log`, `fox-fast-ws.log`.
+
