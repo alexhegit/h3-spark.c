@@ -557,3 +557,12 @@ serial `h3_warp_reduce_sum`. fox-s2 denoise sdpa **1.85 / 1.87 s** (serial)
 vs **1.95 / 1.85 s** (paired); denoise wall **3.27 / 3.33 s** vs
 **3.52 / 3.29 s**. Reverted. Logs: `/tmp/h3_perf_day8/fox-s2-serial-ab1.log`,
 `fox-s2-pair-ab1.log`.
+
+---
+
+## 2026-08-24 — REJECT persistent cuBLAS workspace
+
+`cublasSetWorkspace` with 128 MiB did not drop fox-s2 denoise (off
+**3.12 / 3.13 s**, linear **1.14 / 1.15 s**; on **3.26 / 3.15 s**, linear
+**1.22 / 1.15 s**). Reverted. Logs:
+`/tmp/h3_perf_day8/fox-s2-cublasws-off-ab1.log`, `fox-s2-cublasws-on-ab1.log`.
