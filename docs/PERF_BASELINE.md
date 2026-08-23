@@ -584,3 +584,13 @@ Four-wide SwiGLU with `__expf`/`__frcp_rn` did not beat scalar `expf`.
 fox-s2 denoise **3.15 / 3.11 s** (scalar) vs **3.13 / 3.12 s** (vec4).
 Reverted. Logs: `/tmp/h3_perf_day8/fox-s2-swiglu-scalar-ab1.log`,
 `fox-s2-swiglu-vec4-ab1.log`.
+
+---
+
+## 2026-08-24 — REJECT Q8 K/V streaming loads (ld.global.cs)
+
+`ld.global.cs` for pipelined K/V did not beat `__ldg`. fox-s2 denoise
+**3.31 / 3.27 s** (`__ldg`) vs **3.31 / 3.31 s** (cs); sdpa **1.86 / 1.85 s**
+vs **1.88 / 1.86 s**. The dual-path kernel also inflated both vs the
+single-`__ldg` baseline (~1.70 s sdpa). Reverted. Logs:
+`/tmp/h3_perf_day8/fox-s2-q8-ldg-ab1.log`, `fox-s2-q8-ldcs-ab1.log`.
