@@ -403,3 +403,13 @@ fox-fast (steps 20 / L45 / reuse 2):
 Denoise SDPA **~1.31–1.34×**. Remaining fox-fast denoise is SDPA 14.0 + linear
 7.9 of 27.3 s. Logs: `/tmp/h3_perf_day8/fox-s2-q4.log`, `fox-s2-q8.log`,
 `fox-fast-sdpa-q8.log`, `fox-fast-sdpa-q4.log`.
+
+---
+
+## 2026-08-23 — REJECT d128 wave SDPA Q16
+
+Tried sharing K/V across 16 queries (`H3_SDPA_D128_Q16=1`). fox-s2 denoise
+gpu-op sdpa **1.93 s → 5.01 s** (denoise 3.86 s → 6.94 s). Register spill
+dominates; Q8 stays default. Kernel not landed. Log:
+`/tmp/h3_perf_day8/fox-s2-q8.log`, `fox-s2-q16.log`.
+
