@@ -372,3 +372,34 @@ VAE wall **~1.85–1.91×**. Remaining fox-fast VAE (~9 s) is mostly GPU
 (linear 3.7 + sdpa 3.6). Remaining fox-fast denoise is still mostly SDPA
 (18.4 / 31.8). Logs: `/tmp/h3_perf_day8/fox-s2-prefetch-read.log`,
 `fox-s2-noprefetch-read.log`, `fox-fast-prefetch.log`, `fox-fast-noprefetch.log`.
+
+---
+
+## 2026-08-23 — DiT d128 wave SDPA Q8
+
+**KEEP** d128 wave SDPA Q8 as default (eight queries share each K/V load).
+Opt-out `H3_SDPA_D128_Q4=1` (previous Q4), `H3_SDPA_D128_Q2=1`, or
+`H3_SDPA_D128_Q1=1`. `readahead`-style GEMM SDPA is still rejected.
+
+`h3_cuda_ops` and DiT block smoke passed.
+
+fox-s2 (steps 2 / L35 / reuse 1):
+
+| Metric | Q4 | **Q8** |
+|--------|---:|-------:|
+| GPU Euler denoise | 4.47 s | **3.82 s** |
+| denoise gpu-op sdpa | 2.57 s | **1.91 s** |
+| denoise gpu-op linear | 1.14 s | 1.13 s |
+
+fox-fast (steps 20 / L45 / reuse 2):
+
+| Metric | Q4 | **Q8** |
+|--------|---:|-------:|
+| GPU Euler denoise | 31.7 s | **27.3 s** |
+| denoise gpu-op sdpa | 18.4 s | **14.0 s** |
+| denoise gpu-op linear | 7.87 s | 7.92 s |
+| video VAE decoder | 9.2 s | 9.1 s |
+
+Denoise SDPA **~1.31–1.34×**. Remaining fox-fast denoise is SDPA 14.0 + linear
+7.9 of 27.3 s. Logs: `/tmp/h3_perf_day8/fox-s2-q4.log`, `fox-s2-q8.log`,
+`fox-fast-sdpa-q8.log`, `fox-fast-sdpa-q4.log`.
