@@ -413,3 +413,31 @@ gpu-op sdpa **1.93 s → 5.01 s** (denoise 3.86 s → 6.94 s). Register spill
 dominates; Q8 stays default. Kernel not landed. Log:
 `/tmp/h3_perf_day8/fox-s2-q8.log`, `fox-s2-q16.log`.
 
+---
+
+## 2026-08-23 — DiT Q8 SDPA K-unroll 2
+
+**KEEP** Q8 wave SDPA consuming two K/V positions per inner iteration (loads
+overlapped before the online-softmax update). Partial Q tiles still walk K
+one-by-one.
+
+fox-s2 (steps 2 / L35 / reuse 1):
+
+| Metric | Q8 | **Q8 K2** |
+|--------|---:|----------:|
+| GPU Euler denoise | 3.86 s | **3.67 s** |
+| denoise gpu-op sdpa | 1.93 s | **1.74 s** |
+| denoise gpu-op linear | 1.17 s | 1.15 s |
+
+fox-fast (steps 20 / L45 / reuse 2):
+
+| Metric | Q8 | **Q8 K2** |
+|--------|---:|----------:|
+| GPU Euler denoise | 27.3 s | **26.9 s** |
+| denoise gpu-op sdpa | 14.0 s | **13.0 s** |
+| denoise gpu-op linear | 7.92 s | 8.01 s |
+
+Denoise SDPA **~1.07–1.10×**. Remaining fox-fast denoise is SDPA 13.0 + linear
+8.0 of 26.9 s. Logs: `/tmp/h3_perf_day8/fox-s2-q8k2.log`,
+`fox-fast-q8k2.log`.
+

@@ -2314,15 +2314,8 @@ h3_sdpa_bf16_wave_d128_q8_kernel(const uint16_t *query, const uint16_t *key,
     uint32_t k_base = args.kv_head_major ? head * args.sequence * 128u
                                          : head * 128u;
     if (q_live == 8u) {
-        for (uint32_t k_pos = 0; k_pos < args.sequence; k_pos++) {
-            float k0 = h3_ldg_bf16(key + k_base + lane);
-            float k1 = h3_ldg_bf16(key + k_base + 32u + lane);
-            float k2 = h3_ldg_bf16(key + k_base + 64u + lane);
-            float k3 = h3_ldg_bf16(key + k_base + 96u + lane);
-            float v0 = h3_ldg_bf16(value + k_base + lane);
-            float v1 = h3_ldg_bf16(value + k_base + 32u + lane);
-            float v2 = h3_ldg_bf16(value + k_base + 64u + lane);
-            float v3 = h3_ldg_bf16(value + k_base + 96u + lane);
+        auto consume = [&](float k0, float k1, float k2, float k3, float v0,
+                           float v1, float v2, float v3) {
 #pragma unroll
             for (int qi = 0; qi < 8; qi++) {
                 float score = h3_warp_reduce_sum(
@@ -2338,7 +2331,39 @@ h3_sdpa_bf16_wave_d128_q8_kernel(const uint16_t *query, const uint16_t *key,
                 sum[qi] = fmaf(sum[qi], alpha, p);
                 maximum[qi] = new_max;
             }
-            k_base += stride;
+        };
+        uint32_t k_pos = 0;
+        for (; k_pos + 1u < args.sequence; k_pos += 2u) {
+            float a0 = h3_ldg_bf16(key + k_base + lane);
+            float a1 = h3_ldg_bf16(key + k_base + 32u + lane);
+            float a2 = h3_ldg_bf16(key + k_base + 64u + lane);
+            float a3 = h3_ldg_bf16(key + k_base + 96u + lane);
+            float av0 = h3_ldg_bf16(value + k_base + lane);
+            float av1 = h3_ldg_bf16(value + k_base + 32u + lane);
+            float av2 = h3_ldg_bf16(value + k_base + 64u + lane);
+            float av3 = h3_ldg_bf16(value + k_base + 96u + lane);
+            uint32_t k_next = k_base + stride;
+            float b0 = h3_ldg_bf16(key + k_next + lane);
+            float b1 = h3_ldg_bf16(key + k_next + 32u + lane);
+            float b2 = h3_ldg_bf16(key + k_next + 64u + lane);
+            float b3 = h3_ldg_bf16(key + k_next + 96u + lane);
+            float bv0 = h3_ldg_bf16(value + k_next + lane);
+            float bv1 = h3_ldg_bf16(value + k_next + 32u + lane);
+            float bv2 = h3_ldg_bf16(value + k_next + 64u + lane);
+            float bv3 = h3_ldg_bf16(value + k_next + 96u + lane);
+            consume(a0, a1, a2, a3, av0, av1, av2, av3);
+            consume(b0, b1, b2, b3, bv0, bv1, bv2, bv3);
+            k_base += stride * 2u;
+        }
+        if (k_pos < args.sequence) {
+            consume(h3_ldg_bf16(key + k_base + lane),
+                    h3_ldg_bf16(key + k_base + 32u + lane),
+                    h3_ldg_bf16(key + k_base + 64u + lane),
+                    h3_ldg_bf16(key + k_base + 96u + lane),
+                    h3_ldg_bf16(value + k_base + lane),
+                    h3_ldg_bf16(value + k_base + 32u + lane),
+                    h3_ldg_bf16(value + k_base + 64u + lane),
+                    h3_ldg_bf16(value + k_base + 96u + lane));
         }
     } else {
         for (uint32_t k_pos = 0; k_pos < args.sequence; k_pos++) {
