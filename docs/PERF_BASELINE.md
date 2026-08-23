@@ -547,3 +547,13 @@ Two warps per block, 16 queries, K/V staged through shared memory. fox-s2
 denoise sdpa **1.67 / 1.74 s → 3.17 / 3.21 s** (denoise 3.06 / 3.18 s →
 4.54 / 4.62 s). Barrier + split K/V load is slower than pipelined Q8.
 Reverted. Logs: `/tmp/h3_perf_day8/fox-s2-q8-ab1.log`, `fox-s2-q8x2-ab1.log`.
+
+---
+
+## 2026-08-24 — REJECT Q8 paired warp-reduce
+
+Interleaving two query `__shfl_xor` reductions per K/V step did not beat
+serial `h3_warp_reduce_sum`. fox-s2 denoise sdpa **1.85 / 1.87 s** (serial)
+vs **1.95 / 1.85 s** (paired); denoise wall **3.27 / 3.33 s** vs
+**3.52 / 3.29 s**. Reverted. Logs: `/tmp/h3_perf_day8/fox-s2-serial-ab1.log`,
+`fox-s2-pair-ab1.log`.
