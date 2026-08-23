@@ -2332,39 +2332,32 @@ h3_sdpa_bf16_wave_d128_q8_kernel(const uint16_t *query, const uint16_t *key,
                 maximum[qi] = new_max;
             }
         };
-        uint32_t k_pos = 0;
-        for (; k_pos + 1u < args.sequence; k_pos += 2u) {
-            float a0 = h3_ldg_bf16(key + k_base + lane);
-            float a1 = h3_ldg_bf16(key + k_base + 32u + lane);
-            float a2 = h3_ldg_bf16(key + k_base + 64u + lane);
-            float a3 = h3_ldg_bf16(key + k_base + 96u + lane);
-            float av0 = h3_ldg_bf16(value + k_base + lane);
-            float av1 = h3_ldg_bf16(value + k_base + 32u + lane);
-            float av2 = h3_ldg_bf16(value + k_base + 64u + lane);
-            float av3 = h3_ldg_bf16(value + k_base + 96u + lane);
-            uint32_t k_next = k_base + stride;
-            float b0 = h3_ldg_bf16(key + k_next + lane);
-            float b1 = h3_ldg_bf16(key + k_next + 32u + lane);
-            float b2 = h3_ldg_bf16(key + k_next + 64u + lane);
-            float b3 = h3_ldg_bf16(key + k_next + 96u + lane);
-            float bv0 = h3_ldg_bf16(value + k_next + lane);
-            float bv1 = h3_ldg_bf16(value + k_next + 32u + lane);
-            float bv2 = h3_ldg_bf16(value + k_next + 64u + lane);
-            float bv3 = h3_ldg_bf16(value + k_next + 96u + lane);
-            consume(a0, a1, a2, a3, av0, av1, av2, av3);
-            consume(b0, b1, b2, b3, bv0, bv1, bv2, bv3);
-            k_base += stride * 2u;
+        /* Software-pipeline: load next K/V while consuming the current pair. */
+        auto load_kv = [&](uint32_t kb, float *k, float *v) {
+            k[0] = h3_ldg_bf16(key + kb + lane);
+            k[1] = h3_ldg_bf16(key + kb + 32u + lane);
+            k[2] = h3_ldg_bf16(key + kb + 64u + lane);
+            k[3] = h3_ldg_bf16(key + kb + 96u + lane);
+            v[0] = h3_ldg_bf16(value + kb + lane);
+            v[1] = h3_ldg_bf16(value + kb + 32u + lane);
+            v[2] = h3_ldg_bf16(value + kb + 64u + lane);
+            v[3] = h3_ldg_bf16(value + kb + 96u + lane);
+        };
+        float cur_k[4], cur_v[4], nxt_k[4], nxt_v[4];
+        load_kv(k_base, cur_k, cur_v);
+        for (uint32_t k_pos = 0; k_pos + 1u < args.sequence; k_pos++) {
+            load_kv(k_base + stride, nxt_k, nxt_v);
+            consume(cur_k[0], cur_k[1], cur_k[2], cur_k[3], cur_v[0], cur_v[1],
+                    cur_v[2], cur_v[3]);
+#pragma unroll
+            for (int d = 0; d < 4; d++) {
+                cur_k[d] = nxt_k[d];
+                cur_v[d] = nxt_v[d];
+            }
+            k_base += stride;
         }
-        if (k_pos < args.sequence) {
-            consume(h3_ldg_bf16(key + k_base + lane),
-                    h3_ldg_bf16(key + k_base + 32u + lane),
-                    h3_ldg_bf16(key + k_base + 64u + lane),
-                    h3_ldg_bf16(key + k_base + 96u + lane),
-                    h3_ldg_bf16(value + k_base + lane),
-                    h3_ldg_bf16(value + k_base + 32u + lane),
-                    h3_ldg_bf16(value + k_base + 64u + lane),
-                    h3_ldg_bf16(value + k_base + 96u + lane));
-        }
+        consume(cur_k[0], cur_k[1], cur_k[2], cur_k[3], cur_v[0], cur_v[1],
+                cur_v[2], cur_v[3]);
     } else {
         for (uint32_t k_pos = 0; k_pos < args.sequence; k_pos++) {
             float k0 = h3_ldg_bf16(key + k_base + lane);

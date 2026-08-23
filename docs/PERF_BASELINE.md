@@ -469,3 +469,32 @@ Ops still passed. fox-s2 denoise gpu-op linear **1.139 s → 1.186 s** (slightly
 slower). Stay on `CUBLAS_COMPUTE_32F`. Logs:
 `/tmp/h3_perf_day8/fox-s2-fast16bf-off.log`, `fox-s2-fast16bf-on.log`.
 
+---
+
+## 2026-08-23 — DiT Q8 SDPA software-pipelined K/V load
+
+**KEEP** overlapping the next K/V load with the current online-softmax
+update, instead of loading two positions then consuming both. Full Q8
+tiles only.
+
+fox-s2 (steps 2 / L35 / reuse 1), contemporaneous A/B (two warm runs):
+
+| Metric | Q8 K2 | **Q8 pipe** |
+|--------|------:|------------:|
+| GPU Euler denoise | 3.74 / 3.82 s | **3.64 / 3.66 s** |
+| denoise gpu-op sdpa | 1.77 / 1.82 s | **1.69 / 1.70 s** |
+| denoise gpu-op linear | 1.17 / 1.19 s | 1.16 / 1.15 s |
+
+fox-fast (steps 20 / L45 / reuse 2):
+
+| Metric | Q8 K2 | **Q8 pipe** |
+|--------|------:|------------:|
+| GPU Euler denoise | 26.9 s | **25.2 s** |
+| denoise gpu-op sdpa | 13.0 s | **11.9 s** |
+| denoise gpu-op linear | 8.01 s | 7.92 s |
+
+Denoise SDPA **~1.05–1.10×** vs K2. Remaining fox-fast denoise is SDPA 11.9 +
+linear 7.9 of 25.2 s (~1.51× vs Metal ~16.7 s). Logs:
+`/tmp/h3_perf_day8/fox-s2-k2-ab1.log`, `fox-s2-pipe-ab1.log`,
+`fox-fast-q8k2.log`, `fox-fast-q8pipe.log`.
+
