@@ -575,3 +575,12 @@ Keeping gated activations in registers and using a warp-shuffle block
 reduce did not beat the shared-memory cache. fox-s2 denoise **3.14 / 3.20 s**
 (smem) vs **3.23 / 3.16 s** (registers). Reverted. Logs:
 `/tmp/h3_perf_day8/fox-s2-adaln-smem-ab1.log`, `fox-s2-adaln-reg-ab1.log`.
+
+---
+
+## 2026-08-24 — REJECT vec4 SwiGLU
+
+Four-wide SwiGLU with `__expf`/`__frcp_rn` did not beat scalar `expf`.
+fox-s2 denoise **3.15 / 3.11 s** (scalar) vs **3.13 / 3.12 s** (vec4).
+Reverted. Logs: `/tmp/h3_perf_day8/fox-s2-swiglu-scalar-ab1.log`,
+`fox-s2-swiglu-vec4-ab1.log`.
