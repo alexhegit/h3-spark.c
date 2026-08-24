@@ -2927,12 +2927,10 @@ __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
         for (uint32_t j = 0; j < 8u; j++) {
 #pragma unroll
             for (uint32_t e = 0; e < 2u; e++) {
-                float p_a = score[j][e] == -INFINITY
-                                ? 0.0f
-                                : __expf(score[j][e] - new_max_a);
-                float p_b = score[j][e + 2u] == -INFINITY
-                                ? 0.0f
-                                : __expf(score[j][e + 2u] - new_max_b);
+                /* Masked columns hold -inf, and expf(-inf - max) is already 0,
+                 * so the comparison the obvious version needs is free. */
+                float p_a = __expf(score[j][e] - new_max_a);
+                float p_b = __expf(score[j][e + 2u] - new_max_b);
                 score[j][e] = p_a;
                 score[j][e + 2u] = p_b;
                 tile_sum_a += p_a;
@@ -2948,12 +2946,17 @@ __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
         sum_b = sum_b * alpha_b + tile_sum_b;
         max_a = new_max_a;
         max_b = new_max_b;
+        /* After the first few tiles the running max rarely moves, so the 64
+         * accumulator rescales per tile are usually a no-op. Skipping them
+         * needs a warp-uniform decision, hence the vote. */
+        if (__any_sync(0xffffffffu, alpha_a != 1.0f || alpha_b != 1.0f)) {
 #pragma unroll
-        for (uint32_t dt = 0; dt < 16u; dt++) {
-            out_acc[dt][0] *= alpha_a;
-            out_acc[dt][1] *= alpha_a;
-            out_acc[dt][2] *= alpha_b;
-            out_acc[dt][3] *= alpha_b;
+            for (uint32_t dt = 0; dt < 16u; dt++) {
+                out_acc[dt][0] *= alpha_a;
+                out_acc[dt][1] *= alpha_a;
+                out_acc[dt][2] *= alpha_b;
+                out_acc[dt][3] *= alpha_b;
+            }
         }
 
         /* O += P V. P is already in A-fragment order. */

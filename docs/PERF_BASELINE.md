@@ -1550,3 +1550,36 @@ smokes), `h3_cuda_dit_forward_smoke` with unchanged hashes, and
 audio and silent paths, 5m20s). Logs: `/tmp/h3_perf_day12/conditional.log`,
 `ssd.log`, `ssd-ser.log`, `f32_bench.cu`.
 ---
+
+## 2026-08-25 — KEEP a cheaper online softmax, REJECT a transposed V tile
+
+Two attempts at the DiT's attention kernel, which sits at 31 TFLOP/s of a
+~98 TFLOP/s BF16 peak.
+
+**Rejected: storing the V tile transposed.** A B fragment for P·V needs two
+keys at one dimension, which the row-major tile serves as four 16-bit shared
+reads plus shifts. Dimension-major (pitch 72 halves, so a quad-group's eight
+columns cover all 32 banks) makes it two aligned 32-bit reads. It is 82% slower:
+attention 1.62 s → 2.95 s, denoise 8.80 s → 10.0 s. Transposing moves the cost
+to the store side — each thread then writes one dimension's key pair, whose
+addresses collide four ways — and the read side was evidently not the
+constraint: two lanes reading different halves of one word broadcast rather than
+conflict, so the "half the banks" reasoning that motivated this was wrong.
+
+**Kept: two cheap softmax edits.** Masked columns hold −inf and `expf(-inf)` is
+already 0, so the per-element comparison guarding the exponential is
+unnecessary; and after the first few key tiles the running row max rarely moves,
+so the 64 accumulator rescales per tile are usually multiplication by 1 and can
+be skipped behind a warp vote. Interleaved fox-fast, two pairs:
+
+| Run | Baseline attention | **With both** |
+|-----|-------------------:|--------------:|
+| ab1 | 1.599 s | **1.538 s** |
+| ab2 | 1.592 s | **1.534 s** |
+
+3.8% off the kernel, accuracy unchanged (relL2 0.00239 at sequence 1874, worst
+absolute error 0.00037 at sequence 200). The denoise wall does not move by a
+measurable amount — 0.06 s is inside its run-to-run spread — so this is banked
+as reduced GPU work rather than as a wall-clock win. Logs:
+`/tmp/h3_perf_day12/ab-{base,soft}-{1,2}.log`, `vt-{1,2}.log`.
+---
