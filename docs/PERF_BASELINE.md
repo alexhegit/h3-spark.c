@@ -889,4 +889,19 @@ two-wide column ILP and vec4. fox-s2 interleaved `H3_SWIGLU_X4ROW=1`:
 
 Leftover denoise − sdpa − linear unchanged. Wall tracks SDPA noise. Reverted.
 Logs: `/tmp/h3_perf_day9/fox-s2-x4row-ab1.log`, `fox-s2-swiglu-ab1.log`.
+---
+
+## 2026-08-24 — REJECT smem-tiled INT8 scale epilogue
+
+Separate kernel: one column-tile block, weight scales in smem, loop over rows.
+Distinct from REJECT 2D grid and vec4 1D. fox-s2 interleaved
+`H3_INT8_SCALE_SMEM=1`:
+
+| Run | 1D scalar | **Smem tile** |
+|-----|----------:|--------------:|
+| ab1 | 3.066 s (linear 1.149, sdpa 1.752) | 3.042 s (linear 1.200, sdpa 1.678) |
+| ab2 | 2.955 s (linear 1.106, sdpa 1.687) | 3.096 s (linear 1.221, sdpa 1.712) |
+
+Linear is slower (row-strided accum). Wall does not drop. Reverted. Logs:
+`/tmp/h3_perf_day9/fox-s2-smem-ab1.log`, `fox-s2-scale-ab1.log`.
 
