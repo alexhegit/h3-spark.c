@@ -1496,3 +1496,57 @@ choice at the same time: BF16 denoise linear is 8.19 s against INT8's 5.31 s.
 Logs: `/tmp/h3_perf_day12/stage-{64,128,256}.log`, `pw-{0,18}.log`,
 `pwf-{0,16}.log`, `mlp-{i8,bf16}.log`, `int8_bench.cu`.
 ---
+
+## 2026-08-25 — state of play after the load and VAE work
+
+fox-fast (`512² / 22f / steps=20 / L45 / reuse=2`), one clean run per column:
+
+| Stage | 2026-08-24 evening | **Now** | Δ |
+|-------|-------------------:|--------:|--:|
+| text encoder | 13.27 s | **4.52 s** | −2.9× |
+| DiT load | 22.33 s | **5.45 s** | −4.1× |
+| DiT denoise | 8.80 s | **8.80 s** | — |
+| audio VAE | 0.95 s | **1.15 s** | — |
+| video VAE | 9.10 s | **5.37 s** | −1.7× |
+| **e2e wall** | **56.3 s** | **26.8 s** | **−2.1×** |
+
+Where the remaining 26.8 s goes, and what is left in each:
+
+- **denoise 8.80 s.** INT8 GEMM 4.96 s at 143 TFLOP/s, i.e. 89% of this chip's
+  INT8 ceiling — done. Attention 1.60 s at 31 TFLOP/s of a ~98 TFLOP/s BF16
+  peak, the largest single remaining headroom. The other ~2.2 s is the
+  memory-bound glue between GEMMs (int32→scale→BF16 0.74 s, fused
+  SwiGLU-quantize 0.54 s, QKV RoPE 0.36 s, gate/AdaLN quantize 0.35 s), all of
+  it running at DRAM bandwidth; the only way down is fusing consumers, worth
+  about 0.3 s for the RoPE pair and less for the others.
+- **video VAE 5.37 s.** 3.6 s of it is FP32 GEMM, which cuBLAS runs at
+  **10–14 TFLOP/s** (measured across the five shapes). TF32 reaches 25–39
+  TFLOP/s but was rejected on output noise, and both BF16x9 emulation and a
+  hand-split FP16 GEMM land back at ~13 TFLOP/s effective because three 16-bit
+  products cost what one FP32 product does. The checkpoint itself is F32, so
+  dropping precision here is not free.
+- **DiT load 5.45 s + text encoder 4.52 s.** Now genuinely I/O bound: the run
+  reads 58 GB (`/usr/bin/time -v`, File system inputs 113,553,992 blocks) at an
+  effective 5.8 GB/s across the loading stages. Reading fewer bytes — caching
+  quantized INT8 weights on disk — is the only lever left, and that is a
+  behaviour change, not a tuning change.
+
+The parallel reads matter most where reads are on the critical path. With
+`--ssd-streaming`, which fetches each BF16 layer during denoise instead of
+resident INT8:
+
+| fox-s2 `--ssd-streaming` | denoise wall |
+|--------------------------|-------------:|
+| 12 readers | **12.85 s** |
+| 1 reader | 71.23 s |
+
+That is 5.5× on the streaming path, versus 1.9× on the resident path, because
+streaming has nothing else to hide the read behind.
+
+Verified on this tree: `make -f Makefile.linux test` (unit, ops, and the DiT
+block, text, vision, video VAE, audio VAE, video encoder and audio encoder
+smokes), `h3_cuda_dit_forward_smoke` with unchanged hashes, and
+`make -f Makefile.linux test-conditional` (FL2VA first/last plus Ref2VA image,
+audio and silent paths, 5m20s). Logs: `/tmp/h3_perf_day12/conditional.log`,
+`ssd.log`, `ssd-ser.log`, `f32_bench.cu`.
+---
