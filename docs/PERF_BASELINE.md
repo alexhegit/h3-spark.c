@@ -804,4 +804,19 @@ Leftover rose ~10 ms (int32 branch reads are heavier than BF16). Wall is a
 tie inside SDPA noise. Same failure mode as fused INT8 QKV scale+RoPE.
 Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-attn-adaln-ab1.log`,
 `fox-s2-attn-base-ab1.log`.
+---
+
+## 2026-08-24 — REJECT head-major QKV for wave SDPA
+
+RoPE storing Q/K/V as `[heads, seq, 128]` so Q8 SDPA walks K/V with 256 B
+stride instead of `heads*256` (14 KiB). Distinct from L2 prefetch.
+fox-s2 interleaved (`H3_SDPA_HEAD_MAJOR_QKV=1`):
+
+| Run | Token-major | **Head-major QKV** |
+|-----|------------:|-------------------:|
+| ab1 | 3.044 s (sdpa 1.706, linear 1.168) | 3.022 s (sdpa 1.684, linear 1.173) |
+| ab2 | 3.025 s (sdpa 1.709, linear 1.148) | 3.025 s (sdpa 1.673, linear 1.185) |
+
+SDPA ~25–35 ms faster both pairs; denoise wall tied (linear noise). Reverted.
+Logs: `/tmp/h3_perf_day9/fox-s2-hm-ab1.log`, `fox-s2-hm-base-ab1.log`.
 
