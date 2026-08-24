@@ -33,6 +33,10 @@ h3_cuda_dit_block_smoke
 h3_cuda_text_smoke
 h3_cuda_vision_smoke
 h3_cuda_dit_forward_smoke
+h3_cuda_video_vae_smoke
+h3_cuda_audio_vae_smoke
+h3_cuda_video_encoder_smoke
+h3_cuda_audio_encoder_smoke
 tokenizer_smoke
 tokenizer_test
 libh3_cuda.a
