@@ -990,3 +990,20 @@ Separate Q8 kernel: K/V via `__ldcg` (cache-global). Distinct from
 No denoise wall drop; ab2 SDPA slower. Reverted. Logs:
 `/tmp/h3_perf_day9/fox-s2-q8-ldcg-ab1.log`, `fox-s2-q8-ldg-ab1.log`.
 ---
+
+## 2026-08-24 — REJECT Q8 lane-packed QKV
+
+Separate RoPE store + Q8 kernel: Q/K/V as `[seq, heads, 32, 4]` so each
+lane's 4 chunks are contiguous (`uint32` pairs), not 64 B apart. Distinct
+from head-major (which kept dim 0..127 contiguous). fox-s2 interleaved
+`H3_SDPA_LANE_PACK=1`. DiT block smoke passed.
+
+| Run | Token-major Q8 | **Lane-pack** |
+|-----|---------------:|--------------:|
+| ab1 | 3.067 s (sdpa 1.729, linear 1.170) | 2.857 s (sdpa 1.555, linear 1.136) |
+| ab2 | 2.982 s (sdpa 1.687, linear 1.128) | 3.082 s (sdpa 1.651, linear 1.259) |
+
+SDPA is faster both pairs (~36–174 ms). Denoise wall is mixed (ab2 linear
+noise +131 ms). Same KEEP failure as head-major. Reverted. Logs:
+`/tmp/h3_perf_day9/fox-s2-lanepack-ab1.log`, `fox-s2-lanepack-base-ab1.log`.
+---
