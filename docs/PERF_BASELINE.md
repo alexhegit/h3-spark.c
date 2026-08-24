@@ -786,4 +786,22 @@ A separate Q8 kernel issuing `prefetch.global.L2` on K/V two/three steps ahead
 
 Not the rejected depth-2 register pipe; still a net loss. Reverted. Logs:
 `/tmp/h3_perf_day9/fox-s2-q8-l2pre-ab1.log`, `fox-s2-q8-base-ab1.log`.
+---
+
+## 2026-08-24 — REJECT fused INT8 attn-out scales into MLP AdaLN
+
+Leaving INT8 attention-out GEMM in int32 accum and folding
+`accum * input_scale * weight_scale` into the BF16 MLP AdaLN kernel skipped
+70 apply-scale launches (796 → 726) but did not drop fox-s2 denoise wall.
+Interleaved A/B (`H3_INT8_ATTN_ADALN=1`):
+
+| Run | Default | **Fused accum AdaLN** |
+|-----|--------:|----------------------:|
+| ab1 | 3.145 s (sdpa 1.780, linear 1.199, leftover 0.166) | 3.059 s (sdpa 1.730, linear 1.153, leftover 0.176) |
+| ab2 | 2.960 s (sdpa 1.685, linear 1.111, leftover 0.164) | 3.025 s (sdpa 1.720, linear 1.132, leftover 0.173) |
+
+Leftover rose ~10 ms (int32 branch reads are heavier than BF16). Wall is a
+tie inside SDPA noise. Same failure mode as fused INT8 QKV scale+RoPE.
+Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-attn-adaln-ab1.log`,
+`fox-s2-attn-base-ab1.log`.
 
