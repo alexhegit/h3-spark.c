@@ -24,6 +24,7 @@ struct h3_gpu_tensor {
     size_t elements;
     size_t bytes;
     h3_gpu_dtype dtype;
+    int pooled;
 };
 
 struct h3_gpu {
@@ -40,6 +41,7 @@ struct h3_gpu {
     int device;
     int fast_path;
     int tensor_fast_path;
+    int pool_alloc;
     char error[512];
     char profile_label[128];
     h3_gpu_stats stats;
@@ -286,7 +288,17 @@ static h3_gpu_tensor *h3_tensor_alloc(h3_gpu *gpu, size_t elements,
         h3_gpu_fail(gpu, "out of memory allocating tensor handle");
         return NULL;
     }
-    cudaError_t status = cudaMalloc(&tensor->device, bytes);
+    /* The stream-ordered allocator recycles blocks out of a pool instead of
+     * asking the driver to map fresh pages, which is what the weight loader's
+     * thousands of same-shaped staging buffers want: cudaMalloc was averaging
+     * 2.4 ms a call there. */
+    cudaError_t status;
+    if (gpu->pool_alloc && gpu->stream) {
+        status = cudaMallocAsync(&tensor->device, bytes, gpu->stream);
+        if (status == cudaSuccess) tensor->pooled = 1;
+    } else {
+        status = cudaMalloc(&tensor->device, bytes);
+    }
     if (status != cudaSuccess) {
         free(tensor);
         h3_gpu_fail(gpu, "cudaMalloc failed: %s", cudaGetErrorString(status));
@@ -356,6 +368,18 @@ h3_gpu *h3_gpu_create(const char *shader_source_path, char *error,
     if (cudaGetDeviceProperties(&props, 0) == cudaSuccess) {
         gpu->fast_path = props.major >= 12 ? 1 : 0;
         gpu->tensor_fast_path = gpu->fast_path;
+    }
+    /* Keep freed pool blocks resident so the loader's repeated shapes are
+     * satisfied from the pool. Opt out with H3_GPU_SYNC_ALLOC=1. */
+    if (!h3_env_on("H3_GPU_SYNC_ALLOC")) {
+        cudaMemPool_t pool = NULL;
+        if (cudaDeviceGetDefaultMemPool(&pool, gpu->device) == cudaSuccess &&
+            pool) {
+            uint64_t threshold = (uint64_t)24 << 30;
+            cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold,
+                                    &threshold);
+            gpu->pool_alloc = 1;
+        }
     }
     gpu->error[0] = '\0';
     snprintf(gpu->profile_label, sizeof(gpu->profile_label), "%s",
@@ -444,7 +468,12 @@ void h3_gpu_tensor_free(h3_gpu_tensor *tensor) {
     if (tensor->owner) {
         tensor->owner->stats.live_bytes -= tensor->bytes;
     }
-    if (tensor->device) cudaFree(tensor->device);
+    if (tensor->device) {
+        if (tensor->pooled && tensor->owner && tensor->owner->stream)
+            cudaFreeAsync(tensor->device, tensor->owner->stream);
+        else
+            cudaFree(tensor->device);
+    }
     free(tensor);
 }
 
@@ -629,6 +658,12 @@ static int h3_gpu_ensure_stage(h3_gpu *gpu, size_t bytes) {
     if (gpu->stage_host[0] && gpu->stage_host[1] &&
         gpu->stage_host_bytes >= bytes)
         return 1;
+    /* cudaMallocHost costs 100 ms for a few hundred MB and cudaFreeHost about
+     * half that, so growing the staging pair tensor by tensor was spending
+     * seconds inside the driver. Round up hard and grow rarely. */
+    size_t granularity = (size_t)256 << 20;
+    if (bytes < granularity) bytes = granularity;
+    else bytes = (bytes + granularity - 1) & ~(granularity - 1);
     for (int i = 0; i < 2; i++) {
         if (gpu->stage_event_recorded[i] && gpu->stage_copied[i])
             cudaEventSynchronize(gpu->stage_copied[i]);
@@ -1337,7 +1372,10 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     float beta = 0.0f;
     /* TF32 keeps FP32 range with a 10-bit mantissa and runs on the tensor
      * cores. It is worth its precision only where the GEMM is big enough to be
-     * MMA-bound, so the small shapes stay exact FP32. */
+     * MMA-bound, so the small shapes stay exact FP32. BF16x9 emulation
+     * (CUBLAS_COMPUTE_32F_EMULATED_16BFX9) was measured here and is a wash:
+     * nine BF16 products at 98 TFLOP/s is no faster than FP32's own 31, so
+     * cuBLAS declines the emulation and the wall time does not move. */
     cublasComputeType_t compute =
         (input_dim >= 512u && output_dim >= 512u && rows >= 512u &&
          h3_env_on("H3_F32_TF32"))

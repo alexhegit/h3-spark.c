@@ -1399,3 +1399,54 @@ limit, and the accumulator is 32 registers instead of the d128 kernel's 64.
 Logs: `/tmp/h3_perf_day12/fox-fast-{vmma,vwave,vaemma}.log`,
 `split-{qk,full}.log`.
 ---
+
+## 2026-08-25 — KEEP pooled device allocation and a coarse staging buffer
+
+With the reads parallelized, an `nsys` trace of the load showed the remaining
+time was not I/O at all — it was the CUDA allocator:
+
+| API | Total | Calls | Avg |
+|-----|------:|------:|----:|
+| `cudaMalloc` | 6.73 s | 2833 | 2.4 ms |
+| `cudaFree` | 2.01 s | 2837 | 0.7 ms |
+| `cudaMallocHost` | 2.43 s | 24 | 101 ms |
+| `cudaFreeHost` | 1.17 s | 24 | 49 ms |
+
+Confirmed independently: a diagnostic build that skipped the file reads
+entirely still took 6.46 s of the DiT's 9.88 s load, so the reads were already
+almost free and the driver was the wall.
+
+Two changes:
+
+- Tensors allocate through `cudaMallocAsync`/`cudaFreeAsync` on the GPU stream,
+  with the default pool's release threshold raised to 24 GiB so freed blocks
+  stay resident for reuse. The loader allocates the same handful of shapes over
+  and over (a BF16 staging tensor per weight, quantized to INT8 and dropped),
+  which is exactly what a pool is for. `H3_GPU_SYNC_ALLOC=1` restores
+  `cudaMalloc`.
+- The pinned staging pair rounds up to 256 MiB granularity and never shrinks,
+  instead of being resized to each tensor. That takes the host-side allocation
+  from 24 calls to 2.
+
+fox-s2 (`512² / 22f / steps=2 / L45 / reuse=1`), interleaved:
+
+| Metric | **Pooled** | `cudaMalloc` | Δ |
+|--------|-----------:|-------------:|--:|
+| text encoder | **5.65 s** | 6.27 s | −0.6 s |
+| DiT load | **6.53 s** | 9.34 s | −2.8 s |
+| denoise | 1.71 s | 1.67 s | ±noise |
+| video VAE | **5.47 s** | 5.68 s | −0.2 s |
+
+fox-fast e2e **29.9 s**, from 33.5 s before this change. Peak live memory is
+unchanged (16.9 GiB), and the pool does not bloat: the minimum `MemAvailable`
+during an 864×480 run is 96 GiB of 124 GiB. The whole suite passes with the
+forward smoke's hashes unchanged (`ab054bb20d9c4c83` / `863553009bcf1b83`).
+
+Also measured and rejected on the way: `CUBLAS_COMPUTE_32F_EMULATED_16BFX9` for
+the video VAE's 3.6 s of FP32 GEMM. Nine BF16 products at 98 TFLOP/s is no
+faster than FP32's own ~31 TFLOP/s, cuBLAS declines the emulation under its
+default strategy, and the wall time does not move (3.597 s vs 3.634 s). That
+GEMM is at the hardware's exact-FP32 limit unless TF32 is accepted, which an
+earlier entry already rejected. Logs: `/tmp/h3_perf_day12/alloc-{pool,sync}.log`,
+`fox-fast-{pool,pool2,bfx9,exact}.log`, `dit_load.nsys-rep`.
+---
