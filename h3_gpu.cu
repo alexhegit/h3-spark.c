@@ -653,17 +653,25 @@ static int h3_read_file_at(h3_gpu *gpu, const char *path, uint64_t offset,
     return 1;
 }
 
+static size_t h3_stage_chunk_bytes(void) {
+    const char *value = getenv("H3_LOAD_STAGE_MIB");
+    size_t mib = 128;
+    if (value && *value) {
+        long parsed = strtol(value, NULL, 10);
+        if (parsed >= 8 && parsed <= 4096) mib = (size_t)parsed;
+    }
+    return mib << 20;
+}
+
 static int h3_gpu_ensure_stage(h3_gpu *gpu, size_t bytes) {
     if (!gpu || !bytes) return 0;
+    /* Pinning is slow — around 1.5 GB/s — so the staging pair is allocated
+     * once at a fixed size and larger tensors are copied in chunks instead of
+     * growing it. */
+    bytes = h3_stage_chunk_bytes();
     if (gpu->stage_host[0] && gpu->stage_host[1] &&
         gpu->stage_host_bytes >= bytes)
         return 1;
-    /* cudaMallocHost costs 100 ms for a few hundred MB and cudaFreeHost about
-     * half that, so growing the staging pair tensor by tensor was spending
-     * seconds inside the driver. Round up hard and grow rarely. */
-    size_t granularity = (size_t)256 << 20;
-    if (bytes < granularity) bytes = granularity;
-    else bytes = (bytes + granularity - 1) & ~(granularity - 1);
     for (int i = 0; i < 2; i++) {
         if (gpu->stage_event_recorded[i] && gpu->stage_copied[i])
             cudaEventSynchronize(gpu->stage_copied[i]);
@@ -698,14 +706,10 @@ static int h3_gpu_ensure_stage(h3_gpu *gpu, size_t bytes) {
     return 1;
 }
 
-static int h3_copy_file_to_device(h3_gpu *gpu, void *device, const char *path,
-                                  uint64_t offset, size_t bytes, char *error,
-                                  size_t error_size) {
-    if (!gpu || !device || !path || !bytes) return 0;
-    if (!h3_gpu_ensure_stage(gpu, bytes)) {
-        if (error && error_size) snprintf(error, error_size, "out of memory");
-        return 0;
-    }
+static int h3_copy_file_to_device_chunk(h3_gpu *gpu, void *device,
+                                        const char *path, uint64_t offset,
+                                        size_t bytes, char *error,
+                                        size_t error_size) {
     int slot = gpu->stage_slot & 1;
     if (gpu->stage_event_recorded[slot] && gpu->stage_copied[slot] &&
         cudaEventSynchronize(gpu->stage_copied[slot]) != cudaSuccess) {
@@ -739,6 +743,31 @@ static int h3_copy_file_to_device(h3_gpu *gpu, void *device, const char *path,
         return 0;
     }
     gpu->stage_slot = slot ^ 1;
+    return 1;
+}
+
+/* Copying in staging-sized pieces means the pinned buffers stay small and the
+ * read of one piece overlaps the copy of the previous one even within a single
+ * large tensor. */
+static int h3_copy_file_to_device(h3_gpu *gpu, void *device, const char *path,
+                                  uint64_t offset, size_t bytes, char *error,
+                                  size_t error_size) {
+    if (!gpu || !device || !path || !bytes) return 0;
+    if (!h3_gpu_ensure_stage(gpu, bytes)) {
+        if (error && error_size) snprintf(error, error_size, "out of memory");
+        return 0;
+    }
+    size_t chunk_cap = gpu->stage_host_bytes;
+    if (!chunk_cap) chunk_cap = bytes;
+    for (size_t done = 0; done < bytes;) {
+        size_t span = bytes - done;
+        if (span > chunk_cap) span = chunk_cap;
+        if (!h3_copy_file_to_device_chunk(gpu, (unsigned char *)device + done,
+                                         path, offset + done, span, error,
+                                         error_size))
+            return 0;
+        done += span;
+    }
     return 1;
 }
 
@@ -6378,6 +6407,23 @@ static int32_t *h3_int8_gemm_accum(h3_gpu *gpu, const void *weight,
             gpu->int8_accum_bytes = accum_bytes;
     }
     if (!gpu->int8_accum) return NULL;
+    if (h3_env_on("H3_INT8_SHAPES")) {
+        static int seen[64][3];
+        static int count = 0;
+        int known = 0;
+        for (int i = 0; i < count; i++)
+            if (seen[i][0] == (int)rows && seen[i][1] == (int)output_dim &&
+                seen[i][2] == (int)input_dim)
+                known = 1;
+        if (!known && count < 64) {
+            seen[count][0] = (int)rows;
+            seen[count][1] = (int)output_dim;
+            seen[count][2] = (int)input_dim;
+            count++;
+            fprintf(stderr, "h3 int8 gemm shape m=%u n=%u k=%u\n", rows,
+                    output_dim, input_dim);
+        }
+    }
     int32_t alpha = 1;
     int32_t beta = 0;
     cublasStatus_t status = cublasGemmEx(

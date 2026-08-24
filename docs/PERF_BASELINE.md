@@ -1450,3 +1450,49 @@ GEMM is at the hardware's exact-FP32 limit unless TF32 is accepted, which an
 earlier entry already rejected. Logs: `/tmp/h3_perf_day12/alloc-{pool,sync}.log`,
 `fox-fast-{pool,pool2,bfx9,exact}.log`, `dit_load.nsys-rep`.
 ---
+
+## 2026-08-25 — KEEP a fixed 128 MiB staging buffer with chunked copies
+
+Pooling the device allocations left pinned host memory as the next driver cost:
+`cudaMallocHost` was 2.41 s over 10 calls (up to 682 ms each) and `cudaFreeHost`
+another 0.98 s, because the staging pair still grew to fit the largest tensor
+seen so far and pinning runs at roughly 1.5 GB/s.
+
+The staging pair is now allocated once at 128 MiB (`H3_LOAD_STAGE_MIB`) and
+tensors larger than that are copied in pieces. Chunking is not a cost: the
+double buffer already alternates, so a large tensor's second piece is read while
+its first piece is copying, which the old whole-tensor path could not do.
+
+fox-s2 (`512² / 22f / steps=2 / L45 / reuse=1`):
+
+| Metric | **128 MiB chunked** | Grown to fit | Δ |
+|--------|--------------------:|-------------:|--:|
+| text encoder | **4.50 s** | 5.91 s | −1.4 s |
+| DiT load | **5.41 s** | 6.18 s | −0.8 s |
+
+Chunk sweep (fox-s2 DiT load): 64 MiB → 5.62 s, 128 MiB → 5.41 s,
+256 MiB → 5.48 s.
+
+fox-fast is now **26.8 s** end to end, with DiT load 5.45 s, denoise 8.80 s,
+text encoder 4.52 s, video VAE 5.37 s, audio VAE 1.15 s. The whole suite passes
+with the forward smoke's hashes unchanged.
+
+Also measured and rejected: pre-warming the memory pool with one large
+`cudaMallocAsync`/`cudaFreeAsync` pair at startup. It does move time — DiT load
+5.28 s → 4.35 s with an 18 GiB reserve — but e2e does not change (26.6 s vs
+26.6 s, 26.4 s vs 26.4 s in two interleaved pairs), because the page mapping
+just happens earlier instead of not happening. The pool's ~0.5 ms per allocation
+is page mapping, not bookkeeping, so the only real fix is allocating fewer
+bytes.
+
+Also measured: the INT8 GEMM has no headroom left. A microbenchmark of the four
+shapes the DiT actually issues (all M=1874: N=21504 K=5376 for QKV, N=28672
+K=5376 for FC1, N=5376 K=14336 for FC2, N=5376 K=7168 for the attention output)
+runs at **143 TFLOP/s** through `cublasGemmEx`, and cuBLASLt's best heuristic
+candidate is within 1% of it (144 TFLOP/s). Those shapes at that rate account
+for essentially all of the denoise's 4.96 s of INT8 GEMM time, so the GEMM is
+done — 89% of the 160 TFLOP/s INT8 ceiling. Re-confirmed the INT8-vs-BF16 MLP
+choice at the same time: BF16 denoise linear is 8.19 s against INT8's 5.31 s.
+Logs: `/tmp/h3_perf_day12/stage-{64,128,256}.log`, `pw-{0,18}.log`,
+`pwf-{0,16}.log`, `mlp-{i8,bf16}.log`, `int8_bench.cu`.
+---
