@@ -5,6 +5,7 @@ extern "C" {
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -42,6 +43,10 @@ struct h3_gpu {
     int fast_path;
     int tensor_fast_path;
     int pool_alloc;
+    cublasLtHandle_t lt;
+    int lt_ready;
+    void *lt_workspace;
+    size_t lt_workspace_bytes;
     char error[512];
     char profile_label[128];
     h3_gpu_stats stats;
@@ -1378,6 +1383,123 @@ __global__ static void h3_linear_add_bias_f32_kernel(float *output,
     output[index] += bias[column];
 }
 
+/* Adding the bias in a separate pass costs a full read and write of the GEMM's
+ * output, which on the video VAE's shapes was 0.27 s a run. cuBLASLt can apply
+ * it in the GEMM's epilogue instead. The library's plan depends only on the
+ * shape, and the VAE issues five of them, so plans are cached. */
+typedef struct {
+    int rows;
+    int input_dim;
+    int output_dim;
+    cublasLtMatmulAlgo_t algo;
+    int valid;
+} h3_lt_bias_plan;
+
+static int h3_lt_ensure(h3_gpu *gpu) {
+    if (gpu->lt_ready) return gpu->lt != NULL;
+    gpu->lt_ready = 1;
+    if (h3_env_on("H3_F32_SPLIT_BIAS")) return 0;
+    if (cublasLtCreate(&gpu->lt) != CUBLAS_STATUS_SUCCESS) {
+        gpu->lt = NULL;
+        return 0;
+    }
+    gpu->lt_workspace_bytes = (size_t)32 << 20;
+    if (cudaMalloc(&gpu->lt_workspace, gpu->lt_workspace_bytes) !=
+        cudaSuccess) {
+        gpu->lt_workspace = NULL;
+        gpu->lt_workspace_bytes = 0;
+    }
+    return 1;
+}
+
+static int h3_linear_f32_bias_fused(h3_gpu *gpu, h3_gpu_tensor *output,
+                                    const h3_gpu_tensor *input,
+                                    const h3_gpu_tensor *weight,
+                                    const h3_gpu_tensor *bias, uint32_t rows,
+                                    uint32_t input_dim, uint32_t output_dim,
+                                    cublasComputeType_t compute) {
+    static h3_lt_bias_plan plans[16];
+    if (!h3_lt_ensure(gpu)) return 0;
+    cublasLtMatmulDesc_t desc = NULL;
+    cublasLtMatrixLayout_t la = NULL, lb = NULL, lc = NULL;
+    cublasOperation_t transpose = CUBLAS_OP_T;
+    cublasOperation_t straight = CUBLAS_OP_N;
+    cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+    const void *bias_pointer = bias->device;
+    int ok = 0;
+    if (cublasLtMatmulDescCreate(&desc, compute, CUDA_R_32F) !=
+        CUBLAS_STATUS_SUCCESS)
+        return 0;
+    if (cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                       &transpose, sizeof(transpose)) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                       &straight, sizeof(straight)) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE,
+                                       &epilogue, sizeof(epilogue)) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                       &bias_pointer, sizeof(bias_pointer)) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatrixLayoutCreate(&la, CUDA_R_32F, input_dim, output_dim,
+                                   input_dim) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatrixLayoutCreate(&lb, CUDA_R_32F, input_dim, rows,
+                                   input_dim) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatrixLayoutCreate(&lc, CUDA_R_32F, output_dim, rows,
+                                   output_dim) == CUBLAS_STATUS_SUCCESS) {
+        h3_lt_bias_plan *plan = NULL;
+        for (unsigned i = 0; i < 16u; i++) {
+            if (plans[i].valid && plans[i].rows == (int)rows &&
+                plans[i].input_dim == (int)input_dim &&
+                plans[i].output_dim == (int)output_dim) {
+                plan = &plans[i];
+                break;
+            }
+            if (!plans[i].valid && !plan) plan = &plans[i];
+        }
+        if (plan && !plan->valid) {
+            cublasLtMatmulPreference_t preference = NULL;
+            cublasLtMatmulHeuristicResult_t result;
+            int found = 0;
+            if (cublasLtMatmulPreferenceCreate(&preference) ==
+                CUBLAS_STATUS_SUCCESS) {
+                cublasLtMatmulPreferenceSetAttribute(
+                    preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    &gpu->lt_workspace_bytes,
+                    sizeof(gpu->lt_workspace_bytes));
+                if (cublasLtMatmulAlgoGetHeuristic(gpu->lt, desc, la, lb, lc,
+                                                   lc, preference, 1, &result,
+                                                   &found) ==
+                        CUBLAS_STATUS_SUCCESS &&
+                    found > 0) {
+                    plan->algo = result.algo;
+                    plan->rows = (int)rows;
+                    plan->input_dim = (int)input_dim;
+                    plan->output_dim = (int)output_dim;
+                    plan->valid = 1;
+                }
+                cublasLtMatmulPreferenceDestroy(preference);
+            }
+        }
+        if (plan && plan->valid) {
+            float alpha = 1.0f;
+            float beta = 0.0f;
+            ok = cublasLtMatmul(gpu->lt, desc, &alpha, weight->device, la,
+                                input->device, lb, &beta, output->device, lc,
+                                output->device, lc, &plan->algo,
+                                gpu->lt_workspace, gpu->lt_workspace_bytes,
+                                gpu->stream) == CUBLAS_STATUS_SUCCESS;
+        }
+    }
+    if (lc) cublasLtMatrixLayoutDestroy(lc);
+    if (lb) cublasLtMatrixLayoutDestroy(lb);
+    if (la) cublasLtMatrixLayoutDestroy(la);
+    cublasLtMatmulDescDestroy(desc);
+    if (ok) gpu->stats.direct_dispatches++;
+    return ok;
+}
+
 int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
                       const h3_gpu_tensor *weight,
@@ -1410,6 +1532,11 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
          h3_env_on("H3_F32_TF32"))
             ? CUBLAS_COMPUTE_32F_FAST_TF32
             : CUBLAS_COMPUTE_32F;
+    if (bias && h3_linear_f32_bias_fused(gpu, output, input, weight, bias, rows,
+                                         input_dim, output_dim, compute)) {
+        h3_gpu_op_end(gpu);
+        return 1;
+    }
     cublasStatus_t status = cublasGemmEx(
         gpu->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)output_dim, (int)rows,
         (int)input_dim, &alpha, weight->device, CUDA_R_32F, (int)input_dim,

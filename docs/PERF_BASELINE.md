@@ -1583,3 +1583,26 @@ measurable amount — 0.06 s is inside its run-to-run spread — so this is bank
 as reduced GPU work rather than as a wall-clock win. Logs:
 `/tmp/h3_perf_day12/ab-{base,soft}-{1,2}.log`, `vt-{1,2}.log`.
 ---
+
+## 2026-08-25 — KEEP the F32 bias in the GEMM epilogue (video VAE −0.27 s)
+
+`h3_gpu_linear_f32` added its bias in a separate kernel, which is a full read
+and write of the GEMM output for an operation the GEMM could have done on the
+way out: 590 launches and 0.27 s a run. It now goes through `cublasLtMatmul`
+with `CUBLASLT_EPILOGUE_BIAS`. The Lt plan depends only on the shape and the
+VAE issues five, so heuristics are looked up once per shape and cached; any
+failure anywhere in the Lt path falls back to the old `cublasGemmEx` plus bias
+kernel, and `H3_F32_SPLIT_BIAS=1` forces that path.
+
+Interleaved fox-fast, two pairs:
+
+| Run | **Fused** | Separate kernel |
+|-----|----------:|----------------:|
+| video VAE wall | **5.09 s / 5.13 s** | 5.39 s / 5.38 s |
+| video VAE GEMM | **3.46 s / 3.50 s** | 3.74 s / 3.77 s |
+| dispatches | **1468** | 2056 |
+
+The audio VAE is convolution-only and does not change (0.94 s either way). Both
+VAE smokes report identical values (video abs-max 0.677619, audio 0.16749) and
+the whole suite passes. Logs: `/tmp/h3_perf_day12/bias-{fused,split,fused2,split2}.log`.
+---

@@ -9,7 +9,7 @@ CFLAGS := -std=c11 -O2 -Wall -Wextra -Wpedantic -MMD -MP -I. -Ithird_party -D_GN
 	-I/usr/local/cuda/include
 NVCCFLAGS := -std=c++17 -O2 -Xcompiler -fPIC -I. \
 	-gencode arch=compute_121,code=sm_121
-LDFLAGS := -L$(CUDA_LIB) -Wl,-rpath,$(CUDA_LIB) -lcudart -lcublas \
+LDFLAGS := -L$(CUDA_LIB) -Wl,-rpath,$(CUDA_LIB) -lcudart -lcublas -lcublasLt \
 	-lstdc++ -licuuc -lm -pthread
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
