@@ -1237,3 +1237,37 @@ one map row, so both the reference and the kernel read one row past the end of
 their buffers and agreed only while that memory happened to be zero. It now
 allocates both rows, which also makes the row map meaningful.
 ---
+
+## 2026-08-25 — TF32 F32 GEMM: 2.1× on the video VAE, kept opt-in
+
+`h3_gpu_linear_f32` ran `CUBLAS_COMPUTE_32F`, i.e. no tensor cores at all.
+`H3_F32_TF32=1` switches the large shapes (all of `input_dim`, `output_dim` and
+`rows` at least 512, so the op gate's small cases stay exact) to
+`CUBLAS_COMPUTE_32F_FAST_TF32`. fox-s2, interleaved:
+
+| Run | **TF32** | FP32 |
+|-----|---------:|-----:|
+| ab1 | video VAE 7.29 s (linear 1.78 s) | 9.16 s (linear 3.65 s) |
+| ab2 | video VAE 7.24 s (linear 1.70 s) | 9.19 s (linear 3.69 s) |
+
+The GEMM more than halves and the VAE wall drops 1.9 s. It is **not** the
+default, because of what the output stability says:
+
+| PSNR pair | average |
+|-----------|--------:|
+| FP32 run vs FP32 run (same config) | **32.65 dB** |
+| TF32 run vs TF32 run (same config) | 22.24 dB |
+| TF32 vs FP32 | 23.24 dB |
+
+The video VAE is already not bit-reproducible run to run (documented earlier as
+nondeterminism downstream of the DiT, most likely a split-k reduction), and
+TF32 raises that floor by ~10 dB: two TF32 runs differ from each other about as
+much as a TF32 run differs from an FP32 one. So TF32's error is not a small
+bias on a stable output, it makes the decode measurably noisier, and 23 dB is
+large enough to see. A 1.9 s VAE win is not worth spending that silently, so
+the flag exists and the default stays exact.
+
+The other half of the video VAE, its 3.55 s of FP32 attention, is untouched:
+the DiT's MMA kernel is head_dim 128 only, and an FP16 path there would raise
+the same question this measurement just answered.
+---

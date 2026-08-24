@@ -1229,12 +1229,19 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
     float alpha = 1.0f;
     float beta = 0.0f;
+    /* TF32 keeps FP32 range with a 10-bit mantissa and runs on the tensor
+     * cores. It is worth its precision only where the GEMM is big enough to be
+     * MMA-bound, so the small shapes stay exact FP32. */
+    cublasComputeType_t compute =
+        (input_dim >= 512u && output_dim >= 512u && rows >= 512u &&
+         h3_env_on("H3_F32_TF32"))
+            ? CUBLAS_COMPUTE_32F_FAST_TF32
+            : CUBLAS_COMPUTE_32F;
     cublasStatus_t status = cublasGemmEx(
         gpu->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)output_dim, (int)rows,
         (int)input_dim, &alpha, weight->device, CUDA_R_32F, (int)input_dim,
         input->device, CUDA_R_32F, (int)input_dim, &beta, output->device,
-        CUDA_R_32F, (int)output_dim, CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT);
+        CUDA_R_32F, (int)output_dim, compute, CUBLAS_GEMM_DEFAULT);
     if (!h3_cublas_check(gpu, status, "cublasGemmEx linear_f32")) {
         h3_gpu_op_end(gpu);
         return 0;
