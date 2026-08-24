@@ -741,3 +741,18 @@ ab2 split looks like SDPA noise (1.803 s vs ~1.71 s). ab1/ab3 fused is not
 faster. Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-qkvrope-fused-ab1.log`,
 `fox-s2-qkvrope-split-ab1.log`.
 
+---
+
+## 2026-08-24 — REJECT two-wide SwiGLU ILP
+
+A separate kernel doing two columns per thread with the same `expf` math
+(not vec4, not `__expf`) did not drop fox-s2 denoise. Interleaved A/B:
+
+| Run | Scalar | **X2** |
+|-----|-------:|-------:|
+| ab1 | 3.012 s | 3.089 s |
+| ab2 | 3.160 s | 3.103 s |
+
+ab2 scalar SDPA looks noisy (1.785 s vs ~1.70 s). ab1 x2 is slower. Reverted.
+Logs: `/tmp/h3_perf_day9/fox-s2-swiglu-x2-ab1.log`, `fox-s2-swiglu-scalar-ab1.log`.
+
