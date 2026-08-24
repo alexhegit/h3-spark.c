@@ -967,3 +967,11 @@ between Q4 and Q8; not Q10 register spill. fox-s2 interleaved
 SDPA ~100–130 ms slower; denoise wall follows. Reverted. Logs:
 `/tmp/h3_perf_day9/fox-s2-q6-ab1.log`, `fox-s2-q8-ab1.log`.
 ---
+
+## 2026-08-24 — REJECT Q8 hardware warp reduce
+
+Separate Q8 kernel replacing the shfl-xor sum with `__reduce_add_sync`.
+nvcc 12.x / sm_121 only overloads that intrinsic for `int` / `unsigned`;
+there is no `float` form, so the kernel does not compile. Not an A/B.
+Reverted. Distinct from Q6 occupancy REJECT.
+---
