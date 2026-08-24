@@ -905,3 +905,18 @@ Distinct from REJECT 2D grid and vec4 1D. fox-s2 interleaved
 Linear is slower (row-strided accum). Wall does not drop. Reverted. Logs:
 `/tmp/h3_perf_day9/fox-s2-smem-ab1.log`, `fox-s2-scale-ab1.log`.
 
+## 2026-08-24 — REJECT AdaLN packed vec2 loads
+
+Separate MLP AdaLN kernel: two consecutive columns per step, packed `uint32`
+BF16 residual/branch/gate/weight loads. Distinct from warp AdaLN reduce and
+register-cached fuse. fox-s2 interleaved `H3_ADALN_VEC2=1`:
+
+| Run | Default | **Vec2 packed** |
+|-----|--------:|----------------:|
+| ab1 | 3.165 s (sdpa 1.788, linear 1.209, leftover 0.168) | 3.004 s (sdpa 1.702, linear 1.136, leftover 0.166) |
+| ab2 | 3.032 s (sdpa 1.702, linear 1.167, leftover 0.163) | 2.998 s (sdpa 1.693, linear 1.144, leftover 0.161) |
+
+Leftover denoise − sdpa − linear unchanged (~2 ms). ab1 wall tracks SDPA/linear
+noise. Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-adaln-vec2-ab1.log`,
+`fox-s2-adaln-base-ab1.log`.
+---
