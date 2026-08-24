@@ -819,4 +819,18 @@ fox-s2 interleaved (`H3_SDPA_HEAD_MAJOR_QKV=1`):
 
 SDPA ~25–35 ms faster both pairs; denoise wall tied (linear noise). Reverted.
 Logs: `/tmp/h3_perf_day9/fox-s2-hm-ab1.log`, `fox-s2-hm-base-ab1.log`.
+---
+
+## 2026-08-24 — REJECT cuBLASLt for BF16 DiT linear
+
+`cublasLtMatmul` + heuristic (64 MiB workspace, `H3_BF16_CUBLASLT=1`) did not
+beat `cublasGemmEx` / WMMA. fox-s2 interleaved:
+
+| Run | GemmEx | **cuBLASLt** |
+|-----|-------:|-------------:|
+| ab1 | 3.033 s (linear 1.155, sdpa 1.710) | 3.096 s (linear 1.185, sdpa 1.746) |
+| ab2 | 3.049 s (linear 1.138, sdpa 1.744) | 3.049 s (linear 1.173, sdpa 1.707) |
+
+Linear is slower, not just SDPA noise. Distinct from INT8 cuBLASLt REJECT.
+Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-lt-ab1.log`, `fox-s2-lt-base-ab1.log`.
 
