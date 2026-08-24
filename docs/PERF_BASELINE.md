@@ -772,3 +772,18 @@ Leftover denoise − sdpa − linear stayed **0.167 / 0.166 s** on both sides. a
 wall tracks SDPA noise (1.766 s vs 1.688 s). Reverted. Logs:
 `/tmp/h3_perf_day9/fox-s2-adaln-warp-ab1.log`, `fox-s2-adaln-tree-ab1.log`.
 
+---
+
+## 2026-08-24 — REJECT Q8 SDPA L2 prefetch
+
+A separate Q8 kernel issuing `prefetch.global.L2` on K/V two/three steps ahead
+(depth-1 register pipe unchanged) slowed fox-s2 denoise. Interleaved A/B:
+
+| Run | Default Q8 | **L2 prefetch** |
+|-----|-----------:|----------------:|
+| ab1 | 3.005 s (sdpa 1.704) | 3.192 s (sdpa 1.851) |
+| ab2 | 3.034 s (sdpa 1.711) | 3.152 s (sdpa 1.822) |
+
+Not the rejected depth-2 register pipe; still a net loss. Reverted. Logs:
+`/tmp/h3_perf_day9/fox-s2-q8-l2pre-ab1.log`, `fox-s2-q8-base-ab1.log`.
+
