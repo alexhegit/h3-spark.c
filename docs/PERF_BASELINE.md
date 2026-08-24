@@ -1606,3 +1606,54 @@ The audio VAE is convolution-only and does not change (0.94 s either way). Both
 VAE smokes report identical values (video abs-max 0.677619, audio 0.16749) and
 the whole suite passes. Logs: `/tmp/h3_perf_day12/bias-{fused,split,fused2,split2}.log`.
 ---
+
+## 2026-08-25 — two output-correctness findings (pre-existing, not perf)
+
+Checking the actual pixels at the end of the session, rather than only hashes
+and wall clocks, turned up two problems that are independent of every change in
+this document. Both reproduce with all of them disabled
+(`H3_LOAD_READ_THREADS=1 H3_GPU_SYNC_ALLOC=1 H3_SDPA_F32_WAVE=1
+H3_F32_SPLIT_BIAS=1`).
+
+**1. Output does not depend on the prompt.** Three prompts — "A red fox walks
+through fresh snow in a pine forest…", "An astronaut rides a white horse on the
+surface of the moon…", and a 321-word prompt written in the documented
+H3-Context-IR shape (`integrated_multimodal_description:` / `[Shot 1]` /
+`overall_soundscape:` / `non_diegetic_music:`) — all produce the same family of
+scene: hands preparing food or pouring water on a wooden surface, i.e. what
+looks like the training distribution's mode rather than anything conditioned.
+
+The text encoder is not the problem. `h3_real_prompt_test` (now buildable on
+Linux) shows it tokenizes and encodes correctly and prompt-dependently:
+
+| Prompt | Tokens | Layer-50 embedding hash |
+|--------|-------:|-------------------------|
+| "A red fox walks through fresh snow in a pine forest." | 12 | `bfdb59bb391c82aa` |
+| "An astronaut rides a white horse on the moon." | 10 | `9757e55740146973` |
+
+So the conditioning is lost somewhere between that embedding and the denoised
+latent: `refine_text` projects it through `condition_proj` and two token-refiner
+blocks into `dit->refined_text`, and that is the next thing to audit — likely
+whether `refined_text` actually reaches the joint attention, and whether the
+prompt template the checkpoint expects differs from what is fed in. Note the
+model card is explicit that H3 expects Context-IR input of ~5,000–12,800 prompt
+tokens, so short prompts are out of distribution by design; but the structured
+321-word attempt failing the same way says this is not only a prompt-length
+issue.
+
+**2. Identical invocations produce different videos.** The same command twice,
+same default seed 42, gives different files (md5 `0c65f6dd…` vs `9b66fe82…`)
+and 22.87 dB PSNR between them — a different scene, not rounding. The latent
+noise is seeded deterministically (`h3_rng_seed(&video_rng, params->seed)` for
+both modalities) and `h3_cuda_dit_forward_smoke` hashes identically run to run,
+so the divergence is introduced after that seeding and outside the forward
+smoke's coverage. This is the same nondeterminism noted earlier in this document
+as "downstream of the DiT; not chased here", but it is worth recording that its
+magnitude is semantic, not numerical: it is why the PSNR floor between runs of
+one configuration is ~17–23 dB, and why PSNR cannot be used to validate any
+kernel change end to end.
+
+Neither finding affects the performance measurements above — the work per step
+is the same either way — but both outrank further tuning: the pipeline is
+currently fast at producing something other than what was asked for.
+---

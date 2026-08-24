@@ -53,6 +53,9 @@ h3_cuda_text_smoke: tests/test_cuda_text_smoke.o $(LIB_OBJ)
 h3_cuda_vision_smoke: tests/test_cuda_vision_smoke.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+h3_real_prompt_test: tests/test_real_prompt.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 h3_cuda_dit_forward_smoke: tests/test_cuda_dit_forward_smoke.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
