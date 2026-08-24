@@ -833,4 +833,18 @@ beat `cublasGemmEx` / WMMA. fox-s2 interleaved:
 
 Linear is slower, not just SDPA noise. Distinct from INT8 cuBLASLt REJECT.
 Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-lt-ab1.log`, `fox-s2-lt-base-ab1.log`.
+---
+
+## 2026-08-24 — REJECT Q10 wave SDPA
+
+Separate d128 Q10 kernel (158 regs, no local spill; occupancy below Q8's 127
+regs). fox-s2 interleaved `H3_SDPA_D128_Q10=1`:
+
+| Run | Q8 | **Q10** |
+|-----|---:|--------:|
+| ab1 | 3.115 s (sdpa 1.759) | 3.385 s (sdpa 2.024) |
+| ab2 | 3.203 s (sdpa 1.777) | 3.436 s (sdpa 2.050) |
+
+Slower than Q8; not Q16 spill. Reverted. Logs:
+`/tmp/h3_perf_day9/fox-s2-q10-ab1.log`, `fox-s2-q8-ab1.log`.
 
