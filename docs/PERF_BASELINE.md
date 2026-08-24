@@ -975,3 +975,18 @@ nvcc 12.x / sm_121 only overloads that intrinsic for `int` / `unsigned`;
 there is no `float` form, so the kernel does not compile. Not an A/B.
 Reverted. Distinct from Q6 occupancy REJECT.
 ---
+
+## 2026-08-24 — REJECT Q8 __ldcg K/V
+
+Separate Q8 kernel: K/V via `__ldcg` (cache-global). Distinct from
+`ld.global.cs` streaming and L2 prefetch. fox-s2 interleaved
+`H3_SDPA_Q8_LDCG=1`:
+
+| Run | `__ldg` | **`__ldcg`** |
+|-----|--------:|-------------:|
+| ab1 | 3.028 s (sdpa 1.719) | 3.038 s (sdpa 1.720) |
+| ab2 | 3.051 s (sdpa 1.701) | 3.259 s (sdpa 1.848) |
+
+No denoise wall drop; ab2 SDPA slower. Reverted. Logs:
+`/tmp/h3_perf_day9/fox-s2-q8-ldcg-ab1.log`, `fox-s2-q8-ldg-ab1.log`.
+---
