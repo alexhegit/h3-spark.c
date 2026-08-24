@@ -679,3 +679,13 @@ denoise. Interleaved A/B: **3.04 / 3.06 s** (`expf`) vs **3.07 / 3.07 s**
 (`__expf`+`__frcp_rn`). Reverted. Logs:
 `/tmp/h3_perf_day8/fox-s2-swiglu-expf-ab1.log`, `fox-s2-swiglu-fast-ab1.log`.
 
+---
+
+## 2026-08-24 — REJECT Q8 SDPA depth-2 K/V pipeline
+
+Prefetching K/V two steps ahead (triple-buffer, separate kernel) did not drop
+fox-s2 denoise vs the depth-1 software pipeline. Interleaved A/B:
+**3.08 / 3.07 s** (pipe1) vs **3.04 / 3.28 s** (pipe3); sdpa **1.71 / 1.74 s**
+vs **1.72 / 1.86 s**. Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-q8-pipe1-ab1.log`,
+`fox-s2-q8-pipe3-ab1.log`.
+
