@@ -1642,13 +1642,17 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
-    /* GB10 BF16 tensor cores beat the runtime INT8 MLP (fox-s2 denoise
-     * 18s INT8 vs 4.9s BF16). Opt back in with H3_INT8_MLP=1. */
+    /* cuBLAS INT8 GEMM runs ~1.6x the BF16 rate on the DiT FC1/FC2 shapes
+     * (GB10 measured 160 vs 98 TFLOP/s), so the INT8 MLP wins once FC2 uses
+     * one row scale instead of the grouped dp4a kernel. The earlier BF16
+     * default was an artifact of that grouped FC2. Opt out with
+     * H3_BF16_MLP=1 or --use-slower-bf16-mlp. */
+    const char *bf16_mlp_env = getenv("H3_BF16_MLP");
+    int force_bf16_mlp = bf16_mlp_env && *bf16_mlp_env &&
+                         strcmp(bf16_mlp_env, "0") != 0;
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
-                    !use_slower_bf16_mlp &&
-                    h3_gpu_has_int8_mlp(dit->gpu) &&
-                    getenv("H3_INT8_MLP") &&
-                    strcmp(getenv("H3_INT8_MLP"), "0") != 0;
+                    !use_slower_bf16_mlp && !force_bf16_mlp &&
+                    h3_gpu_has_int8_mlp(dit->gpu);
     dit->int8_qkv = !dit->ssd_streaming && !use_slower_bf16_qkv &&
                     dit->sequence >= 128 &&
                     h3_gpu_has_int8_mlp(dit->gpu);
@@ -1673,7 +1677,11 @@ static h3_dit *load_dit(const char *weight_directory,
         (getenv("H3_INT8_KEEP_BF16_QKV") ||
          getenv("H3_BENCH_INT8_QKV_AB"));
     dit->use_slower_grouped_quantizer = use_slower_grouped_quantizer;
-    dit->use_int8_row_fc2 = dit->int8_mlp && use_int8_row_fc2;
+    /* One row scale keeps FC2 on the cuBLAS INT8 GEMM; the grouped 1024-wide
+     * scale forces the slower dp4a kernel (fox-s2 linear 0.82s vs 3.33s).
+     * Opt back into grouped scales with H3_INT8_GROUP_FC2=1. */
+    dit->use_int8_row_fc2 = dit->int8_mlp &&
+        (use_int8_row_fc2 || !getenv("H3_INT8_GROUP_FC2"));
     dit->keep_bf16_mlp = dit->int8_mlp &&
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||

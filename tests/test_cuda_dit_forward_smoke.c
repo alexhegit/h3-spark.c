@@ -75,16 +75,29 @@ static uint64_t hash_f32(const float *values, size_t count) {
 
 static void configure_path(int int8_mlp) {
     setenv("H3_DISABLE_TOKEN_REDUCTION", "1", 1);
+    /* Tiny smoke layout has sequence < 128, so QKV/attn stay BF16. */
+    setenv("H3_DISABLE_INT8_QKV", "1", 1);
+    setenv("H3_DISABLE_INT8_ATTENTION_OUT", "1", 1);
     if (int8_mlp) {
         unsetenv("H3_DISABLE_INT8_MLP");
-        /* Tiny smoke layout has sequence < 128, so QKV/attn stay BF16. */
-        setenv("H3_DISABLE_INT8_QKV", "1", 1);
-        setenv("H3_DISABLE_INT8_ATTENTION_OUT", "1", 1);
+        unsetenv("H3_BF16_MLP");
     } else {
         setenv("H3_DISABLE_INT8_MLP", "1", 1);
-        setenv("H3_DISABLE_INT8_QKV", "1", 1);
-        setenv("H3_DISABLE_INT8_ATTENTION_OUT", "1", 1);
+        setenv("H3_BF16_MLP", "1", 1);
     }
+}
+
+static double rel_l2(const float *candidate, const float *reference,
+                     size_t count) {
+    double error = 0.0;
+    double norm = 0.0;
+    for (size_t index = 0; index < count; index++) {
+        double delta = (double)candidate[index] - (double)reference[index];
+        error += delta * delta;
+        norm += (double)reference[index] * (double)reference[index];
+    }
+    if (norm <= 0.0) return error > 0.0 ? 1.0 : 0.0;
+    return sqrt(error / norm);
 }
 
 static h3_dit *load_smoke_dit(const char *weights_path, h3_text_embedding *text,
@@ -157,6 +170,30 @@ int main(int argc, char **argv) {
     if (!h3_schedule_build(20, &sigmas)) fail("cannot build sigma schedule");
 
     unsigned active_blocks = full_blocks ? 50u : 25u;
+
+    /* Report how far the INT8 MLP stack lands from the BF16 stack, but do not
+     * gate tightly on it. This velocity comes out of a deep residual stream,
+     * so the number measures how the per-block deviation compounds over
+     * `active_blocks`, not the quantizer itself; h3_cuda_ops gates the
+     * per-MLP relL2 at DiT width (~0.007). Here we only catch a blowup. */
+    float *video_ref = NULL;
+    float *audio_ref = NULL;
+    if (int8_mlp) {
+        video_ref = malloc((size_t)VIDEO_ELEMENTS * sizeof(*video_ref));
+        audio_ref = malloc((size_t)AUDIO_ELEMENTS * sizeof(*audio_ref));
+        if (!video_ref || !audio_ref) fail("reference allocation failed");
+        configure_path(0);
+        h3_dit *reference = load_smoke_dit(weights_path, &text, &layout,
+                                           &sigmas, active_blocks, 0, error,
+                                           sizeof(error));
+        if (!reference) fail(error);
+        if (!h3_dit_forward(reference, 0, video, audio, video_ref, audio_ref,
+                            error, sizeof(error)))
+            fail(error);
+        h3_dit_free(reference);
+        configure_path(1);
+    }
+
     h3_dit *dit = load_smoke_dit(weights_path, &text, &layout, &sigmas,
                                  active_blocks, int8_mlp, error, sizeof(error));
     if (!dit) {
@@ -195,6 +232,17 @@ int main(int argc, char **argv) {
         memcmp(audio_out_a, audio_out_b,
                (size_t)AUDIO_ELEMENTS * sizeof(*audio_out_a)) != 0)
         fail("DiT forward output is not deterministic");
+
+    if (int8_mlp) {
+        double video_rel = rel_l2(video_out_a, video_ref, VIDEO_ELEMENTS);
+        double audio_rel = rel_l2(audio_out_a, audio_ref, AUDIO_ELEMENTS);
+        printf("int8 MLP vs BF16 MLP relL2 over %u blocks: video %.4g "
+               "audio %.4g\n", active_blocks, video_rel, audio_rel);
+        if (!(video_rel < 4.0) || !(audio_rel < 4.0))
+            fail("int8 MLP velocity diverged from the BF16 MLP");
+    }
+    free(video_ref);
+    free(audio_ref);
 
     h3_gpu_stats stats;
     if (!h3_dit_get_gpu_stats(dit, &stats)) fail("cannot read GPU stats");

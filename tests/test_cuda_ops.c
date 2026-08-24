@@ -2863,6 +2863,117 @@ int main(void) {
         }
     }
 
+    /* The check above pins the INT8 MLP to an INT8 reference. This one asks a
+     * different question at DiT widths: how far the INT8 MLP lands from the
+     * BF16 MLP it replaces, which is what picking a default trades away. */
+    {
+        const uint32_t q_rows = 64;
+        const uint32_t q_in = 5376;
+        const uint32_t q_hidden = 14336;
+        const uint32_t q_out = 5376;
+        const uint32_t q_padded = (q_rows + 127u) & ~127u;
+        size_t in_count = (size_t)q_rows * q_in;
+        size_t fc1_count = (size_t)q_hidden * 2u * q_in;
+        size_t fc2_count = (size_t)q_out * q_hidden;
+        size_t out_count = (size_t)q_rows * q_out;
+        uint16_t *q_input = malloc(in_count * sizeof(*q_input));
+        uint16_t *q_fc1 = malloc(fc1_count * sizeof(*q_fc1));
+        uint16_t *q_fc2 = malloc(fc2_count * sizeof(*q_fc2));
+        uint16_t *q_got_int8 = malloc(out_count * sizeof(*q_got_int8));
+        uint16_t *q_got_bf16 = malloc(out_count * sizeof(*q_got_bf16));
+        check(q_input && q_fc1 && q_fc2 && q_got_int8 && q_got_bf16,
+              "int8-vs-bf16 MLP host alloc");
+        if (q_input && q_fc1 && q_fc2 && q_got_int8 && q_got_bf16) {
+            /* AdaLN hands the MLP a normalized row, so unit-scale inputs and
+             * fan-in scaled weights match the shape the DiT actually sees. */
+            for (size_t i = 0; i < in_count; i++)
+                q_input[i] = f32_to_bf16(sinf((float)i * 0.017f) +
+                                         0.3f * cosf((float)i * 0.101f));
+            for (size_t i = 0; i < fc1_count; i++)
+                q_fc1[i] = f32_to_bf16(sinf((float)i * 0.0031f) * 0.02f);
+            for (size_t i = 0; i < fc2_count; i++)
+                q_fc2[i] = f32_to_bf16(cosf((float)i * 0.0027f) * 0.01f);
+
+            h3_gpu_tensor *t_in = h3_gpu_tensor_from_bf16(gpu, q_input, in_count);
+            h3_gpu_tensor *t_fc1 = h3_gpu_tensor_from_bf16(gpu, q_fc1, fc1_count);
+            h3_gpu_tensor *t_fc2 = h3_gpu_tensor_from_bf16(gpu, q_fc2, fc2_count);
+            h3_gpu_tensor *t_fc1_i8 = h3_gpu_tensor_new_i8(gpu, fc1_count);
+            h3_gpu_tensor *t_fc1_scale =
+                h3_gpu_tensor_new_f32(gpu, q_hidden * 2u);
+            h3_gpu_tensor *t_fc2_i8 = h3_gpu_tensor_new_i8(gpu, fc2_count);
+            h3_gpu_tensor *t_fc2_scale = h3_gpu_tensor_new_f32(gpu, q_out);
+            h3_gpu_tensor *t_act =
+                h3_gpu_tensor_new_bf16(gpu, (size_t)q_rows * q_hidden);
+            h3_gpu_tensor *t_quant =
+                h3_gpu_tensor_new_i8(gpu, (size_t)q_padded * q_hidden);
+            h3_gpu_tensor *t_scales = h3_gpu_tensor_new_f32(gpu, q_padded);
+            h3_gpu_tensor *t_out_int8 = h3_gpu_tensor_new_bf16(gpu, out_count);
+            h3_gpu_tensor *t_out_bf16 = h3_gpu_tensor_new_bf16(gpu, out_count);
+            check(t_in && t_fc1 && t_fc2 && t_fc1_i8 && t_fc1_scale &&
+                      t_fc2_i8 && t_fc2_scale && t_act && t_quant && t_scales &&
+                      t_out_int8 && t_out_bf16,
+                  "int8-vs-bf16 MLP device alloc");
+            if (t_in && t_fc1 && t_fc2 && t_fc1_i8 && t_fc1_scale && t_fc2_i8 &&
+                t_fc2_scale && t_act && t_quant && t_scales && t_out_int8 &&
+                t_out_bf16) {
+                check(h3_gpu_quantize_weight_int8(gpu, t_fc1_i8, t_fc1_scale,
+                                                  t_fc1, q_hidden * 2u, q_in),
+                      "quantize wide fc1");
+                check(h3_gpu_quantize_weight_int8(gpu, t_fc2_i8, t_fc2_scale,
+                                                  t_fc2, q_out, q_hidden),
+                      "quantize wide fc2");
+                check(h3_gpu_mlp_int8_bf16(
+                          gpu, t_out_int8, t_act, t_quant, t_scales, t_in,
+                          t_fc1_i8, t_fc1_scale, t_fc2_i8, t_fc2_scale, t_fc1,
+                          t_fc2, q_rows, q_in, q_hidden, q_out, 0, 0, 1, 0),
+                      "wide mlp_int8_bf16");
+                check(h3_gpu_mlp_bf16(gpu, t_out_bf16, t_in, t_fc1, t_fc2,
+                                      q_rows, q_in, q_hidden, q_out),
+                      "wide mlp_bf16");
+                check(h3_gpu_submit(gpu), "submit wide MLP pair");
+                check(h3_gpu_tensor_read_bf16(t_out_int8, q_got_int8,
+                                              out_count),
+                      "read wide mlp_int8");
+                check(h3_gpu_tensor_read_bf16(t_out_bf16, q_got_bf16,
+                                              out_count),
+                      "read wide mlp_bf16");
+                double err = 0.0;
+                double norm = 0.0;
+                for (size_t i = 0; i < out_count; i++) {
+                    double a = bf16_to_f32(q_got_int8[i]);
+                    double b = bf16_to_f32(q_got_bf16[i]);
+                    err += (a - b) * (a - b);
+                    norm += b * b;
+                }
+                double rel = norm > 0.0 ? sqrt(err / norm) : 1.0;
+                printf("int8 MLP vs BF16 MLP relL2 at DiT width: %.5f\n", rel);
+                if (!(rel < 3e-2)) {
+                    fprintf(stderr,
+                            "FAIL: int8 MLP relL2 %.5f is too far from BF16\n",
+                            rel);
+                    failures++;
+                }
+            }
+            h3_gpu_tensor_free(t_out_bf16);
+            h3_gpu_tensor_free(t_out_int8);
+            h3_gpu_tensor_free(t_scales);
+            h3_gpu_tensor_free(t_quant);
+            h3_gpu_tensor_free(t_act);
+            h3_gpu_tensor_free(t_fc2_scale);
+            h3_gpu_tensor_free(t_fc2_i8);
+            h3_gpu_tensor_free(t_fc1_scale);
+            h3_gpu_tensor_free(t_fc1_i8);
+            h3_gpu_tensor_free(t_fc2);
+            h3_gpu_tensor_free(t_fc1);
+            h3_gpu_tensor_free(t_in);
+        }
+        free(q_got_bf16);
+        free(q_got_int8);
+        free(q_fc2);
+        free(q_fc1);
+        free(q_input);
+    }
+
     const uint32_t gaq_rows = 4;
     const uint32_t gaq_width = 32;
     const uint32_t gaq_slots = 6;

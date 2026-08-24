@@ -1007,3 +1007,115 @@ SDPA is faster both pairs (~36–174 ms). Denoise wall is mixed (ab2 linear
 noise +131 ms). Same KEEP failure as head-major. Reverted. Logs:
 `/tmp/h3_perf_day9/fox-s2-lanepack-ab1.log`, `fox-s2-lanepack-base-ab1.log`.
 ---
+
+## 2026-08-25 — GB10 GEMM roofline: INT8 is 1.6× BF16
+
+Standalone `cublasGemmEx` bench on the DiT shapes (`/tmp/h3_perf_day10/gemm_bench.cu`),
+`n` = sequence rows:
+
+| Shape | BF16 | INT8 |
+|-------|-----:|-----:|
+| QKV `21504x5376`, n=6144 | 103.4 TFLOP/s | **166.9** |
+| attn out `5376x7168`, n=6144 | 94.4 | **159.3** |
+| FC1 `28672x5376`, n=6144 | 103.8 | — |
+| FC2 `5376x14336`, n=6144 | 96.4 | — |
+| square `8192³` | 97.9 | **150.4** |
+
+Two conclusions that redirected the plan:
+
+1. **cuBLAS BF16 is already saturated.** The DiT shapes hit 94–104 TFLOP/s and a
+   compute-bound `8192³` square hits 97.9, so the shapes are not the problem and
+   there is no tiling win to reclaim. A hand or CUTLASS BF16 GEMM would be
+   competing with cuBLAS at its own ceiling — **dropped**, not attempted.
+2. **INT8 runs at ~1.6× the BF16 rate** on exactly these shapes. That is where
+   the linear time is.
+
+## 2026-08-25 — REJECT cuBLASLt INT8 scale epilogue
+
+Goal was to fold `accum * input_scale * weight_scale` into the GEMM and delete
+the `h3_int8_apply_scales_bf16_kernel` launch, using
+`CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F` (per-`m` A scale × per-`n` B
+scale). Not supported on `sm_121` / CUDA 13.0. Probe
+(`/tmp/h3_perf_day10/lt_probe2.cu`), `heur` is `cublasLtMatmulAlgoGetHeuristic`:
+
+| A/B | D | scales | heuristic |
+|-----|---|--------|----------:|
+| i8 | i32 | none | 0 (ok) |
+| i8 | i8 | none | 0 (ok) |
+| i8 | f32 / bf16 / f16 | none | **15 NOT_SUPPORTED** |
+| i8 | i32 | alpha device vector | **7** |
+| i8 | bf16 / f32 | outer vec | **15** |
+| bf16 | bf16 | none | 0 (ok) |
+| bf16 | bf16 | outer vec | **7** |
+
+INT8 matmul on this GPU can only write `i32` or `i8`, and takes no per-vector
+scale, so the epilogue has to stay a separate kernel. fox-s2 with the code in
+place confirmed it: `ltfail=140`, every call fell back. Reverted.
+
+---
+
+## 2026-08-25 — KEEP INT8 MLP as the Spark default (row FC2)
+
+**Supersedes the 2026-08-23 "Spark defaults to BF16 MLP" entry.** That
+conclusion was an artifact of the *grouped* FC2 scale, not of INT8. A grouped
+1024-wide scale cannot be expressed as one cuBLAS GEMM, so it fell back to the
+`__dp4a` tile kernel; one row scale keeps FC2 on the cuBLAS INT8 GEMM.
+
+fox-s2 (`512² / 22f / steps=2 / L35 / reuse=1`), same binary:
+
+| MLP path | Denoise | gpu-op linear | Peak |
+|----------|--------:|--------------:|-----:|
+| INT8, grouped FC2 (`H3_INT8_GROUP_FC2=1`) | 5.16 s | 3.33 s | 13.3 GiB |
+| BF16 (previous default) | 3.01 s | 1.14 s | 20.6 GiB |
+| **INT8, row FC2 (new default)** | **2.87 s** | **0.81 s** | **13.3 GiB** |
+
+Interleaved fox-s2, two pairs:
+
+| Run | BF16 MLP | **INT8 row FC2** |
+|-----|---------:|-----------------:|
+| ab1 | 3.051 s (linear 1.167, sdpa 1.717) | 2.875 s (linear 0.810, sdpa 1.696) |
+| ab2 | 3.069 s (linear 1.177, sdpa 1.727) | 2.822 s (linear 0.817, sdpa 1.652) |
+
+Interleaved fox-fast (`steps=20 / L45 / reuse=2`, 11 evals), two pairs:
+
+| Metric | BF16 MLP | **INT8 row FC2** | Delta |
+|--------|---------:|-----------------:|------:|
+| GPU Euler denoise | 20.95 / 21.11 s | **19.66 / 19.84 s** | **−1.28 s** |
+| denoise gpu-op linear | 7.76 / 7.85 s | **5.35 / 5.39 s** | **−2.43 s (−31%)** |
+| denoise gpu-op sdpa | 12.09 / 12.14 s | 11.77 / 11.91 s | −0.28 s |
+| denoise leftover | 1.12 s | 2.54 s | **+1.42 s** |
+| DiT peak live | 26.63 GiB | **17.20 GiB** | −9.4 GiB |
+
+Denoise wall drops and the driver is linear, so this is a KEEP under the usual
+rule. Note the leftover **rises 1.42 s**: the INT8 path adds an
+`apply_scales` pass after each GEMM plus a re-quantize before FC2. That is the
+next target, not a reason to reject — the wall still drops 1.28 s.
+
+vs Metal M5 docs denoise 16.69 s → Spark **1.18×** (was 1.31×).
+
+### Accuracy
+
+The old INT8 mode of `h3_cuda_dit_forward_smoke` was a silent no-op: it only
+unset `H3_DISABLE_INT8_MLP` while the day-7 default flip also required
+`H3_INT8_MLP`, so it re-ran the BF16 path and printed an identical hash. Fixed,
+and the numerics are now gated where they mean something:
+
+- **`h3_cuda_ops` gates the MLP op at DiT width** (`rows 64, in 5376, hidden
+  14336, out 5376`): INT8 MLP vs BF16 MLP **relL2 0.0069**, gate `< 3e-2`. That
+  is ordinary INT8 error, and row FC2 is included in it.
+- The forward smoke's deep relL2 (video 0.87 / audio 1.56 over 25 blocks) only
+  measures how 0.7% per block compounds through a residual stream whose
+  velocity nearly cancels. It is now reported, not tightly gated.
+- Output-level check on the 20-step fox-fast videos, PSNR average:
+  **BF16 vs BF16 (two runs of the same config) 19.04 dB**, INT8 vs BF16
+  **20.69 / 19.82 dB**. The config change moves the output *less* than
+  re-running the same config does.
+
+The last line also documents that the pipeline is not bit-reproducible
+run-to-run even though `h3_dit_forward` itself is (the smoke's BF16 control is
+relL2 0). The nondeterminism is downstream of the DiT; not chased here.
+
+Opt out with `H3_BF16_MLP=1` or `--use-slower-bf16-mlp`; opt back into grouped
+FC2 scales with `H3_INT8_GROUP_FC2=1`. Logs: `/tmp/h3_perf_day10/fox-s2-i8row-ab*.log`,
+`fox-s2-bf16-ab*.log`, `fox-fast-i8-ff*.log`, `fox-fast-bf16-ff*.log`.
+---
