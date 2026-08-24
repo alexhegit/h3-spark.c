@@ -5529,6 +5529,73 @@ __global__ static void h3_int8_apply_scales_bf16_kernel(
     output[index] = h3_f32_to_bf16_bits(value);
 }
 
+struct h3_int8_swiglu_quant_args {
+    uint32_t rows;
+    uint32_t dispatch_rows;
+    uint32_t width;
+};
+
+/* One block per row: reads the FC1 int32 accumulator, applies the row and
+ * column scales, runs SwiGLU, and requantizes to INT8 without ever landing
+ * the BF16 gate/up pair or the activation in memory. The BF16 roundings match
+ * the split apply_scales → swiglu → quantize chain bit for bit. */
+__global__ static void h3_int8_swiglu_quant_kernel(
+    const int32_t *accum, const float *input_scales,
+    const float *weight_scales, int8_t *output, float *output_scales,
+    h3_int8_swiglu_quant_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.dispatch_rows) return;
+
+    extern __shared__ float shared[];
+    float *reductions = shared;
+    uint16_t *activated = (uint16_t *)(shared + threads);
+    size_t out_base = (size_t)row * args.width;
+    if (row >= args.rows) {
+        for (uint32_t column = tid; column < args.width; column += threads)
+            output[out_base + column] = 0;
+        if (tid == 0) output_scales[row] = 1.0f;
+        return;
+    }
+
+    const int32_t *row_accum = accum + (size_t)row * args.width * 2u;
+    float input_scale = input_scales[row];
+    float local_max = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float gate = h3_bf16_bits_to_f32(h3_f32_to_bf16_bits(
+            (float)row_accum[column] * input_scale * weight_scales[column]));
+        float up = h3_bf16_bits_to_f32(h3_f32_to_bf16_bits(
+            (float)row_accum[args.width + column] * input_scale *
+            weight_scales[args.width + column]));
+        uint16_t bits =
+            h3_f32_to_bf16_bits(gate / (1.0f + expf(-gate)) * up);
+        activated[column] = bits;
+        float magnitude = fabsf(h3_bf16_bits_to_f32(bits));
+        if (magnitude > local_max) local_max = magnitude;
+    }
+    reductions[tid] = local_max;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) {
+            float other = reductions[tid + stride];
+            if (other > reductions[tid]) reductions[tid] = other;
+        }
+        __syncthreads();
+    }
+    float row_max = reductions[0];
+    float scale = row_max > 0.0f ? row_max / 127.0f : 1.0f / 127.0f;
+    float inverse = row_max > 0.0f ? 127.0f / row_max : 127.0f;
+    if (tid == 0) output_scales[row] = scale;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        int quantized =
+            (int)rintf(h3_bf16_bits_to_f32(activated[column]) * inverse);
+        if (quantized > 127) quantized = 127;
+        if (quantized < -127) quantized = -127;
+        output[out_base + column] = (int8_t)quantized;
+    }
+}
+
 __global__ static void h3_linear_int8_naive_kernel(
     const int8_t *input, const int8_t *weight, const float *input_scales,
     const float *weight_scales, uint16_t *output, uint32_t rows,
@@ -5552,6 +5619,41 @@ __global__ static void h3_linear_int8_grouped_tiled_kernel(
     const float *weight_scales, uint16_t *output, uint32_t rows,
     uint32_t input_dim, uint32_t output_dim, uint32_t group_size,
     uint32_t groups);
+
+/* cuBLAS INT8 GEMM into the persistent int32 accumulator. Returns NULL when
+ * the buffer or the GEMM is unavailable so callers can fall back. */
+static int32_t *h3_int8_gemm_accum(h3_gpu *gpu, const void *weight,
+                                   const void *quantized_input, uint32_t rows,
+                                   uint32_t input_dim, uint32_t output_dim) {
+    size_t accum_bytes = (size_t)rows * output_dim * sizeof(int32_t);
+    if (gpu->int8_accum_bytes < accum_bytes) {
+        if (gpu->int8_accum) cudaFree(gpu->int8_accum);
+        gpu->int8_accum = NULL;
+        gpu->int8_accum_bytes = 0;
+        if (cudaMalloc((void **)&gpu->int8_accum, accum_bytes) == cudaSuccess)
+            gpu->int8_accum_bytes = accum_bytes;
+    }
+    if (!gpu->int8_accum) return NULL;
+    int32_t alpha = 1;
+    int32_t beta = 0;
+    cublasStatus_t status = cublasGemmEx(
+        gpu->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)output_dim, (int)rows,
+        (int)input_dim, &alpha, weight, CUDA_R_8I, (int)input_dim,
+        quantized_input, CUDA_R_8I, (int)input_dim, &beta, gpu->int8_accum,
+        CUDA_R_32I, (int)output_dim, CUBLAS_COMPUTE_32I,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status != CUBLAS_STATUS_SUCCESS)
+        status = cublasGemmEx(
+            gpu->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)output_dim, (int)rows,
+            (int)input_dim, &alpha, weight, CUDA_R_8I, (int)input_dim,
+            quantized_input, CUDA_R_8I, (int)input_dim, &beta, gpu->int8_accum,
+            CUDA_R_32I, (int)output_dim, CUBLAS_COMPUTE_32I,
+            CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS) return NULL;
+    gpu->int8_cublas_ok++;
+    gpu->stats.direct_dispatches++;
+    return gpu->int8_accum;
+}
 
 static int h3_gpu_linear_int8_bf16_impl(
     h3_gpu *gpu, h3_gpu_tensor *output, h3_gpu_tensor *quantized_input,
@@ -5607,45 +5709,19 @@ static int h3_gpu_linear_int8_bf16_impl(
     }
 
     /* Prefer cuBLAS INT8 GEMM; keep a persistent accum. */
-    size_t accum_bytes = output_count * sizeof(int32_t);
-    if (gpu->int8_accum_bytes < accum_bytes) {
-        if (gpu->int8_accum) cudaFree(gpu->int8_accum);
-        gpu->int8_accum = NULL;
-        gpu->int8_accum_bytes = 0;
-        if (cudaMalloc((void **)&gpu->int8_accum, accum_bytes) == cudaSuccess)
-            gpu->int8_accum_bytes = accum_bytes;
-    }
-    if (gpu->int8_accum) {
-        int32_t alpha = 1;
-        int32_t beta = 0;
-        cublasStatus_t status = cublasGemmEx(
-            gpu->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)output_dim, (int)rows,
-            (int)input_dim, &alpha, weight->device, CUDA_R_8I, (int)input_dim,
-            quantized_input->device, CUDA_R_8I, (int)input_dim, &beta,
-            gpu->int8_accum, CUDA_R_32I, (int)output_dim, CUBLAS_COMPUTE_32I,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        if (status != CUBLAS_STATUS_SUCCESS)
-            status = cublasGemmEx(
-                gpu->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)output_dim,
-                (int)rows, (int)input_dim, &alpha, weight->device, CUDA_R_8I,
-                (int)input_dim, quantized_input->device, CUDA_R_8I,
-                (int)input_dim, &beta, gpu->int8_accum, CUDA_R_32I,
-                (int)output_dim, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
-        if (status == CUBLAS_STATUS_SUCCESS) {
-            gpu->int8_cublas_ok++;
-            gpu->stats.direct_dispatches++;
-            unsigned threads = 256;
-            unsigned blocks =
-                (unsigned)((output_count + threads - 1) / threads);
-            h3_int8_apply_scales_bf16_kernel<<<blocks, threads, 0,
-                                                 gpu->stream>>>(
-                gpu->int8_accum, (const float *)input_scales->device,
-                (const float *)weight_scales->device, (uint16_t *)output->device,
-                rows, output_dim);
-            gpu->stats.direct_dispatches++;
-            return h3_cuda_check(gpu, cudaGetLastError(),
-                                 "h3_int8_apply_scales_bf16");
-        }
+    int32_t *accum =
+        h3_int8_gemm_accum(gpu, weight->device, quantized_input->device, rows,
+                           input_dim, output_dim);
+    if (accum) {
+        unsigned threads = 256;
+        unsigned blocks = (unsigned)((output_count + threads - 1) / threads);
+        h3_int8_apply_scales_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+            accum, (const float *)input_scales->device,
+            (const float *)weight_scales->device, (uint16_t *)output->device,
+            rows, output_dim);
+        gpu->stats.direct_dispatches++;
+        return h3_cuda_check(gpu, cudaGetLastError(),
+                             "h3_int8_apply_scales_bf16");
     }
 
     if (gpu->int8_naive_fallback++ == 0)
@@ -6100,6 +6176,50 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         return h3_gpu_fail(gpu, "invalid INT8 MLP request");
     if (input_is_quantized && !int8_fc1)
         return h3_gpu_fail(gpu, "prequantized MLP input requires int8 FC1");
+
+    /* Default: one kernel turns the FC1 int32 accumulator into the INT8 FC2
+     * input, so neither the gate/up pair nor the activation is ever written as
+     * BF16. Opt out with H3_SPLIT_INT8_SWIGLU=1. */
+    unsigned fused_threads = 256;
+    size_t fused_shared =
+        fused_threads * sizeof(float) + (size_t)hidden_dim * sizeof(uint16_t);
+    if (int8_fc1 && int8_fc2 && !grouped_fc2 && fused_shared <= 46u * 1024u &&
+        !h3_env_on("H3_SPLIT_INT8_SWIGLU")) {
+        if (!input_is_quantized &&
+            !h3_gpu_quantize_bf16_int8_rows(gpu, quantized_activation,
+                                            activation_scales, input, rows,
+                                            padded_rows, input_dim, 1.0f))
+            return 0;
+        h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
+        int32_t *accum =
+            h3_int8_gemm_accum(gpu, fc1_weight->device,
+                               quantized_activation->device, rows, input_dim,
+                               hidden_dim * 2u);
+        int fused_ok = 0;
+        if (accum) {
+            /* The scale buffer is read as the FC1 input scale and rewritten as
+             * the FC2 input scale; every read of a row precedes the reduction
+             * barrier in the block that owns it, so the reuse is safe. */
+            h3_int8_swiglu_quant_args args = {rows, padded_rows, hidden_dim};
+            h3_int8_swiglu_quant_kernel<<<padded_rows, fused_threads,
+                                            fused_shared, gpu->stream>>>(
+                accum, (const float *)activation_scales->device,
+                (const float *)fc1_scales->device,
+                (int8_t *)quantized_activation->device,
+                (float *)activation_scales->device, args);
+            gpu->stats.direct_dispatches++;
+            fused_ok = h3_cuda_check(gpu, cudaGetLastError(),
+                                     "h3_int8_swiglu_quant");
+        }
+        h3_gpu_op_end(gpu);
+        if (fused_ok)
+            return h3_gpu_linear_int8_bf16_impl(
+                gpu, output, quantized_activation, activation_scales, NULL,
+                fc2_weight, fc2_scales, rows, hidden_dim, output_dim, 0, 1);
+        if (accum) return 0; /* the kernel failed, not the GEMM buffer */
+        /* No INT8 GEMM available: fall through to the split path. */
+        if (!input_is_quantized) input_is_quantized = 1;
+    }
 
     h3_gpu_tensor *fc1_fused = h3_gpu_workspace_bf16(
         gpu, &gpu->ws_int8_fc1, (size_t)rows * hidden_dim * 2u);

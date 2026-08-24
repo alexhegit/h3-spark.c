@@ -1119,3 +1119,48 @@ Opt out with `H3_BF16_MLP=1` or `--use-slower-bf16-mlp`; opt back into grouped
 FC2 scales with `H3_INT8_GROUP_FC2=1`. Logs: `/tmp/h3_perf_day10/fox-s2-i8row-ab*.log`,
 `fox-s2-bf16-ab*.log`, `fox-fast-i8-ff*.log`, `fox-fast-bf16-ff*.log`.
 ---
+
+## 2026-08-25 — KEEP fused INT8 FC1 epilogue (scale + SwiGLU + requantize)
+
+The INT8 MLP's leftover cost was three separate passes between the two GEMMs:
+`apply_scales` wrote the `[rows, 2*hidden]` gate/up pair as BF16, SwiGLU read it
+and wrote `[rows, hidden]`, then the row quantizer read that twice (max, then
+quantize). One kernel now does all of it from the int32 accumulator — one block
+per row, the activation staged in 28 KiB of shared memory instead of HBM — so
+neither the gate/up pair nor the activation is ever written to memory.
+
+The BF16 roundings are applied at the same three points as the split chain, so
+this is bit-identical, not an approximation: `h3_cuda_ops` reports the same
+relL2 0.00691 and the forward smoke the same 0.8693 / 1.556.
+
+fox-s2 interleaved (`H3_SPLIT_INT8_SWIGLU=1` is the split control):
+
+| Run | **Fused** | Split |
+|-----|----------:|------:|
+| ab1 | 2.713 s (linear 0.766) | 2.834 s (linear 0.806) |
+| ab2 | 2.798 s (linear 0.793) | 2.877 s (linear 0.807) |
+
+Both fused runs beat both split runs. Dispatches per run 866 vs 1006 (two
+kernels × 70 block invocations), denoise scratch alloc 0.075 vs 0.175 GiB — the
+`ws_int8_fc1` workspace is gone.
+
+fox-fast (20 steps, 45 layers):
+
+| Metric | **Fused** | Split | Δ |
+|--------|----------:|------:|--:|
+| denoise wall | **20.10 s** | 20.70 s | −0.60 s |
+| denoise gpu-op linear | 5.414 s | 5.475 s | −0.06 s |
+| denoise gpu-op sdpa | 12.687 s | 12.689 s | ±0 |
+| denoise leftover | **2.00 s** | 2.54 s | −0.54 s |
+| dispatches | 6165 | 7155 | −990 |
+
+So the +1.42 s leftover the INT8 flip introduced is now +0.88 s, and the win is
+entirely in the leftover as intended: SDPA is unchanged to 2 ms. Denoise vs
+Metal M5 docs 16.69 s → **1.20×**.
+
+Opt out with `H3_SPLIT_INT8_SWIGLU=1`. The fused path requires row FC2 scales
+(the grouped variant cannot share the row reduction) and `hidden*2 B` of shared
+memory, so it self-disables above ~23k hidden. Logs:
+`/tmp/h3_perf_day11/fox-s2-fused*.log`, `fox-s2-split*.log`,
+`fox-fast-fused.log`, `fox-fast-split.log`.
+---
