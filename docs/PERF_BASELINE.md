@@ -756,3 +756,19 @@ A separate kernel doing two columns per thread with the same `expf` math
 ab2 scalar SDPA looks noisy (1.785 s vs ~1.70 s). ab1 x2 is slower. Reverted.
 Logs: `/tmp/h3_perf_day9/fox-s2-swiglu-x2-ab1.log`, `fox-s2-swiglu-scalar-ab1.log`.
 
+---
+
+## 2026-08-24 — REJECT warp AdaLN reduce
+
+Separate kernels using warp-shuffle + 8-wide smem reduce (instead of a 256-wide
+tree) did not drop leftover AdaLN. Interleaved fox-s2 denoise:
+
+| Run | Tree | **Warp** |
+|-----|-----:|---------:|
+| ab1 | 3.146 s | 3.035 s |
+| ab2 | 3.110 s | 3.086 s |
+
+Leftover denoise − sdpa − linear stayed **0.167 / 0.166 s** on both sides. ab1
+wall tracks SDPA noise (1.766 s vs 1.688 s). Reverted. Logs:
+`/tmp/h3_perf_day9/fox-s2-adaln-warp-ab1.log`, `fox-s2-adaln-tree-ab1.log`.
+
