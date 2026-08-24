@@ -952,3 +952,18 @@ SDPA delta is within noise; linear moved as much as SDPA so wall is not a
 real denoise win. Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-q8-pairk-ab1.log`,
 `fox-s2-q8-pipe-ab1.log`.
 ---
+
+## 2026-08-24 — REJECT Q6 wave SDPA
+
+Separate d128 Q6 kernel (depth-1 K/V pipe, 6 queries/block). Occupancy
+between Q4 and Q8; not Q10 register spill. fox-s2 interleaved
+`H3_SDPA_D128_Q6=1`:
+
+| Run | Q8 | **Q6** |
+|-----|---:|-------:|
+| ab1 | 3.038 s (sdpa 1.711) | 3.170 s (sdpa 1.815) |
+| ab2 | 3.016 s (sdpa 1.712) | 3.235 s (sdpa 1.840) |
+
+SDPA ~100–130 ms slower; denoise wall follows. Reverted. Logs:
+`/tmp/h3_perf_day9/fox-s2-q6-ab1.log`, `fox-s2-q8-ab1.log`.
+---
