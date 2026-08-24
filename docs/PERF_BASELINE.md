@@ -935,3 +935,20 @@ fox-s2 interleaved `H3_SDPA_Q8_BF16X2=1`:
 SDPA ~210 ms slower; denoise wall follows. Reverted. Logs:
 `/tmp/h3_perf_day9/fox-s2-q8-bf16x2-ab1.log`, `fox-s2-q8-float-ab1.log`.
 ---
+
+## 2026-08-24 — REJECT Q8 pair-K consume
+
+Separate Q8 kernel: step K by two, consume K[i] then prefetch K[i+2], consume
+K[i+1] then prefetch K[i+3]. Same two live K/V slots as the depth-1 pipe;
+not K-unroll 4 or depth-2 triple-buffer. fox-s2 interleaved
+`H3_SDPA_Q8_PAIRK=1`:
+
+| Run | Depth-1 pipe | **Pair-K** |
+|-----|-------------:|-----------:|
+| ab1 | 3.254 s (sdpa 1.818, linear 1.268) | 3.145 s (sdpa 1.763, linear 1.213) |
+| ab2 | 3.099 s (sdpa 1.746, linear 1.187) | 3.039 s (sdpa 1.731, linear 1.143) |
+
+SDPA delta is within noise; linear moved as much as SDPA so wall is not a
+real denoise win. Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-q8-pairk-ab1.log`,
+`fox-s2-q8-pipe-ab1.log`.
+---
