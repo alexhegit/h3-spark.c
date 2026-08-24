@@ -3671,6 +3671,90 @@ int h3_gpu_gate_adaln_bf16(
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_gate_adaln_bf16");
 }
 
+
+/* Single kernel: fused gate+AdaLN then INT8 row quantize from smem.
+ * Avoids writing the BF16 AdaLN temp to HBM. Opt out H3_SPLIT_ADALN_QUANT=1. */
+__global__ static void h3_gate_adaln_quantize_int8_kernel(
+    const uint16_t *residual, const uint16_t *branch,
+    const uint16_t *gate_modulation, const uint32_t *row_map,
+    const uint16_t *weight, const uint16_t *norm_modulation,
+    uint16_t *gated_residual, int8_t *quantized, float *scales,
+    h3_gate_adaln_args args, uint32_t padded_rows) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= padded_rows) return;
+    extern __shared__ unsigned char shared_raw[];
+    float *reductions = (float *)shared_raw;
+    uint16_t *row_values =
+        (uint16_t *)(shared_raw + threads * sizeof(float));
+    size_t out_base = (size_t)row * args.width;
+    if (row >= args.rows) {
+        for (uint32_t column = tid; column < args.width; column += threads)
+            quantized[out_base + column] = 0;
+        if (tid == 0) scales[row] = 1.0f;
+        return;
+    }
+    size_t base = (size_t)row_map[row] * args.slots * args.width;
+    float local_sum = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        size_t index = (size_t)row * args.width + column;
+        float gate = h3_bf16_bits_to_f32(
+            gate_modulation[base + args.gate_slot * args.width + column]);
+        uint16_t gated = h3_f32_to_bf16_bits(
+            h3_bf16_bits_to_f32(residual[index]) +
+            h3_bf16_bits_to_f32(branch[index]) * gate);
+        gated_residual[index] = gated;
+        row_values[column] = gated;
+        float value = h3_bf16_bits_to_f32(gated);
+        local_sum = fmaf(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float inverse =
+        rsqrtf(reductions[0] / (float)args.width + args.epsilon);
+    float local_max = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float normalized = h3_bf16_bits_to_f32(row_values[column]) *
+                           inverse * h3_bf16_bits_to_f32(weight[column]);
+        float shift = h3_bf16_bits_to_f32(
+            norm_modulation[base + args.shift_slot * args.width + column]);
+        float scale = h3_bf16_bits_to_f32(
+            norm_modulation[base + args.scale_slot * args.width + column]);
+        uint16_t bits =
+            h3_f32_to_bf16_bits(normalized * (1.0f + scale) + shift);
+        row_values[column] = bits;
+        float absv = fabsf(h3_bf16_bits_to_f32(bits));
+        if (absv > local_max) local_max = absv;
+    }
+    reductions[tid] = local_max;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) {
+            float other = reductions[tid + stride];
+            if (other > reductions[tid]) reductions[tid] = other;
+        }
+        __syncthreads();
+    }
+    float clipped_max = reductions[0];
+    float qscale =
+        clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
+    float qinv = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    if (tid == 0) scales[row] = qscale;
+    __syncthreads();
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float value = h3_bf16_bits_to_f32(row_values[column]) * qinv;
+        int qv = (int)rintf(value);
+        if (qv > 127) qv = 127;
+        if (qv < -127) qv = -127;
+        quantized[out_base + column] = (int8_t)qv;
+    }
+}
+
 struct h3_rms_inverse_args {
     uint32_t rows;
     uint32_t width;
@@ -6092,6 +6176,42 @@ int h3_gpu_gate_adaln_quantize_int8(
         !norm_modulation || !row_map || !rows || padded_rows < rows || !width ||
         gate_slot >= slots || shift_slot >= slots || scale_slot >= slots)
         return h3_gpu_fail(gpu, "invalid gate AdaLN quantize request");
+
+    /* Default: single kernel. Opt out H3_SPLIT_ADALN_QUANT=1. */
+    if (!h3_env_on("H3_SPLIT_ADALN_QUANT") && width <= 5376u &&
+        gated_residual->dtype == H3_GPU_BF16 &&
+        quantized_output->dtype == H3_GPU_I8 &&
+        quantized_scales->dtype == H3_GPU_F32 &&
+        residual->dtype == H3_GPU_BF16 && branch->dtype == H3_GPU_BF16 &&
+        norm_weight->dtype == H3_GPU_BF16 &&
+        gate_modulation->dtype == H3_GPU_BF16 &&
+        norm_modulation->dtype == H3_GPU_BF16 &&
+        row_map->dtype == H3_GPU_U32 &&
+        gated_residual->elements >= elements &&
+        quantized_output->elements >= (size_t)padded_rows * width &&
+        quantized_scales->elements >= padded_rows &&
+        residual->elements >= elements && branch->elements >= elements &&
+        norm_weight->elements >= width && row_map->elements >= rows) {
+        h3_gate_adaln_args args = {rows, width, slots, gate_slot, shift_slot,
+                                   scale_slot, epsilon};
+        unsigned threads = 256;
+        size_t shared_bytes =
+            threads * sizeof(float) + (size_t)width * sizeof(uint16_t);
+        h3_gate_adaln_quantize_int8_kernel<<<padded_rows, threads,
+                                               shared_bytes, gpu->stream>>>(
+            (const uint16_t *)residual->device,
+            (const uint16_t *)branch->device,
+            (const uint16_t *)gate_modulation->device,
+            (const uint32_t *)row_map->device,
+            (const uint16_t *)norm_weight->device,
+            (const uint16_t *)norm_modulation->device,
+            (uint16_t *)gated_residual->device,
+            (int8_t *)quantized_output->device,
+            (float *)quantized_scales->device, args, padded_rows);
+        gpu->stats.direct_dispatches++;
+        return h3_cuda_check(gpu, cudaGetLastError(),
+                             "h3_gate_adaln_quantize_int8");
+    }
 
     h3_gpu_tensor *adaln =
         h3_gpu_workspace_bf16(gpu, &gpu->ws_adaln, elements);

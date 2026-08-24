@@ -689,3 +689,37 @@ fox-s2 denoise vs the depth-1 software pipeline. Interleaved A/B:
 vs **1.72 / 1.86 s**. Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-q8-pipe1-ab1.log`,
 `fox-s2-q8-pipe3-ab1.log`.
 
+---
+
+## 2026-08-24 — KEEP fused gate AdaLN + INT8 row quantize
+
+Replace the two-kernel wrapper (`h3_gpu_gate_adaln_bf16` then
+`h3_gpu_quantize_bf16_int8_rows`) with one kernel that keeps gated/AdaLN BF16
+in smem and writes INT8+scales. Skips the BF16 AdaLN HBM temp. Default on;
+opt-out `H3_SPLIT_ADALN_QUANT=1`.
+
+`h3_cuda_ops` and DiT block smoke passed with fused and split paths.
+
+fox-s2 (steps 2 / L35 / reuse 1), interleaved:
+
+| Metric | Two kernels | **Fused** |
+|--------|------------:|----------:|
+| GPU Euler denoise | 3.051 / 3.046 s | **3.022 / 3.026 s** |
+| denoise gpu-op sdpa | 1.728 / 1.699 s | 1.705 / 1.717 s |
+| denoise gpu-op linear | 1.147 / 1.170 s | 1.152 / 1.145 s |
+| direct launches | 862 | **796** |
+| denoise alloc | 0.244 GiB | **0.225 GiB** |
+
+fox-fast (steps 20 / L45 / reuse 2), interleaved:
+
+| Metric | Two kernels | **Fused** |
+|--------|------------:|----------:|
+| GPU Euler denoise | 21.967 / 21.974 s | **21.911 / 21.867 s** |
+| denoise gpu-op sdpa | 12.848 / 12.878 s | 12.837 / 12.858 s |
+| denoise gpu-op linear | 7.896 / 7.898 s | 7.916 / 7.867 s |
+| direct launches | 6121 | **5670** |
+| denoise alloc | 0.247 GiB | **0.228 GiB** |
+
+Denoise wall dropped on both gates. Logs: `/tmp/h3_perf_day9/fox-s2-fused-ab1.log`,
+`fox-s2-two-ab1.log`, `fox-fast-fused-ab1.log`, `fox-fast-two-ab1.log`.
+
