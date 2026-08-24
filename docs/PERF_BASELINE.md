@@ -723,3 +723,21 @@ fox-fast (steps 20 / L45 / reuse 2), interleaved:
 Denoise wall dropped on both gates. Logs: `/tmp/h3_perf_day9/fox-s2-fused-ab1.log`,
 `fox-s2-two-ab1.log`, `fox-fast-fused-ab1.log`, `fox-fast-two-ab1.log`.
 
+---
+
+## 2026-08-24 — REJECT fused INT8 QKV scale+RoPE
+
+Folding INT8 GEMM int32 accum + scales into the cooperative QKV/RoPE kernel
+skipped the BF16 QKV temp (alloc 0.225 → 0.150 GiB, 796 → 726 launches) but did
+not drop fox-s2 denoise wall. Interleaved A/B:
+
+| Run | Split | **Fused** |
+|-----|------:|----------:|
+| ab1 | 3.011 s | 3.017 s |
+| ab2 | 3.184 s | 2.933 s |
+| ab3 | 3.005 s | 3.129 s |
+
+ab2 split looks like SDPA noise (1.803 s vs ~1.71 s). ab1/ab3 fused is not
+faster. Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-qkvrope-fused-ab1.log`,
+`fox-s2-qkvrope-split-ab1.log`.
+
