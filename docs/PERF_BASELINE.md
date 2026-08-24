@@ -861,4 +861,18 @@ RMS. fox-s2 interleaved `H3_QKV_ROPE_VEC2=1`:
 
 Leftover denoise − sdpa − linear unchanged. ab1 wall tracks SDPA noise.
 Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-vec2-ab1.log`, `fox-s2-coop-ab1.log`.
+---
+
+## 2026-08-24 — REJECT Q8 SDPA exp2f softmax
+
+Separate Q8 kernel using `exp2f((x)*log2(e))` instead of `__expf`. fox-s2
+interleaved `H3_SDPA_Q8_EXP2=1`:
+
+| Run | `__expf` | **exp2f** |
+|-----|---------:|----------:|
+| ab1 | 3.094 s (sdpa 1.754) | 3.194 s (sdpa 1.781) |
+| ab2 | 3.076 s (sdpa 1.735) | 3.109 s (sdpa 1.752) |
+
+Slower SDPA and denoise wall. Reverted. Logs:
+`/tmp/h3_perf_day9/fox-s2-exp2-ab1.log`, `fox-s2-expf-ab1.log`.
 
