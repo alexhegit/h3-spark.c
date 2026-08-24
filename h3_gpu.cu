@@ -9,6 +9,7 @@ extern "C" {
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -493,9 +494,114 @@ static int h3_gpu_open_stage_fd(h3_gpu *gpu, const char *path, char *error,
     return fd;
 }
 
+/* Weight loading is disk-read bound: a single pread stream reaches about
+ * 0.94 GB/s on the Spark NVMe while eight concurrent readers reach 4.5 GB/s,
+ * because the device needs queue depth to stay busy. Large tensors are read by
+ * a fan-out of pread slices so the loader tracks the parallel rate instead of
+ * the single-stream rate. Set H3_LOAD_READ_THREADS=1 to force the serial path.
+ */
+#define H3_LOAD_READ_THREADS_MAX 16
+#define H3_LOAD_READ_SLICE_MIN ((size_t)4 << 20)
+
+typedef struct {
+    const char *path;
+    unsigned char *buffer;
+    uint64_t offset;
+    size_t bytes;
+    int ok;
+} h3_read_slice;
+
+static int h3_read_fd_range(int fd, unsigned char *buffer, uint64_t offset,
+                            size_t bytes) {
+    size_t done = 0;
+    while (done < bytes) {
+        size_t chunk = bytes - done;
+        if (chunk > (size_t)1 << 30) chunk = (size_t)1 << 30;
+        ssize_t got = pread(fd, buffer + done, chunk, (off_t)(offset + done));
+        if (got <= 0) return 0;
+        done += (size_t)got;
+    }
+    return 1;
+}
+
+static void *h3_read_slice_worker(void *raw) {
+    h3_read_slice *slice = (h3_read_slice *)raw;
+    slice->ok = 0;
+    int fd = open(slice->path, O_RDONLY);
+    if (fd < 0) return NULL;
+    slice->ok =
+        h3_read_fd_range(fd, slice->buffer, slice->offset, slice->bytes);
+    close(fd);
+    return NULL;
+}
+
+static int h3_read_threads(void) {
+    const char *value = getenv("H3_LOAD_READ_THREADS");
+    int threads = 12;
+    if (value && *value) {
+        long parsed = strtol(value, NULL, 10);
+        if (parsed >= 1 && parsed <= H3_LOAD_READ_THREADS_MAX)
+            threads = (int)parsed;
+    }
+    return threads;
+}
+
+static int h3_read_file_parallel(const char *path, uint64_t offset,
+                                 void *buffer, size_t bytes, int threads) {
+    /* Slice on 1 MiB boundaries so each reader issues aligned requests. */
+    size_t slice_bytes = (bytes + (size_t)threads - 1) / (size_t)threads;
+    slice_bytes = (slice_bytes + ((size_t)1 << 20) - 1) & ~(((size_t)1 << 20) - 1);
+    h3_read_slice slices[H3_LOAD_READ_THREADS_MAX];
+    pthread_t workers[H3_LOAD_READ_THREADS_MAX];
+    int count = 0;
+    for (size_t start = 0; start < bytes && count < threads;
+         start += slice_bytes) {
+        size_t span = bytes - start;
+        if (span > slice_bytes) span = slice_bytes;
+        slices[count].path = path;
+        slices[count].buffer = (unsigned char *)buffer + start;
+        slices[count].offset = offset + start;
+        slices[count].bytes = span;
+        slices[count].ok = 0;
+        count++;
+    }
+    if (!count) return 0;
+    int spawned = 0;
+    for (int i = 1; i < count; i++) {
+        if (pthread_create(&workers[i], NULL, h3_read_slice_worker,
+                           &slices[i]) != 0)
+            break;
+        spawned = i;
+    }
+    h3_read_slice_worker(&slices[0]);
+    int ok = slices[0].ok;
+    for (int i = 1; i <= spawned; i++) {
+        pthread_join(workers[i], NULL);
+        if (!slices[i].ok) ok = 0;
+    }
+    /* Any slice we failed to spawn still has to be read. */
+    for (int i = spawned + 1; i < count; i++) {
+        h3_read_slice_worker(&slices[i]);
+        if (!slices[i].ok) ok = 0;
+    }
+    return ok;
+}
+
 static int h3_read_file_at(h3_gpu *gpu, const char *path, uint64_t offset,
                            void *buffer, size_t bytes, char *error,
                            size_t error_size) {
+    int threads = h3_read_threads();
+    if (threads > 1 && bytes >= H3_LOAD_READ_SLICE_MIN * 2) {
+        size_t want = bytes / H3_LOAD_READ_SLICE_MIN;
+        if (want < (size_t)threads) threads = (int)want;
+        if (h3_read_file_parallel(path, offset, buffer, bytes, threads))
+            return 1;
+        if (error && error_size) {
+            snprintf(error, error_size, "cannot read %zu bytes from %s", bytes,
+                     path);
+        }
+        return 0;
+    }
     int fd = h3_gpu_open_stage_fd(gpu, path, error, error_size);
     if (fd < 0) return 0;
     size_t done = 0;

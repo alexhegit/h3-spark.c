@@ -1286,3 +1286,63 @@ rows per block. fox-fast, interleaved:
 so doubling the warps per block halves the blocks resident per SM without
 buying anything: the K/V tile was never the constraint. Reverted.
 ---
+
+## 2026-08-25 — KEEP parallel weight reads (e2e 56.3 s → 37.0 s)
+
+With denoise down to 8.8 s, the run is dominated by weight loading: 22.3 s for
+the DiT and 13.3 s for the text encoder out of a 56.3 s fox-fast wall. Both ran
+at 0.6 GB/s, which is not a disk limit and not a copy limit — the reads and the
+H2D copies already overlap through the pinned double buffer, so the wall is the
+read rate of a single `pread` stream. The device just needs queue depth:
+
+| Concurrent readers, 8 MiB requests | Throughput |
+|-----------------------------------:|-----------:|
+| 1 | 0.94 GB/s |
+| 2 | 1.32 GB/s |
+| 4 | 2.55 GB/s |
+| 8 | 4.50 GB/s |
+
+So `h3_read_file_at` now fans a tensor out over up to 12 `pread` slices on
+1 MiB boundaries (each worker opens its own descriptor; the calling thread takes
+slice 0 and joins the rest). Tensors under 8 MiB, and `H3_LOAD_READ_THREADS=1`,
+still take the original serial path. DiT weights are 231–308 MB per tensor, so
+nearly all of the bytes go through the parallel path.
+
+fox-s2 (`512² / 22f / steps=2 / L35 / reuse=1`), interleaved:
+
+| Metric | **12 readers** | 1 reader | Δ |
+|--------|---------------:|---------:|--:|
+| text encoder | **6.36 / 6.50 s** | 12.72 / 13.70 s | −2.05× |
+| DiT load | **8.52 / 8.56 s** | 14.64 / 17.32 s | −1.87× |
+| denoise | 1.31 s | 1.31 s | ±noise |
+
+fox-fast (20 steps, 45 layers), interleaved:
+
+| Metric | **12 readers** | 1 reader | Δ |
+|--------|---------------:|---------:|--:|
+| text encoder | **6.38 s** | 13.13 s | −6.8 s |
+| DiT load | **9.94 s** | 22.06 s | −12.1 s |
+| DiT total | **19.02 s** | 31.15 s | −12.1 s |
+| video VAE prefetch | **1.35 s** | 1.76 s | −0.4 s |
+| denoise | 8.86 s | 8.88 s | ±noise |
+| **e2e wall** | **37.0 s** | 56.3 s | **−19.3 s** |
+
+Reader-count sweep on fox-s2 DiT load: 4 → 10.64 s, 8 → 8.52 s, 12 → 8.05 s,
+16 → 7.98 s. Twelve is where the curve flattens, so that is the default.
+
+### Correctness
+
+Bytes are bytes: `h3_cuda_dit_forward_smoke` produces video hash
+`ab054bb20d9c4c83` and audio hash `863553009bcf1b83` with both 12 readers and
+`H3_LOAD_READ_THREADS=1`, i.e. the weights land bit-identically. `h3_tests`
+(1772 checks), `h3_cuda_ops`, `h3_cuda_dit_block_smoke` and
+`h3_cuda_video_vae_smoke` all pass. The parallel path also touches no shared
+loader state, so it is safer than the serial one under the background video VAE
+prefetch, which reads on its own thread.
+
+The remaining load time is no longer a single stream's read rate; the DiT's
+9.9 s for its weight set is a mix of per-tensor GPU quantization and the read
+fan-out not reaching full depth on the smaller tensors. Logs:
+`/tmp/h3_perf_day12/fox-s2-{par,ser,t4,t12,t16}*.log`,
+`fox-fast-{ffpar,ffser,default}.log`.
+---
