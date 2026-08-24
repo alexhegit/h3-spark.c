@@ -1271,3 +1271,18 @@ The other half of the video VAE, its 3.55 s of FP32 attention, is untouched:
 the DiT's MMA kernel is head_dim 128 only, and an FP16 path there would raise
 the same question this measurement just answered.
 ---
+
+## 2026-08-25 — REJECT 128-query MMA tile
+
+Eight warps per block sharing each K/V tile instead of four, i.e. 128 query
+rows per block. fox-fast, interleaved:
+
+| Run | 64 rows (kept) | **128 rows** |
+|-----|---------------:|-------------:|
+| ab1 | 8.793 s (sdpa 1.602) | 9.609 s (sdpa 2.444) |
+| ab2 | 8.778 s (sdpa 1.588) | 9.750 s (sdpa 2.437) |
+
+53% slower attention. The output accumulator is already 64 registers per lane,
+so doubling the warps per block halves the blocks resident per SM without
+buying anything: the K/V tile was never the constraint. Reverted.
+---
