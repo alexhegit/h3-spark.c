@@ -4902,6 +4902,289 @@ h3_sdpa_f32_wave_d64_q4_kernel(const float *query, const float *key,
     }
 }
 
+/* Tensor-core attention for the video VAE's F32, head_dim 64 attention. Same
+ * flash shape as the DiT's BF16 kernel: one block per 64-query tile per head,
+ * four warps, 64-key stride, online softmax in registers. The inputs are F32
+ * in memory and get narrowed to FP16 on the way into the tiles — 11 bits of
+ * mantissa, more than either BF16 or TF32 offers, and the products still
+ * accumulate in F32. */
+enum { H3_MMA_F32_M = 64u, H3_MMA_F32_N = 64u, H3_MMA_F32_LD = 72u };
+
+/* One FP16 keeps 11 bits of mantissa, which leaves the scores about 0.4% off an
+ * exact F32 dot product — fine for the DiT, whose inputs are BF16 anyway, but
+ * this attention is the only 16-bit step in an otherwise F32 decoder. So each
+ * F32 splits into a high and a low FP16 and Q·Kᵀ is summed as
+ * hi·hi + hi·lo + lo·hi, which recovers ~22 bits at the cost of three MMAs per
+ * score tile instead of one. P·V stays single FP16: P is in [0, 1] and enters a
+ * positive-weight average, so it contributes an order of magnitude less error.
+ */
+__device__ __forceinline__ static uint32_t h3_pack_f16_hi_pair(float low,
+                                                               float high) {
+    return h3_pack_f16_pair(low, high);
+}
+
+__device__ __forceinline__ static uint32_t h3_pack_f16_lo_pair(float low,
+                                                               float high) {
+    float low_residual =
+        low - __half2float(__ushort_as_half((unsigned short)h3_f16_bits(low)));
+    float high_residual =
+        high -
+        __half2float(__ushort_as_half((unsigned short)h3_f16_bits(high)));
+    return h3_pack_f16_pair(low_residual, high_residual);
+}
+
+__global__ __launch_bounds__(128) static void h3_sdpa_f32_mma_d64_kernel(
+    const float *__restrict__ query, const float *__restrict__ key,
+    const float *__restrict__ value, float *__restrict__ output,
+    h3_sdpa_args args) {
+    __shared__ uint16_t k_tile[H3_MMA_F32_N * H3_MMA_F32_LD];
+    __shared__ uint16_t k_low_tile[H3_MMA_F32_N * H3_MMA_F32_LD];
+    __shared__ uint16_t v_tile[H3_MMA_F32_N * H3_MMA_F32_LD];
+    __shared__ uint16_t v_low_tile[H3_MMA_F32_N * H3_MMA_F32_LD];
+    /* Q is read into fragments before the loop's first barrier, so its two
+     * halves borrow the V and low-K tiles. */
+    uint16_t *q_tile = v_tile;
+    uint16_t *q_low_tile = k_low_tile;
+
+    const uint32_t sequence = args.sequence;
+    const uint32_t heads = args.heads;
+    const uint32_t head = (uint32_t)blockIdx.y;
+    const uint32_t m0 = (uint32_t)blockIdx.x * H3_MMA_F32_M;
+    const uint32_t tid = (uint32_t)threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t group = lane >> 2u;
+    const uint32_t tig = lane & 3u;
+    const uint32_t row_a = warp * 16u + group;
+    const uint32_t row_b = row_a + 8u;
+
+    for (uint32_t i = tid; i < H3_MMA_F32_M * 32u; i += 128u) {
+        uint32_t row = i >> 5u;
+        uint32_t column = (i & 31u) * 2u;
+        uint32_t packed = 0;
+        uint32_t packed_low = 0;
+        uint32_t source = m0 + row;
+        if (source < sequence) {
+            const float *base =
+                query + ((size_t)source * heads + head) * 64u + column;
+            packed = h3_pack_f16_hi_pair(base[0], base[1]);
+            packed_low = h3_pack_f16_lo_pair(base[0], base[1]);
+        }
+        *(uint32_t *)&q_tile[row * H3_MMA_F32_LD + column] = packed;
+        *(uint32_t *)&q_low_tile[row * H3_MMA_F32_LD + column] = packed_low;
+    }
+    __syncthreads();
+
+    uint32_t q_frag[4][4];
+    uint32_t q_low_frag[4][4];
+#pragma unroll
+    for (uint32_t kk = 0; kk < 4u; kk++) {
+        uint32_t k0 = kk * 16u + tig * 2u;
+        q_frag[kk][0] = *(const uint32_t *)&q_tile[row_a * H3_MMA_F32_LD + k0];
+        q_frag[kk][1] = *(const uint32_t *)&q_tile[row_b * H3_MMA_F32_LD + k0];
+        q_frag[kk][2] =
+            *(const uint32_t *)&q_tile[row_a * H3_MMA_F32_LD + k0 + 8u];
+        q_frag[kk][3] =
+            *(const uint32_t *)&q_tile[row_b * H3_MMA_F32_LD + k0 + 8u];
+        q_low_frag[kk][0] =
+            *(const uint32_t *)&q_low_tile[row_a * H3_MMA_F32_LD + k0];
+        q_low_frag[kk][1] =
+            *(const uint32_t *)&q_low_tile[row_b * H3_MMA_F32_LD + k0];
+        q_low_frag[kk][2] =
+            *(const uint32_t *)&q_low_tile[row_a * H3_MMA_F32_LD + k0 + 8u];
+        q_low_frag[kk][3] =
+            *(const uint32_t *)&q_low_tile[row_b * H3_MMA_F32_LD + k0 + 8u];
+    }
+
+    float out_acc[8][4];
+#pragma unroll
+    for (uint32_t dt = 0; dt < 8u; dt++)
+#pragma unroll
+        for (uint32_t e = 0; e < 4u; e++) out_acc[dt][e] = 0.0f;
+    float max_a = -INFINITY;
+    float max_b = -INFINITY;
+    float sum_a = 0.0f;
+    float sum_b = 0.0f;
+
+    for (uint32_t n0 = 0; n0 < sequence; n0 += H3_MMA_F32_N) {
+        __syncthreads();
+        for (uint32_t i = tid; i < H3_MMA_F32_N * 32u; i += 128u) {
+            uint32_t row = i >> 5u;
+            uint32_t column = (i & 31u) * 2u;
+            uint32_t packed_k = 0;
+            uint32_t packed_k_low = 0;
+            uint32_t packed_v = 0;
+            uint32_t packed_v_low = 0;
+            uint32_t source = n0 + row;
+            if (source < sequence) {
+                size_t base = ((size_t)source * heads + head) * 64u + column;
+                packed_k = h3_pack_f16_hi_pair(key[base], key[base + 1]);
+                packed_k_low = h3_pack_f16_lo_pair(key[base], key[base + 1]);
+                packed_v = h3_pack_f16_hi_pair(value[base], value[base + 1]);
+                packed_v_low =
+                    h3_pack_f16_lo_pair(value[base], value[base + 1]);
+            }
+            *(uint32_t *)&k_tile[row * H3_MMA_F32_LD + column] = packed_k;
+            *(uint32_t *)&k_low_tile[row * H3_MMA_F32_LD + column] =
+                packed_k_low;
+            *(uint32_t *)&v_tile[row * H3_MMA_F32_LD + column] = packed_v;
+            *(uint32_t *)&v_low_tile[row * H3_MMA_F32_LD + column] =
+                packed_v_low;
+        }
+        __syncthreads();
+
+        float score[8][4];
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++)
+#pragma unroll
+            for (uint32_t e = 0; e < 4u; e++) score[j][e] = 0.0f;
+#pragma unroll
+        for (uint32_t kk = 0; kk < 4u; kk++) {
+            uint32_t k0 = kk * 16u + tig * 2u;
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) {
+                uint32_t row = (j * 8u + group) * H3_MMA_F32_LD;
+                uint32_t b_frag[2] = {
+                    *(const uint32_t *)&k_tile[row + k0],
+                    *(const uint32_t *)&k_tile[row + k0 + 8u]};
+                uint32_t b_low_frag[2] = {
+                    *(const uint32_t *)&k_low_tile[row + k0],
+                    *(const uint32_t *)&k_low_tile[row + k0 + 8u]};
+                h3_mma_m16n8k16_f16(score[j], q_frag[kk], b_frag);
+                h3_mma_m16n8k16_f16(score[j], q_frag[kk], b_low_frag);
+                h3_mma_m16n8k16_f16(score[j], q_low_frag[kk], b_frag);
+            }
+        }
+
+        uint32_t live = sequence - n0;
+        float tile_max_a = -INFINITY;
+        float tile_max_b = -INFINITY;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            uint32_t column = j * 8u + tig * 2u;
+#pragma unroll
+            for (uint32_t e = 0; e < 2u; e++) {
+                if (column + e < live) {
+                    score[j][e] *= args.scale;
+                    score[j][e + 2u] *= args.scale;
+                    tile_max_a = fmaxf(tile_max_a, score[j][e]);
+                    tile_max_b = fmaxf(tile_max_b, score[j][e + 2u]);
+                } else {
+                    score[j][e] = -INFINITY;
+                    score[j][e + 2u] = -INFINITY;
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t mask = 1u; mask < 4u; mask <<= 1u) {
+            tile_max_a = fmaxf(
+                tile_max_a, __shfl_xor_sync(0xffffffffu, tile_max_a, (int)mask));
+            tile_max_b = fmaxf(
+                tile_max_b, __shfl_xor_sync(0xffffffffu, tile_max_b, (int)mask));
+        }
+        float new_max_a = fmaxf(max_a, tile_max_a);
+        float new_max_b = fmaxf(max_b, tile_max_b);
+        float alpha_a = isfinite(new_max_a) ? __expf(max_a - new_max_a) : 1.0f;
+        float alpha_b = isfinite(new_max_b) ? __expf(max_b - new_max_b) : 1.0f;
+        float tile_sum_a = 0.0f;
+        float tile_sum_b = 0.0f;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+#pragma unroll
+            for (uint32_t e = 0; e < 2u; e++) {
+                float p_a = score[j][e] == -INFINITY
+                                ? 0.0f
+                                : __expf(score[j][e] - new_max_a);
+                float p_b = score[j][e + 2u] == -INFINITY
+                                ? 0.0f
+                                : __expf(score[j][e + 2u] - new_max_b);
+                score[j][e] = p_a;
+                score[j][e + 2u] = p_b;
+                tile_sum_a += p_a;
+                tile_sum_b += p_b;
+            }
+        }
+#pragma unroll
+        for (uint32_t mask = 1u; mask < 4u; mask <<= 1u) {
+            tile_sum_a += __shfl_xor_sync(0xffffffffu, tile_sum_a, (int)mask);
+            tile_sum_b += __shfl_xor_sync(0xffffffffu, tile_sum_b, (int)mask);
+        }
+        sum_a = sum_a * alpha_a + tile_sum_a;
+        sum_b = sum_b * alpha_b + tile_sum_b;
+        max_a = new_max_a;
+        max_b = new_max_b;
+#pragma unroll
+        for (uint32_t dt = 0; dt < 8u; dt++) {
+            out_acc[dt][0] *= alpha_a;
+            out_acc[dt][1] *= alpha_a;
+            out_acc[dt][2] *= alpha_b;
+            out_acc[dt][3] *= alpha_b;
+        }
+
+#pragma unroll
+        for (uint32_t kk = 0; kk < 4u; kk++) {
+            uint32_t p_frag[4] = {
+                h3_pack_f16_hi_pair(score[kk * 2u][0], score[kk * 2u][1]),
+                h3_pack_f16_hi_pair(score[kk * 2u][2], score[kk * 2u][3]),
+                h3_pack_f16_hi_pair(score[kk * 2u + 1u][0],
+                                    score[kk * 2u + 1u][1]),
+                h3_pack_f16_hi_pair(score[kk * 2u + 1u][2],
+                                    score[kk * 2u + 1u][3])};
+            uint32_t p_low_frag[4] = {
+                h3_pack_f16_lo_pair(score[kk * 2u][0], score[kk * 2u][1]),
+                h3_pack_f16_lo_pair(score[kk * 2u][2], score[kk * 2u][3]),
+                h3_pack_f16_lo_pair(score[kk * 2u + 1u][0],
+                                    score[kk * 2u + 1u][1]),
+                h3_pack_f16_lo_pair(score[kk * 2u + 1u][2],
+                                    score[kk * 2u + 1u][3])};
+            uint32_t n_low = (kk * 16u + tig * 2u) * H3_MMA_F32_LD;
+            uint32_t n_high = n_low + 8u * H3_MMA_F32_LD;
+#pragma unroll
+            for (uint32_t dt = 0; dt < 8u; dt++) {
+                uint32_t column = dt * 8u + group;
+                uint32_t b_frag[2] = {
+                    (uint32_t)v_tile[n_low + column] |
+                        ((uint32_t)v_tile[n_low + H3_MMA_F32_LD + column]
+                         << 16u),
+                    (uint32_t)v_tile[n_high + column] |
+                        ((uint32_t)v_tile[n_high + H3_MMA_F32_LD + column]
+                         << 16u)};
+                uint32_t b_low_frag[2] = {
+                    (uint32_t)v_low_tile[n_low + column] |
+                        ((uint32_t)v_low_tile[n_low + H3_MMA_F32_LD + column]
+                         << 16u),
+                    (uint32_t)v_low_tile[n_high + column] |
+                        ((uint32_t)v_low_tile[n_high + H3_MMA_F32_LD + column]
+                         << 16u)};
+                h3_mma_m16n8k16_f16(out_acc[dt], p_frag, b_frag);
+                h3_mma_m16n8k16_f16(out_acc[dt], p_frag, b_low_frag);
+                h3_mma_m16n8k16_f16(out_acc[dt], p_low_frag, b_frag);
+            }
+        }
+    }
+
+    float inverse_a = sum_a > 0.0f ? 1.0f / sum_a : 0.0f;
+    float inverse_b = sum_b > 0.0f ? 1.0f / sum_b : 0.0f;
+    uint32_t global_a = m0 + row_a;
+    uint32_t global_b = m0 + row_b;
+#pragma unroll
+    for (uint32_t dt = 0; dt < 8u; dt++) {
+        uint32_t column = dt * 8u + tig * 2u;
+        if (global_a < sequence) {
+            float *dst =
+                output + h3_sdpa_output_index(args, global_a, head, column);
+            dst[0] = out_acc[dt][0] * inverse_a;
+            dst[1] = out_acc[dt][1] * inverse_a;
+        }
+        if (global_b < sequence) {
+            float *dst =
+                output + h3_sdpa_output_index(args, global_b, head, column);
+            dst[0] = out_acc[dt][2] * inverse_b;
+            dst[1] = out_acc[dt][3] * inverse_b;
+        }
+    }
+}
+
 int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                     const h3_gpu_tensor *value, uint32_t sequence,
@@ -4917,6 +5200,18 @@ int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     h3_gpu_op_begin(gpu, H3_GPU_OP_SDPA);
     h3_sdpa_args args = {sequence, heads, head_dim, scale, 0u, 0u};
     int ok = 1;
+    if (head_dim == 64u && !h3_env_on("H3_SDPA_F32_WAVE") &&
+        !h3_env_on("H3_SDPA_PARALLEL") && !h3_env_on("H3_SDPA_WAVE_OFF")) {
+        dim3 blocks((sequence + H3_MMA_F32_M - 1u) / H3_MMA_F32_M, heads, 1);
+        dim3 threads(128, 1, 1);
+        h3_sdpa_f32_mma_d64_kernel<<<blocks, threads, 0, gpu->stream>>>(
+            (const float *)query->device, (const float *)key->device,
+            (const float *)value->device, (float *)output->device, args);
+        gpu->stats.mps_sdpa_dispatches++;
+        ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_f32_mma_d64");
+        h3_gpu_op_end(gpu);
+        return ok;
+    }
     if (head_dim <= 128u && !h3_env_on("H3_SDPA_PARALLEL") &&
         !h3_env_on("H3_SDPA_WAVE_OFF")) {
         dim3 threads(32, 1, 1);

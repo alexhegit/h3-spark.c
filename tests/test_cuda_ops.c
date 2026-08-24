@@ -2243,6 +2243,122 @@ int main(void) {
         free(b_mma);
     }
 
+    /* Same comparison for the video VAE's F32 attention, whose head_dim is 64.
+     * The sequence is deliberately not a multiple of the kernel's 64-wide
+     * tiles so both the query and the key mask are exercised. */
+    {
+        const uint32_t vseq = 900;
+        const uint32_t vheads = 2;
+        const uint32_t vdim = 64;
+        const size_t vcount = (size_t)vseq * vheads * vdim;
+        const float vscale = 1.0f / sqrtf((float)vdim);
+        float *vq = (float *)malloc(vcount * sizeof(float));
+        float *vk = (float *)malloc(vcount * sizeof(float));
+        float *vv = (float *)malloc(vcount * sizeof(float));
+        float *v_wave = (float *)malloc(vcount * sizeof(float));
+        float *v_mma = (float *)malloc(vcount * sizeof(float));
+        check(vq && vk && vv && v_wave && v_mma, "f32 sdpa host alloc");
+        if (vq && vk && vv && v_wave && v_mma) {
+            for (size_t i = 0; i < vcount; i++) {
+                vq[i] = sinf((float)i * 0.0037f) * 2.0f;
+                vk[i] = cosf((float)i * 0.0053f) * 1.5f;
+                vv[i] = sinf((float)i * 0.0023f + 0.7f);
+            }
+            h3_gpu_tensor *tq = h3_gpu_tensor_from_f32(gpu, vq, vcount);
+            h3_gpu_tensor *tk = h3_gpu_tensor_from_f32(gpu, vk, vcount);
+            h3_gpu_tensor *tv = h3_gpu_tensor_from_f32(gpu, vv, vcount);
+            h3_gpu_tensor *to = h3_gpu_tensor_new_f32(gpu, vcount);
+            check(tq && tk && tv && to, "f32 sdpa tensor alloc");
+            if (tq && tk && tv && to) {
+                setenv("H3_SDPA_F32_WAVE", "1", 1);
+                check(h3_gpu_sdpa_f32(gpu, to, tq, tk, tv, vseq, vheads, vdim,
+                                      vscale),
+                      "f32 sdpa wave");
+                check(h3_gpu_submit(gpu), "submit f32 sdpa wave");
+                check(h3_gpu_tensor_read_f32(to, v_wave, vcount),
+                      "read f32 sdpa wave");
+                unsetenv("H3_SDPA_F32_WAVE");
+                check(h3_gpu_sdpa_f32(gpu, to, tq, tk, tv, vseq, vheads, vdim,
+                                      vscale),
+                      "f32 sdpa mma");
+                check(h3_gpu_submit(gpu), "submit f32 sdpa mma");
+                check(h3_gpu_tensor_read_f32(to, v_mma, vcount),
+                      "read f32 sdpa mma");
+                double *scores = (double *)malloc(vseq * sizeof(double));
+                double wave_error = 0.0;
+                double mma_error = 0.0;
+                double norm = 0.0;
+                if (scores) {
+                    for (uint32_t head = 0; head < vheads; head++) {
+                        for (uint32_t row = 0; row < vseq; row++) {
+                            double maximum = -INFINITY;
+                            for (uint32_t key = 0; key < vseq; key++) {
+                                double dot = 0.0;
+                                for (uint32_t d = 0; d < vdim; d++)
+                                    dot += (double)vq[((size_t)row * vheads +
+                                                       head) *
+                                                          vdim +
+                                                      d] *
+                                           (double)vk[((size_t)key * vheads +
+                                                       head) *
+                                                          vdim +
+                                                      d];
+                                scores[key] = dot * (double)vscale;
+                                if (scores[key] > maximum)
+                                    maximum = scores[key];
+                            }
+                            double sum = 0.0;
+                            for (uint32_t key = 0; key < vseq; key++) {
+                                scores[key] = exp(scores[key] - maximum);
+                                sum += scores[key];
+                            }
+                            for (uint32_t d = 0; d < vdim; d++) {
+                                double accumulated = 0.0;
+                                for (uint32_t key = 0; key < vseq; key++)
+                                    accumulated +=
+                                        scores[key] *
+                                        (double)vv[((size_t)key * vheads +
+                                                    head) *
+                                                       vdim +
+                                                   d];
+                                accumulated /= sum;
+                                size_t index =
+                                    ((size_t)row * vheads + head) * vdim + d;
+                                double dw = v_wave[index] - accumulated;
+                                double dm = v_mma[index] - accumulated;
+                                wave_error += dw * dw;
+                                mma_error += dm * dm;
+                                norm += accumulated * accumulated;
+                            }
+                        }
+                    }
+                    free(scores);
+                }
+                double wave_rel = norm > 0.0 ? sqrt(wave_error / norm) : 1.0;
+                double mma_rel = norm > 0.0 ? sqrt(mma_error / norm) : 1.0;
+                fprintf(stderr,
+                        "f32 sdpa relL2 vs f64 reference at seq %u dim 64: "
+                        "wave %.6f, mma %.6f\n",
+                        vseq, wave_rel, mma_rel);
+                if (!(mma_rel < 5e-3)) {
+                    fprintf(stderr,
+                            "FAIL: f32 mma sdpa relL2 %.6f exceeds 5e-3\n",
+                            mma_rel);
+                    failures++;
+                }
+            }
+            h3_gpu_tensor_free(tq);
+            h3_gpu_tensor_free(tk);
+            h3_gpu_tensor_free(tv);
+            h3_gpu_tensor_free(to);
+        }
+        free(vq);
+        free(vk);
+        free(vv);
+        free(v_wave);
+        free(v_mma);
+    }
+
     const uint32_t head_norm_sequence = 3;
     const uint32_t head_norm_heads = 2;
     const uint32_t head_norm_dim = 8;

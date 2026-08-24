@@ -1346,3 +1346,56 @@ fan-out not reaching full depth on the smaller tensors. Logs:
 `/tmp/h3_perf_day12/fox-s2-{par,ser,t4,t12,t16}*.log`,
 `fox-fast-{ffpar,ffser,default}.log`.
 ---
+
+## 2026-08-25 — KEEP tensor-core video VAE attention (VAE 8.72 s → 5.74 s)
+
+The video VAE's attention was the last big FP32 CUDA-core kernel: 144 calls,
+3.57 s, head_dim 64 across 32 heads. It now runs the same flash shape as the
+DiT's MMA kernel (one block per 64-query tile per head, four warps, 64-key
+stride, online softmax in registers), reading F32 and writing F32 with the
+tiles narrowed to FP16 on the way in.
+
+Narrowing is where this differs from the DiT. There, everything is BF16
+already, so a 16-bit MMA costs nothing. Here the decoder is F32 end to end, and
+a single FP16 pass is visibly worse than the CUDA-core kernel it replaces. So
+each F32 splits into a high FP16 and the FP16 of its residual, and both
+products are summed the way a double-double does it — `hi·hi + hi·lo + lo·hi`,
+dropping only `lo·lo` at ~2⁻²². The ladder, measured against an F64 CPU
+reference at sequence 900 (not a multiple of the 64-wide tile, so both masks
+are live):
+
+| Variant | relL2 vs F64 | fox-fast VAE sdpa |
+|---------|-------------:|------------------:|
+| FP32 wave kernel (the baseline) | 0.000010 | 3.565 s |
+| Single FP16 | 0.004411 | 0.302 s |
+| Split Q·K only | 0.003120 | 0.423 s |
+| Split Q·K and V | 0.002231 | — |
+| **Split Q·K, V and P** | **0.000020** | **0.622 s** |
+
+The interesting part is which split mattered. Splitting the score product got
+only a third of the error, and V another third; the rest was P's own FP16
+rounding, which the `p_lo·V_hi` term removes. All three splits together land
+within 2× of the exact kernel's own error, i.e. this is no longer a precision
+trade at all — it is 5.7× the throughput at F32 accuracy, so it is on by
+default rather than behind a flag. `H3_SDPA_F32_WAVE=1` restores the CUDA-core
+kernel.
+
+fox-fast (20 steps, 45 layers):
+
+| Metric | **MMA** | Wave | Δ |
+|--------|--------:|-----:|--:|
+| video VAE sdpa | **0.622 s** | 3.565 s | **−82%** |
+| video VAE wall | **5.74 s** | 8.72 s | −3.0 s |
+| **e2e wall** | **33.5 s** | 37.0 s | −3.5 s |
+
+`h3_cuda_video_vae_smoke` reports abs-max 0.677619 with the MMA kernel and
+0.677619 with the wave kernel — the decode is unchanged to every digit it
+prints, which the single-FP16 version was not (0.677606). `h3_tests` (1772
+checks), `h3_cuda_ops`, `h3_cuda_smoke`, `h3_cuda_dit_block_smoke` and
+`h3_cuda_dit_forward_smoke` all pass; the forward smoke's hashes are unchanged.
+
+Shared memory is four 64×72 half tiles (36 KB), still under the 48 KB static
+limit, and the accumulator is 32 registers instead of the d128 kernel's 64.
+Logs: `/tmp/h3_perf_day12/fox-fast-{vmma,vwave,vaemma}.log`,
+`split-{qk,full}.log`.
+---
