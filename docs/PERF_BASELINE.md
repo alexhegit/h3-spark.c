@@ -920,3 +920,18 @@ Leftover denoise − sdpa − linear unchanged (~2 ms). ab1 wall tracks SDPA/lin
 noise. Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-adaln-vec2-ab1.log`,
 `fox-s2-adaln-base-ab1.log`.
 ---
+
+## 2026-08-24 — REJECT Q8 bf16x2 QK dots
+
+Separate Q8 kernel: native `__nv_bfloat16` K/Q loads, `__hmul2` 4-term QK,
+float `__expf` online softmax unchanged. Distinct from exp2f softmax REJECT.
+fox-s2 interleaved `H3_SDPA_Q8_BF16X2=1`:
+
+| Run | Float QK | **bf16x2 QK** |
+|-----|---------:|--------------:|
+| ab1 | 3.012 s (sdpa 1.693) | 3.207 s (sdpa 1.908) |
+| ab2 | 3.071 s (sdpa 1.730) | 3.253 s (sdpa 1.944) |
+
+SDPA ~210 ms slower; denoise wall follows. Reverted. Logs:
+`/tmp/h3_perf_day9/fox-s2-q8-bf16x2-ab1.log`, `fox-s2-q8-float-ab1.log`.
+---
