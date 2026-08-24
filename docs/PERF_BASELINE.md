@@ -1657,3 +1657,25 @@ Neither finding affects the performance measurements above — the work per step
 is the same either way — but both outrank further tuning: the pipeline is
 currently fast at producing something other than what was asked for.
 ---
+
+### What the nondeterminism is not
+
+Three hypotheses tested and eliminated, so the next attempt can skip them:
+
+- **Uninitialized device memory.** `H3_GPU_ZERO_ALLOC=1` (new, off by default)
+  zeroes every tensor allocation on the stream. Two runs under it still diverge
+  (20.54 dB, different md5), so no op is reading a tensor before writing it.
+- **Uninitialized host memory.** Two runs at a fixed `MALLOC_PERTURB_=1` also
+  diverge (17.35 dB), so it is not malloc content leaking into the result
+  either.
+- **The weight load.** `h3_cuda_dit_forward_smoke` hashes identically across
+  every invocation tonight (`ab054bb20d9c4c83` / `863553009bcf1b83`) while
+  loading the same weights through the same chunked staging path, so a racing
+  host-to-device copy would have to be invisible there to be the cause.
+
+That leaves the parts of a real run the forward smoke does not exercise: the
+multi-step loop with core reuse, the preview decode interleaving, the audio
+branch, and the tiled VAE decode. The obvious next step is to dump the latent
+after each denoise step across two runs and find the first step that differs,
+which localizes it to a step boundary rather than a kernel.
+---

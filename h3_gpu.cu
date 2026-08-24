@@ -309,6 +309,11 @@ static h3_gpu_tensor *h3_tensor_alloc(h3_gpu *gpu, size_t elements,
         h3_gpu_fail(gpu, "cudaMalloc failed: %s", cudaGetErrorString(status));
         return NULL;
     }
+    /* Diagnostic: if any op reads a tensor before writing it, zeroing every
+     * allocation changes the result. Kept because it is the cheapest way to
+     * separate an uninitialized read from a genuine race. */
+    if (h3_env_on("H3_GPU_ZERO_ALLOC") && gpu->stream)
+        cudaMemsetAsync(tensor->device, 0, bytes, gpu->stream);
     tensor->owner = gpu;
     tensor->elements = elements;
     tensor->bytes = bytes;
