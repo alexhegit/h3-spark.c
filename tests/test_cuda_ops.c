@@ -2026,6 +2026,223 @@ int main(void) {
         free(d128_out_b);
     }
 
+    /* Tensor-core SDPA. The sequence is deliberately not a multiple of the
+     * 64-wide MMA tile so the query and key masks both get exercised, and
+     * both output layouts are checked because the DiT uses the head-major
+     * one. */
+    {
+        const uint32_t mma_seq = 200;
+        const uint32_t mma_heads = 3;
+        const uint32_t mma_dim = 128;
+        const size_t mma_count = (size_t)mma_seq * mma_heads * mma_dim;
+        const float mma_scale = 1.0f / sqrtf((float)mma_dim);
+        float *mq = (float *)malloc(mma_count * sizeof(float));
+        float *mk = (float *)malloc(mma_count * sizeof(float));
+        float *mv = (float *)malloc(mma_count * sizeof(float));
+        float *mref = (float *)malloc(mma_count * sizeof(float));
+        uint16_t *mqb = (uint16_t *)malloc(mma_count * sizeof(uint16_t));
+        uint16_t *mkb = (uint16_t *)malloc(mma_count * sizeof(uint16_t));
+        uint16_t *mvb = (uint16_t *)malloc(mma_count * sizeof(uint16_t));
+        uint16_t *mout = (uint16_t *)malloc(mma_count * sizeof(uint16_t));
+        check(mq && mk && mv && mref && mqb && mkb && mvb && mout,
+              "mma sdpa host alloc");
+        if (mq && mk && mv && mref && mqb && mkb && mvb && mout) {
+            for (size_t i = 0; i < mma_count; i++) {
+                mq[i] = sinf((float)i * 0.017f) * 1.3f;
+                mk[i] = cosf((float)i * 0.023f);
+                mv[i] = sinf((float)i * 0.009f + 0.7f) * 0.5f;
+                mqb[i] = f32_to_bf16(mq[i]);
+                mkb[i] = f32_to_bf16(mk[i]);
+                mvb[i] = f32_to_bf16(mv[i]);
+            }
+            sdpa_ref(mq, mk, mv, mref, mma_seq, mma_heads, mma_dim, mma_scale);
+            h3_gpu_tensor *tq = h3_gpu_tensor_from_bf16(gpu, mqb, mma_count);
+            h3_gpu_tensor *tk = h3_gpu_tensor_from_bf16(gpu, mkb, mma_count);
+            h3_gpu_tensor *tv = h3_gpu_tensor_from_bf16(gpu, mvb, mma_count);
+            h3_gpu_tensor *to = h3_gpu_tensor_new_bf16(gpu, mma_count);
+            check(tq && tk && tv && to, "mma sdpa tensor alloc");
+            if (tq && tk && tv && to) {
+                setenv("H3_SDPA_MMA", "1", 1);
+                for (int head_major = 0; head_major < 2; head_major++) {
+                    int ok = head_major
+                                 ? h3_gpu_sdpa_bf16_head_major_output(
+                                       gpu, to, tq, tk, tv, mma_seq, mma_heads,
+                                       mma_dim, mma_scale)
+                                 : h3_gpu_sdpa_bf16(gpu, to, tq, tk, tv,
+                                                    mma_seq, mma_heads,
+                                                    mma_dim, mma_scale);
+                    check(ok, "mma sdpa dispatch");
+                    check(h3_gpu_submit(gpu), "submit mma sdpa");
+                    check(h3_gpu_tensor_read_bf16(to, mout, mma_count),
+                          "read mma sdpa");
+                    double worst = 0.0;
+                    size_t worst_at = 0;
+                    for (uint32_t row = 0; row < mma_seq; row++) {
+                        for (uint32_t head = 0; head < mma_heads; head++) {
+                            for (uint32_t d = 0; d < mma_dim; d++) {
+                                /* sdpa_ref lays its output out token-major. */
+                                size_t ref_index =
+                                    ((size_t)row * mma_heads + head) * mma_dim +
+                                    d;
+                                size_t got_index =
+                                    head_major
+                                        ? ((size_t)head * mma_seq + row) *
+                                              mma_dim + d
+                                        : ref_index;
+                                double delta = fabs(bf16_to_f32(mout[got_index]) -
+                                                    mref[ref_index]);
+                                if (delta > worst) {
+                                    worst = delta;
+                                    worst_at = ref_index;
+                                }
+                            }
+                        }
+                    }
+                    if (worst >= 6e-2) {
+                        fprintf(stderr,
+                                "FAIL: mma sdpa (head_major=%d) worst abs "
+                                "error %g at %zu\n",
+                                head_major, worst, worst_at);
+                        failures++;
+                    } else {
+                        fprintf(stderr,
+                                "mma sdpa head_major=%d worst abs error %.5f\n",
+                                head_major, worst);
+                    }
+                }
+                unsetenv("H3_SDPA_MMA");
+            }
+            h3_gpu_tensor_free(tq);
+            h3_gpu_tensor_free(tk);
+            h3_gpu_tensor_free(tv);
+            h3_gpu_tensor_free(to);
+        }
+        free(mq);
+        free(mk);
+        free(mv);
+        free(mref);
+        free(mqb);
+        free(mkb);
+        free(mvb);
+        free(mout);
+    }
+
+    /* The CPU reference above is limited to short sequences, so also compare
+     * the two GPU kernels against each other at the DiT's own sequence length,
+     * where the softmax range is much wider. */
+    {
+        const uint32_t big_seq = 1874;
+        const uint32_t big_heads = 1;
+        const uint32_t big_dim = 128;
+        const size_t big_count = (size_t)big_seq * big_heads * big_dim;
+        const float big_scale = 1.0f / sqrtf((float)big_dim);
+        uint16_t *bq = (uint16_t *)malloc(big_count * sizeof(uint16_t));
+        uint16_t *bk = (uint16_t *)malloc(big_count * sizeof(uint16_t));
+        uint16_t *bv = (uint16_t *)malloc(big_count * sizeof(uint16_t));
+        uint16_t *b_wave = (uint16_t *)malloc(big_count * sizeof(uint16_t));
+        uint16_t *b_mma = (uint16_t *)malloc(big_count * sizeof(uint16_t));
+        check(bq && bk && bv && b_wave && b_mma, "big sdpa host alloc");
+        if (bq && bk && bv && b_wave && b_mma) {
+            for (size_t i = 0; i < big_count; i++) {
+                bq[i] = f32_to_bf16(sinf((float)i * 0.0031f) * 2.0f);
+                bk[i] = f32_to_bf16(cosf((float)i * 0.0047f) * 1.5f);
+                bv[i] = f32_to_bf16(sinf((float)i * 0.0019f + 0.4f));
+            }
+            h3_gpu_tensor *tq = h3_gpu_tensor_from_bf16(gpu, bq, big_count);
+            h3_gpu_tensor *tk = h3_gpu_tensor_from_bf16(gpu, bk, big_count);
+            h3_gpu_tensor *tv = h3_gpu_tensor_from_bf16(gpu, bv, big_count);
+            h3_gpu_tensor *to = h3_gpu_tensor_new_bf16(gpu, big_count);
+            check(tq && tk && tv && to, "big sdpa tensor alloc");
+            if (tq && tk && tv && to) {
+                setenv("H3_SDPA_WAVE", "1", 1);
+                check(h3_gpu_sdpa_bf16_head_major_output(
+                          gpu, to, tq, tk, tv, big_seq, big_heads, big_dim,
+                          big_scale),
+                      "big sdpa wave");
+                check(h3_gpu_submit(gpu), "submit big sdpa wave");
+                check(h3_gpu_tensor_read_bf16(to, b_wave, big_count),
+                      "read big sdpa wave");
+                unsetenv("H3_SDPA_WAVE");
+                setenv("H3_SDPA_MMA", "1", 1);
+                check(h3_gpu_sdpa_bf16_head_major_output(
+                          gpu, to, tq, tk, tv, big_seq, big_heads, big_dim,
+                          big_scale),
+                      "big sdpa mma");
+                check(h3_gpu_submit(gpu), "submit big sdpa mma");
+                check(h3_gpu_tensor_read_bf16(to, b_mma, big_count),
+                      "read big sdpa mma");
+                unsetenv("H3_SDPA_MMA");
+                /* Both kernels are compared against an F32 CPU reference at
+                 * this length: at 1874 keys the output is a heavily cancelling
+                 * average, so a relative error against each other says
+                 * nothing about which one is closer to the true value. */
+                double *scores = (double *)malloc(big_seq * sizeof(double));
+                double wave_error = 0.0;
+                double mma_error = 0.0;
+                double norm = 0.0;
+                if (scores) {
+                    for (uint32_t row = 0; row < big_seq; row++) {
+                        double maximum = -INFINITY;
+                        for (uint32_t key = 0; key < big_seq; key++) {
+                            double dot = 0.0;
+                            for (uint32_t d = 0; d < big_dim; d++)
+                                dot += (double)bf16_to_f32(
+                                           bq[(size_t)row * big_dim + d]) *
+                                       (double)bf16_to_f32(
+                                           bk[(size_t)key * big_dim + d]);
+                            scores[key] = dot * (double)big_scale;
+                            if (scores[key] > maximum) maximum = scores[key];
+                        }
+                        double sum = 0.0;
+                        for (uint32_t key = 0; key < big_seq; key++) {
+                            scores[key] = exp(scores[key] - maximum);
+                            sum += scores[key];
+                        }
+                        for (uint32_t d = 0; d < big_dim; d++) {
+                            double accumulated = 0.0;
+                            for (uint32_t key = 0; key < big_seq; key++)
+                                accumulated +=
+                                    scores[key] *
+                                    (double)bf16_to_f32(
+                                        bv[(size_t)key * big_dim + d]);
+                            accumulated /= sum;
+                            size_t index = (size_t)row * big_dim + d;
+                            double dw =
+                                bf16_to_f32(b_wave[index]) - accumulated;
+                            double dm =
+                                bf16_to_f32(b_mma[index]) - accumulated;
+                            wave_error += dw * dw;
+                            mma_error += dm * dm;
+                            norm += accumulated * accumulated;
+                        }
+                    }
+                    free(scores);
+                }
+                double wave_rel = norm > 0.0 ? sqrt(wave_error / norm) : 1.0;
+                double mma_rel = norm > 0.0 ? sqrt(mma_error / norm) : 1.0;
+                fprintf(stderr,
+                        "sdpa relL2 vs f32 reference at seq %u: wave %.5f, "
+                        "mma %.5f\n",
+                        big_seq, wave_rel, mma_rel);
+                if (mma_rel >= 3.0 * wave_rel + 1e-3) {
+                    fprintf(stderr,
+                            "FAIL: mma sdpa is much less accurate than wave "
+                            "sdpa\n");
+                    failures++;
+                }
+            }
+            h3_gpu_tensor_free(tq);
+            h3_gpu_tensor_free(tk);
+            h3_gpu_tensor_free(tv);
+            h3_gpu_tensor_free(to);
+        }
+        free(bq);
+        free(bk);
+        free(bv);
+        free(b_wave);
+        free(b_mma);
+    }
+
     const uint32_t head_norm_sequence = 3;
     const uint32_t head_norm_heads = 2;
     const uint32_t head_norm_dim = 8;
@@ -2465,16 +2682,20 @@ int main(void) {
         }
     }
 
-    enum { GA_ROWS = 6, GA_WIDTH = 4, GA_SLOTS = 2, GA_HEAD = 3 };
+    /* GA_MAPS: the row map selects a modulation row, so the modulation has to
+     * cover every value in it. It used to be one row short, which put both the
+     * reference and the kernel one row past the end of their buffers; they
+     * agreed only as long as the memory behind each happened to be zero. */
+    enum { GA_ROWS = 6, GA_WIDTH = 4, GA_SLOTS = 2, GA_HEAD = 3, GA_MAPS = 2 };
     float ga_input_host[GA_ROWS * GA_WIDTH];
     float ga_branch_host[GA_ROWS * GA_WIDTH];
     float ga_norm_host[GA_WIDTH];
-    float ga_mod_host[GA_SLOTS * GA_WIDTH];
+    float ga_mod_host[GA_MAPS * GA_SLOTS * GA_WIDTH];
     uint32_t ga_row_map[GA_ROWS] = {0, 1, 0, 1, 0, 1};
     uint16_t ga_input_bf16[GA_ROWS * GA_WIDTH];
     uint16_t ga_branch_bf16[GA_ROWS * GA_WIDTH];
     uint16_t ga_norm_bf16[GA_WIDTH];
-    uint16_t ga_mod_bf16[GA_SLOTS * GA_WIDTH];
+    uint16_t ga_mod_bf16[GA_MAPS * GA_SLOTS * GA_WIDTH];
     uint16_t ga_out_bf16[GA_ROWS * GA_WIDTH];
     float ga_gate_ref_f32[GA_ROWS * GA_WIDTH];
     float ga_out_ref_f32[GA_ROWS * GA_WIDTH];
@@ -2496,9 +2717,10 @@ int main(void) {
         ga_norm_host[i] = 0.8f + 0.05f * (float)i;
         ga_norm_bf16[i] = f32_to_bf16(ga_norm_host[i]);
     }
-    for (size_t i = 0; i < (size_t)GA_SLOTS * GA_WIDTH; i++) {
+    for (size_t i = 0; i < (size_t)GA_MAPS * GA_SLOTS * GA_WIDTH; i++) {
         ga_mod_host[i] = sinf((float)i * 0.31f) * 0.25f;
         ga_mod_bf16[i] = f32_to_bf16(ga_mod_host[i]);
+        ga_mod_host[i] = bf16_to_f32(ga_mod_bf16[i]);
     }
     gate_ref(ga_input_host, ga_branch_host, ga_mod_host, ga_row_map,
              ga_gate_ref_f32, GA_ROWS, GA_WIDTH, GA_SLOTS, 0);
@@ -2528,7 +2750,8 @@ int main(void) {
     h3_gpu_tensor *ga_norm =
         h3_gpu_tensor_from_bf16(gpu, ga_norm_bf16, GA_WIDTH);
     h3_gpu_tensor *ga_mod =
-        h3_gpu_tensor_from_bf16(gpu, ga_mod_bf16, GA_SLOTS * GA_WIDTH);
+        h3_gpu_tensor_from_bf16(gpu, ga_mod_bf16,
+                                GA_MAPS * GA_SLOTS * GA_WIDTH);
     h3_gpu_tensor *ga_map =
         h3_gpu_tensor_from_u32(gpu, ga_row_map, GA_ROWS);
     h3_gpu_tensor *ga_gate_res =

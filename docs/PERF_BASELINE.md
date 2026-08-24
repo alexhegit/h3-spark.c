@@ -1164,3 +1164,76 @@ memory, so it self-disables above ~23k hidden. Logs:
 `/tmp/h3_perf_day11/fox-s2-fused*.log`, `fox-s2-split*.log`,
 `fox-fast-fused.log`, `fox-fast-split.log`.
 ---
+
+## 2026-08-25 — KEEP tensor-core SDPA: DiT denoise 20.1 s → 8.8 s
+
+The wave kernels ran both attention products on FP32 CUDA cores. At the DiT's
+shape (sequence 1874, 56 heads, head_dim 128 — 101 GFLOP per attention call)
+they took 25.6 ms, i.e. **~4 TFLOP/s**, while the same part sustains ~98
+TFLOP/s of BF16 through the MMA pipes on GEMM shapes. That gap, not memory
+traffic, was the SDPA cost.
+
+`h3_sdpa_bf16_mma_d128_kernel` is flash-attention shaped: one block per
+(64-query tile, head), four warps, each owning 16 query rows across the whole
+head_dim; K/V stream through shared memory in 64-key tiles and Q never leaves
+the MMA fragments. Two properties of the `m16n8k16` fragment maps do the heavy
+lifting:
+
+- The accumulator's lane map (lane `l` holds rows `l/4` and `l/4 + 8` at
+  columns `2*(l%4)` and `+1`) puts each row's max and sum inside a group of
+  four lanes, so the online softmax needs three `shfl_xor`s and rescaling the
+  output accumulator by `alpha` needs no cross-lane traffic at all.
+- The A fragment wants exactly the (row, column) pairs the accumulator already
+  holds, so P feeds the second MMA straight out of the score registers — no
+  shared-memory round trip for the probabilities.
+
+Scores are BF16 (Q and K are already BF16 in memory, and the products
+accumulate exactly in F32), but **P·V runs in FP16**. P lives in [0, 1] and V
+is O(1), so FP16's 11-bit mantissa is free accuracy over BF16's 8:
+
+| P·V precision | relL2 vs F32 reference, sequence 1874 |
+|---------------|--------------------------------------:|
+| BF16 | 0.01335 |
+| **FP16** | **0.00239** |
+| FP32 wave kernel (the baseline) | 0.00164 |
+
+fox-fast (20 steps, 45 layers):
+
+| Metric | **MMA** | Wave | Δ |
+|--------|--------:|-----:|--:|
+| denoise wall | **8.80 / 9.06 s** | 20.08 s | −11.2 s |
+| denoise gpu-op sdpa | **1.60 s** | 12.78 s | **−87%** |
+| denoise gpu-op linear | 5.21 s | 5.34 s | ±noise |
+| e2e wall | 56.3 s | 67.7 s | −11.4 s |
+
+That is 3.24 ms per attention call, **31 TFLOP/s**, an 8.0× rate improvement.
+fox-s2 denoise 2.78 s → 1.27 s in the same A/B.
+
+**Denoise vs Metal M5 docs 16.69 s → Spark 8.80 s, 1.90× faster**, where the
+BF16 baseline was 1.31× slower.
+
+### Accuracy
+
+- `h3_cuda_ops` gates the kernel against the F32 CPU reference at sequence 200
+  (deliberately not a multiple of the 64-wide tile, so both masks are
+  exercised) in both output layouts: worst absolute error **0.00037**.
+- A second gate compares both kernels against an F64-accumulated reference at
+  the DiT's own sequence 1874, where the output is a heavily cancelling
+  average: wave 0.00164, MMA 0.00239. Comparing the kernels to each other says
+  nothing about which is closer, so the gate is written against the reference.
+- fox-fast output PSNR: MMA vs wave **25.63 dB**, against a run-to-run floor of
+  **18.72 dB** for two runs of the same config. Swapping the kernel perturbs
+  the video less than re-running the same config does.
+
+Opt back to the FP32 wave kernel with `H3_SDPA_WAVE=1`. Only head_dim 128 takes
+the MMA path; the wave kernels still cover every other shape. The video VAE's
+attention is unaffected (it is not head_dim 128) and still costs 3.57 s. Logs:
+`/tmp/h3_perf_day11/fox-fast-mma16.log`, `fox-fast-wave16.log`,
+`fox-s2-mma*.log`, `fox-s2-wave*.log`.
+
+Unrelated fix found on the way: the `gate_adaln` fixture in `h3_cuda_ops`
+indexed its modulation by a row map containing 0 and 1 while allocating only
+one map row, so both the reference and the kernel read one row past the end of
+their buffers and agreed only while that memory happened to be zero. It now
+allocates both rows, which also makes the row map meaningful.
+---

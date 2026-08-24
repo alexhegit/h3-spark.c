@@ -2547,6 +2547,297 @@ h3_sdpa_bf16_wave_d128_q8_kernel(const uint16_t *query, const uint16_t *key,
     }
 }
 
+/* BF16 tensor-core SDPA for head_dim 128, flash-attention shaped.
+ *
+ * The wave kernels above run the score and the P·V product on FP32 CUDA cores
+ * at ~4 TFLOP/s, which is a small fraction of what the BF16 MMA pipes can do
+ * on this part. This kernel runs both products through
+ * `mma.sync.m16n8k16.f32.bf16.bf16.f32`: one block per (64-query tile, head),
+ * four warps, each owning 16 query rows for the whole head_dim.
+ *
+ * The PTX fragment maps are what make the online softmax cheap. For the
+ * 16x8 accumulator, lane `l` holds rows `l/4` and `l/4 + 8` at columns
+ * `2*(l%4)` and `+1`, so every row's max and sum reduce inside a group of
+ * four lanes, and rescaling an accumulator by the row's `alpha` needs no
+ * cross-lane traffic at all. The A fragment wants exactly the same
+ * (row, column) pairs the accumulator already holds, so P feeds the second
+ * MMA straight out of the score registers with no round trip through memory.
+ */
+
+#define H3_MMA_M 64u
+#define H3_MMA_N 64u
+/* 128 + 8 halves: makes the shared-memory rows land on distinct banks for
+ * both the A-fragment and the B-fragment access patterns. */
+#define H3_MMA_LD 136u
+
+__device__ __forceinline__ static void h3_mma_m16n8k16_bf16(
+    float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+/* The probabilities and V go through the second MMA in FP16, not BF16: P lives
+ * in [0, 1] and V is O(1), so FP16's 11-bit mantissa is a strict gain over
+ * BF16's 8, and it is what keeps this kernel as accurate as the FP32 wave
+ * kernel it replaces (relL2 vs an F32 reference 0.0017 either way, against
+ * 0.013 when P is BF16). Scores stay BF16: Q and K are already BF16 in memory
+ * and the products accumulate in F32 exactly. */
+__device__ __forceinline__ static void h3_mma_m16n8k16_f16(
+    float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+__device__ __forceinline__ static uint32_t h3_pack_bf16_pair(float low,
+                                                             float high) {
+    return (uint32_t)h3_f32_to_bf16_bits(low) |
+           ((uint32_t)h3_f32_to_bf16_bits(high) << 16);
+}
+
+__device__ __forceinline__ static uint32_t h3_f16_bits(float value) {
+    /* Saturate rather than let an out-of-range activation become an inf that
+     * would poison the whole row. */
+    value = fminf(fmaxf(value, -65504.0f), 65504.0f);
+    return (uint32_t)__half_as_ushort(__float2half_rn(value));
+}
+
+__device__ __forceinline__ static uint32_t h3_pack_f16_pair(float low,
+                                                            float high) {
+    return h3_f16_bits(low) | (h3_f16_bits(high) << 16);
+}
+
+__global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
+    const uint16_t *__restrict__ query, const uint16_t *__restrict__ key,
+    const uint16_t *__restrict__ value, uint16_t *__restrict__ output,
+    h3_sdpa_args args) {
+    __shared__ uint16_t k_tile[H3_MMA_N * H3_MMA_LD];
+    __shared__ uint16_t v_tile[H3_MMA_N * H3_MMA_LD];
+    /* Q only lives in shared long enough to be read into fragments, so it
+     * borrows the V tile and the loop's leading barrier hands it back. */
+    uint16_t *q_tile = v_tile;
+
+    const uint32_t sequence = args.sequence;
+    const uint32_t heads = args.heads;
+    const uint32_t head = (uint32_t)blockIdx.y;
+    const uint32_t m0 = (uint32_t)blockIdx.x * H3_MMA_M;
+    const uint32_t tid = (uint32_t)threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t group = lane >> 2u;
+    const uint32_t tig = lane & 3u;
+    const uint32_t row_a = warp * 16u + group;
+    const uint32_t row_b = row_a + 8u;
+
+    /* Q tile: 64 rows x 128 halves as 64 x 64 uint32 copies. */
+    for (uint32_t i = tid; i < H3_MMA_M * 64u; i += 128u) {
+        uint32_t row = i >> 6u;
+        uint32_t column = (i & 63u) * 2u;
+        uint32_t packed = 0;
+        uint32_t source = m0 + row;
+        if (source < sequence)
+            packed = *(const uint32_t *)(query +
+                                         ((size_t)source * heads + head) *
+                                             128u + column);
+        *(uint32_t *)&q_tile[row * H3_MMA_LD + column] = packed;
+    }
+    __syncthreads();
+
+    uint32_t q_frag[8][4];
+#pragma unroll
+    for (uint32_t kk = 0; kk < 8u; kk++) {
+        uint32_t k0 = kk * 16u + tig * 2u;
+        q_frag[kk][0] = *(const uint32_t *)&q_tile[row_a * H3_MMA_LD + k0];
+        q_frag[kk][1] = *(const uint32_t *)&q_tile[row_b * H3_MMA_LD + k0];
+        q_frag[kk][2] = *(const uint32_t *)&q_tile[row_a * H3_MMA_LD + k0 + 8u];
+        q_frag[kk][3] = *(const uint32_t *)&q_tile[row_b * H3_MMA_LD + k0 + 8u];
+    }
+
+    float out_acc[16][4];
+#pragma unroll
+    for (uint32_t dt = 0; dt < 16u; dt++)
+#pragma unroll
+        for (uint32_t e = 0; e < 4u; e++) out_acc[dt][e] = 0.0f;
+    float max_a = -INFINITY;
+    float max_b = -INFINITY;
+    float sum_a = 0.0f;
+    float sum_b = 0.0f;
+
+    for (uint32_t n0 = 0; n0 < sequence; n0 += H3_MMA_N) {
+        __syncthreads();
+        for (uint32_t i = tid; i < H3_MMA_N * 64u; i += 128u) {
+            uint32_t row = i >> 6u;
+            uint32_t column = (i & 63u) * 2u;
+            uint32_t packed_k = 0;
+            uint32_t packed_v = 0;
+            uint32_t source = n0 + row;
+            if (source < sequence) {
+                size_t base = ((size_t)source * heads + head) * 128u + column;
+                packed_k = *(const uint32_t *)(key + base);
+                uint32_t raw_v = *(const uint32_t *)(value + base);
+                packed_v = h3_pack_f16_pair(
+                    h3_bf16_bits_to_f32((uint16_t)(raw_v & 0xffffu)),
+                    h3_bf16_bits_to_f32((uint16_t)(raw_v >> 16u)));
+            }
+            *(uint32_t *)&k_tile[row * H3_MMA_LD + column] = packed_k;
+            *(uint32_t *)&v_tile[row * H3_MMA_LD + column] = packed_v;
+        }
+        __syncthreads();
+
+        /* S = Q Kᵀ for this 64-key tile, as eight 16x8 accumulators. */
+        float score[8][4];
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++)
+#pragma unroll
+            for (uint32_t e = 0; e < 4u; e++) score[j][e] = 0.0f;
+#pragma unroll
+        for (uint32_t kk = 0; kk < 8u; kk++) {
+            uint32_t k0 = kk * 16u + tig * 2u;
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) {
+                uint32_t row = (j * 8u + group) * H3_MMA_LD;
+                uint32_t b_frag[2] = {
+                    *(const uint32_t *)&k_tile[row + k0],
+                    *(const uint32_t *)&k_tile[row + k0 + 8u]};
+                h3_mma_m16n8k16_bf16(score[j], q_frag[kk], b_frag);
+            }
+        }
+
+        /* Online softmax. score[j][0..1] is row_a, [2..3] is row_b. */
+        uint32_t live = sequence - n0;
+        float tile_max_a = -INFINITY;
+        float tile_max_b = -INFINITY;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            uint32_t column = j * 8u + tig * 2u;
+#pragma unroll
+            for (uint32_t e = 0; e < 2u; e++) {
+                if (column + e < live) {
+                    score[j][e] *= args.scale;
+                    score[j][e + 2u] *= args.scale;
+                    tile_max_a = fmaxf(tile_max_a, score[j][e]);
+                    tile_max_b = fmaxf(tile_max_b, score[j][e + 2u]);
+                } else {
+                    score[j][e] = -INFINITY;
+                    score[j][e + 2u] = -INFINITY;
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t mask = 1u; mask < 4u; mask <<= 1u) {
+            tile_max_a =
+                fmaxf(tile_max_a, __shfl_xor_sync(0xffffffffu, tile_max_a,
+                                                  (int)mask));
+            tile_max_b =
+                fmaxf(tile_max_b, __shfl_xor_sync(0xffffffffu, tile_max_b,
+                                                  (int)mask));
+        }
+        float new_max_a = fmaxf(max_a, tile_max_a);
+        float new_max_b = fmaxf(max_b, tile_max_b);
+        float alpha_a = isfinite(new_max_a) ? __expf(max_a - new_max_a) : 1.0f;
+        float alpha_b = isfinite(new_max_b) ? __expf(max_b - new_max_b) : 1.0f;
+        float tile_sum_a = 0.0f;
+        float tile_sum_b = 0.0f;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+#pragma unroll
+            for (uint32_t e = 0; e < 2u; e++) {
+                float p_a = score[j][e] == -INFINITY
+                                ? 0.0f
+                                : __expf(score[j][e] - new_max_a);
+                float p_b = score[j][e + 2u] == -INFINITY
+                                ? 0.0f
+                                : __expf(score[j][e + 2u] - new_max_b);
+                score[j][e] = p_a;
+                score[j][e + 2u] = p_b;
+                tile_sum_a += p_a;
+                tile_sum_b += p_b;
+            }
+        }
+#pragma unroll
+        for (uint32_t mask = 1u; mask < 4u; mask <<= 1u) {
+            tile_sum_a += __shfl_xor_sync(0xffffffffu, tile_sum_a, (int)mask);
+            tile_sum_b += __shfl_xor_sync(0xffffffffu, tile_sum_b, (int)mask);
+        }
+        sum_a = sum_a * alpha_a + tile_sum_a;
+        sum_b = sum_b * alpha_b + tile_sum_b;
+        max_a = new_max_a;
+        max_b = new_max_b;
+#pragma unroll
+        for (uint32_t dt = 0; dt < 16u; dt++) {
+            out_acc[dt][0] *= alpha_a;
+            out_acc[dt][1] *= alpha_a;
+            out_acc[dt][2] *= alpha_b;
+            out_acc[dt][3] *= alpha_b;
+        }
+
+        /* O += P V. P is already in A-fragment order. */
+#pragma unroll
+        for (uint32_t kk = 0; kk < 4u; kk++) {
+            uint32_t p_frag[4] = {
+                h3_pack_f16_pair(score[kk * 2u][0], score[kk * 2u][1]),
+                h3_pack_f16_pair(score[kk * 2u][2], score[kk * 2u][3]),
+                h3_pack_f16_pair(score[kk * 2u + 1u][0],
+                                 score[kk * 2u + 1u][1]),
+                h3_pack_f16_pair(score[kk * 2u + 1u][2],
+                                 score[kk * 2u + 1u][3])};
+            uint32_t n_low = (kk * 16u + tig * 2u) * H3_MMA_LD;
+            uint32_t n_high = n_low + 8u * H3_MMA_LD;
+#pragma unroll
+            for (uint32_t dt = 0; dt < 16u; dt++) {
+                uint32_t column = dt * 8u + group;
+                uint32_t b_frag[2] = {
+                    (uint32_t)v_tile[n_low + column] |
+                        ((uint32_t)v_tile[n_low + H3_MMA_LD + column] << 16u),
+                    (uint32_t)v_tile[n_high + column] |
+                        ((uint32_t)v_tile[n_high + H3_MMA_LD + column] << 16u)};
+                h3_mma_m16n8k16_f16(out_acc[dt], p_frag, b_frag);
+            }
+        }
+    }
+
+    float inverse_a = sum_a > 0.0f ? 1.0f / sum_a : 0.0f;
+    float inverse_b = sum_b > 0.0f ? 1.0f / sum_b : 0.0f;
+    uint32_t global_a = m0 + row_a;
+    uint32_t global_b = m0 + row_b;
+#pragma unroll
+    for (uint32_t dt = 0; dt < 16u; dt++) {
+        uint32_t column = dt * 8u + tig * 2u;
+        if (global_a < sequence)
+            *(uint32_t *)&output[h3_sdpa_output_index(args, global_a, head,
+                                                      column)] =
+                h3_pack_bf16_pair(out_acc[dt][0] * inverse_a,
+                                  out_acc[dt][1] * inverse_a);
+        if (global_b < sequence)
+            *(uint32_t *)&output[h3_sdpa_output_index(args, global_b, head,
+                                                      column)] =
+                h3_pack_bf16_pair(out_acc[dt][2] * inverse_b,
+                                  out_acc[dt][3] * inverse_b);
+    }
+}
+
+static int h3_gpu_sdpa_bf16_mma(h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *query,
+                                const h3_gpu_tensor *key,
+                                const h3_gpu_tensor *value, uint32_t sequence,
+                                uint32_t heads, float scale,
+                                int head_major_output) {
+    h3_sdpa_args args = {sequence, heads, 128u, scale,
+                         head_major_output ? 1u : 0u, 0u};
+    dim3 blocks((sequence + H3_MMA_M - 1u) / H3_MMA_M, heads, 1);
+    dim3 threads(128, 1, 1);
+    h3_sdpa_bf16_mma_d128_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)query->device, (const uint16_t *)key->device,
+        (const uint16_t *)value->device, (uint16_t *)output->device, args);
+    gpu->stats.mps_sdpa_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_bf16_mma_d128");
+}
+
 static int h3_gpu_sdpa_bf16_wave(h3_gpu *gpu, h3_gpu_tensor *output,
                                  const h3_gpu_tensor *query,
                                  const h3_gpu_tensor *key,
@@ -2625,6 +2916,13 @@ static int h3_gpu_sdpa_bf16_impl(h3_gpu *gpu, h3_gpu_tensor *output,
         return h3_gpu_sdpa_bf16_parallel(gpu, output, query, key, value,
                                          sequence, heads, head_dim, scale,
                                          head_major_output);
+    /* Tensor-core attention is the default at head_dim 128 (the DiT's shape):
+     * it is ~8x the FP32 wave kernel and no less accurate. Opt back to the
+     * wave kernel with H3_SDPA_WAVE=1. */
+    if (head_dim == 128u &&
+        (h3_env_on("H3_SDPA_MMA") || !h3_env_on("H3_SDPA_WAVE")))
+        return h3_gpu_sdpa_bf16_mma(gpu, output, query, key, value, sequence,
+                                    heads, scale, head_major_output);
     if (head_dim <= 128u && !h3_env_on("H3_SDPA_WAVE_OFF"))
         return h3_gpu_sdpa_bf16_wave(gpu, output, query, key, value, sequence,
                                      heads, head_dim, scale,
