@@ -847,4 +847,18 @@ regs). fox-s2 interleaved `H3_SDPA_D128_Q10=1`:
 
 Slower than Q8; not Q16 spill. Reverted. Logs:
 `/tmp/h3_perf_day9/fox-s2-q10-ab1.log`, `fox-s2-q8-ab1.log`.
+---
+
+## 2026-08-24 — REJECT vec2 cooperative QKV/RoPE
+
+Separate kernel: two dims/thread, packed `uint32` BF16 loads/stores, same coop
+RMS. fox-s2 interleaved `H3_QKV_ROPE_VEC2=1`:
+
+| Run | Coop RMS | **Vec2** |
+|-----|---------:|---------:|
+| ab1 | 3.197 s (sdpa 1.795, leftover 0.170) | 3.019 s (sdpa 1.711, leftover 0.162) |
+| ab2 | 3.089 s (sdpa 1.738, leftover 0.165) | 3.177 s (sdpa 1.772, leftover 0.164) |
+
+Leftover denoise − sdpa − linear unchanged. ab1 wall tracks SDPA noise.
+Reverted. Logs: `/tmp/h3_perf_day9/fox-s2-vec2-ab1.log`, `fox-s2-coop-ab1.log`.
 
