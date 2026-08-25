@@ -1771,7 +1771,7 @@ flag on the moon, coffee cup by a rainy window. `--ssd-streaming` also renders a
 correct fox (79.2 s, BF16 weights). Whole suite passes (10 ok checks, all step
 smokes). Logs and frames: `/tmp/h3_perf_day12/verab/`.
 
-### What this says about the gates
+### What this says about the gates (2026-08-25)
 
 Every gate in this document passed while the pipeline was producing wrong
 videos, because all of them compare a build against itself: hashes of a
@@ -1780,4 +1780,91 @@ kernel, wall clocks. None of them looked at a frame, and none of them compared
 against a known-good older build. The cheap check that would have caught this on
 2026-08-23 is the one used to bisect it here: render one fixed prompt at 256×256
 and PSNR it against a stored reference clip.
+---
+
+## 2026-08-25 — the AdaLN tables did not have to be recomputed
+
+### Where the load time actually went
+
+The staging path now reports its own bytes and seconds (`stage … read= copy=
+pin=` on every `--profile` line), which changed the picture completely:
+
+| Phase | Bytes staged | read | H2D copy | pin |
+|-------|-------------:|-----:|---------:|----:|
+| Qwen text encoder | 46.86 GiB | 2.92 s | 0.03 s | 0.28 s |
+| DiT load | 58.14 GiB | 8.73 s | 0.02 s | 0.24 s |
+
+One generation moved **105 GiB** of weights. The host-to-device copy is free on
+GB10 — unified memory, and the copies are async — and pinning is a quarter of a
+second, so essentially all of the load time is getting bytes out of the file and
+into the staging slots. Reads scale with the fan-out up to about 16 readers on
+this 20-core part (DiT load 28.1 s at 4, 14.2 s at 8, 11.1 s at 12, 9.9 s at 16,
+9.4 s at 20, 9.2 s at 32), so the default went from 12 to 16.
+
+That is a constant factor. The structural finding is what the bytes are:
+
+| Tensor (per block, 50 blocks) | Total | Share of transformer |
+|-------------------------------|------:|---------------------:|
+| `adaln_proj.linear.weight` `[96768, 2688]` | **24.22 GiB** | **39.2%** |
+| `ff.net.0.proj.weight` | 14.36 GiB | 23.3% |
+| `ff.net.2.weight` | 7.18 GiB | 11.6% |
+| `attn.to_{q,k,v,out}.weight` | 14.36 GiB | 23.3% |
+
+24.22 GiB of AdaLN projection, read on every run, produces the modulation tables
+in `h3_dit_schedule_precompute` — and its only inputs are the sigma schedule and
+the two condition flags. **Nothing about it depends on the prompt.** The tables
+it produces are `time_rows × 96768` BF16 per block: 361 MiB for the fox-fast
+schedule, 64× smaller than the weights that generate them. It also ran for all
+50 blocks even though the gate ranking prunes 5 of them, which is exactly why
+the measured 58.139 GiB matched 45 core blocks plus 50 AdaLN blocks.
+
+### The cache
+
+`h3_dit_schedule_precompute` now looks for `adaln-<key>.bin` under
+`$H3_ADALN_CACHE`, else `$XDG_CACHE_HOME/h3-spark`, else `~/.cache/h3-spark`.
+The key hashes the schedule's timestep features, the condition flags, the table
+dimensions, and the size and mtime of the shard holding
+`blocks.0.adaln_proj.linear.weight`, so a different step count, a different
+sigma schedule or a swapped checkpoint misses instead of reusing. A miss
+computes the tables as before and writes them; `H3_ADALN_CACHE=off` disables the
+whole thing. Because BF16 tables round-trip exactly, a hit is bit-identical to a
+miss, not merely close.
+
+fox-fast 512×512, 22 frames, 20 steps, 45 layers, reuse 2:
+
+| | Cold cache (writes 361 MiB) | Warm cache |
+|--|---------------------------:|-----------:|
+| e2e wall | 32.7 s | **21.9 / 22.6 / 24.5 s** |
+| DiT load | 11.5 s | **2.6 / 3.1 / 5.1 s** |
+| bytes staged in DiT load | 58.14 GiB | **34.15 GiB** |
+| DiT load read time | 9.29 s | **1.4 / 2.6 s** |
+| GPU Euler denoise | 8.83 s | 8.81 / 8.83 / 8.89 s |
+| output md5 | `a90568fa…` | `a90568fa…` (identical) |
+
+Read time falls further than the byte count does, because 105 GiB per run was
+thrashing a 121 GiB machine's page cache: dropping the AdaLN reads lets the
+remaining 34 GiB stay resident, so it reads at cache speed (24 GB/s) rather than
+device speed (6 GB/s).
+
+Two checks that matter more than the numbers: a cache built by the fox prompt,
+used by the astronaut prompt, gives the same md5 (`fd3f4b38e0d71af3`) as the
+same astronaut run with the cache off — the tables really are prompt-independent
+— and `--steps 12` writes a second entry instead of reusing the 20-step one.
+Whole suite passes (10 ok checks, 5 step smokes). Logs: `/tmp/h3_perf_day13/`.
+
+### Where fox-fast stands now
+
+| Phase | Wall | Share |
+|-------|-----:|------:|
+| GPU Euler denoise | 8.8 s | 39% |
+| video VAE decode | 5.2 s | 23% |
+| DiT load | ~3.1 s | 14% |
+| Qwen text encoder | ~2.5 s | 11% |
+| audio VAE + mux | ~1.5 s | 7% |
+
+Loading is no longer the head: denoise and the video VAE are, and inside the VAE
+it is 3.5 s of F32 GEMM. The text encoder still stages 46.86 GiB per run for a
+twelve-token prompt, which is the next structural target — the same
+sidecar-cache reasoning does not apply (its output depends on the prompt), but
+an INT8 or FP8 weight cache would halve the bytes for every prompt.
 ---

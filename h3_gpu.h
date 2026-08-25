@@ -34,6 +34,12 @@ typedef struct {
     double gpu_linear_seconds;
     double gpu_sdpa_seconds;
     double gpu_conv_seconds;
+    /* CUDA weight staging. Loader lanes run concurrently, so these seconds are
+     * summed across readers and can exceed the phase's wall time. */
+    uint64_t stage_bytes;
+    double stage_read_seconds;
+    double stage_copy_seconds;
+    double stage_pin_seconds;
 } h3_gpu_stats;
 
 h3_gpu *h3_gpu_create(const char *shader_source_path,

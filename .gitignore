@@ -42,3 +42,4 @@ tokenizer_test
 libh3_cuda.a
 libh3.a
 .DS_Store
+cufile.log

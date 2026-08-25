@@ -196,7 +196,8 @@ static void h3_gpu_profile_emit(h3_gpu *gpu, const char *phase,
             "peak=%7.3fGiB alloc=%7.3fGiB submissions=%llu "
             "direct=%llu linear=%llu conv=%llu attention=%llu "
             "gpu-op linear=%.3fs sdpa=%.3fs conv=%.3fs "
-            "int8-cublas=%llu naive=%llu\n",
+            "int8-cublas=%llu naive=%llu "
+            "stage %.3fGiB read=%.3fs copy=%.3fs pin=%.3fs\n",
             label, phase, wall,
             (double)value.peak_live_bytes / (1024.0 * 1024.0 * 1024.0),
             (double)h3_gpu_counter_delta(value.allocated_bytes,
@@ -219,7 +220,15 @@ static void h3_gpu_profile_emit(h3_gpu *gpu, const char *phase,
             h3_gpu_seconds_delta(value.gpu_conv_seconds,
                                  start->gpu_conv_seconds),
             (unsigned long long)gpu->int8_cublas_ok,
-            (unsigned long long)gpu->int8_naive_fallback);
+            (unsigned long long)gpu->int8_naive_fallback,
+            (double)h3_gpu_counter_delta(value.stage_bytes, start->stage_bytes) /
+                (1024.0 * 1024.0 * 1024.0),
+            h3_gpu_seconds_delta(value.stage_read_seconds,
+                                 start->stage_read_seconds),
+            h3_gpu_seconds_delta(value.stage_copy_seconds,
+                                 start->stage_copy_seconds),
+            h3_gpu_seconds_delta(value.stage_pin_seconds,
+                                 start->stage_pin_seconds));
     fflush(stderr);
 }
 
@@ -547,12 +556,12 @@ static int h3_gpu_open_stage_fd(h3_gpu *gpu, const char *path, char *error,
 }
 
 /* Weight loading is disk-read bound: a single pread stream reaches about
- * 0.94 GB/s on the Spark NVMe while eight concurrent readers reach 4.5 GB/s,
+ * 0.94 GB/s on the Spark NVMe while sixteen concurrent readers reach 4.5 GB/s,
  * because the device needs queue depth to stay busy. Large tensors are read by
  * a fan-out of pread slices so the loader tracks the parallel rate instead of
  * the single-stream rate. Set H3_LOAD_READ_THREADS=1 to force the serial path.
  */
-#define H3_LOAD_READ_THREADS_MAX 16
+#define H3_LOAD_READ_THREADS_MAX 32
 #define H3_LOAD_READ_SLICE_MIN ((size_t)4 << 20)
 
 typedef struct {
@@ -589,7 +598,9 @@ static void *h3_read_slice_worker(void *raw) {
 
 static int h3_read_threads(void) {
     const char *value = getenv("H3_LOAD_READ_THREADS");
-    int threads = 12;
+    /* Reads keep scaling to about 16 on this 20-core part; 24 and beyond only
+     * add contention (DiT load 2.5 s at 16, 3.1 s at 20, 10.3 s at 24). */
+    int threads = 16;
     if (value && *value) {
         long parsed = strtol(value, NULL, 10);
         if (parsed >= 1 && parsed <= H3_LOAD_READ_THREADS_MAX)
@@ -709,6 +720,7 @@ static int h3_gpu_ensure_stage(h3_gpu *gpu) {
     }
     gpu->stage_host_bytes = 0;
     gpu->stage_host_pinned = 0;
+    double pin_start = h3_gpu_now();
     int pinned = 1;
     for (int i = 0; i < H3_STAGE_SLOTS; i++) {
         if (cudaMallocHost(&gpu->stage_host[i], bytes) != cudaSuccess) {
@@ -720,6 +732,7 @@ static int h3_gpu_ensure_stage(h3_gpu *gpu) {
     if (pinned) {
         gpu->stage_host_bytes = bytes;
         gpu->stage_host_pinned = 1;
+        gpu->stats.stage_pin_seconds += h3_gpu_now() - pin_start;
         return 1;
     }
     for (int i = 0; i < H3_STAGE_SLOTS; i++) {
@@ -784,9 +797,11 @@ static int h3_copy_file_to_device_chunk(h3_gpu *gpu, void *device,
         return 0;
     }
     gpu->stage_event_recorded[slot] = 0;
+    double read_start = h3_gpu_now();
     if (!h3_read_file_at(gpu, path, offset, gpu->stage_host[slot], bytes, error,
                          error_size))
         return 0;
+    double copy_start = h3_gpu_now();
     cudaError_t status;
     int overlap = gpu->stage_host_pinned && gpu->stream &&
                   !h3_env_on("H3_LOAD_SYNC_COPY");
@@ -808,6 +823,12 @@ static int h3_copy_file_to_device_chunk(h3_gpu *gpu, void *device,
         }
         return 0;
     }
+    double copy_end = h3_gpu_now();
+    pthread_mutex_lock(&gpu->stage_lock);
+    gpu->stats.stage_bytes += bytes;
+    gpu->stats.stage_read_seconds += copy_start - read_start;
+    gpu->stats.stage_copy_seconds += copy_end - copy_start;
+    pthread_mutex_unlock(&gpu->stage_lock);
     return 1;
 }
 
