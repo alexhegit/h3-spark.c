@@ -2,9 +2,11 @@
 
 #include <float.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int failures;
 
@@ -549,6 +551,115 @@ static void text_qk_rope_ref(const float *query_input, const float *key_input,
             }
         }
     }
+}
+
+#define STAGE_LANES 6
+#define STAGE_LANE_ELEMENTS ((size_t)3 << 20)
+
+typedef struct {
+    const char *path;
+    h3_gpu_tensor *tensor;
+    uint64_t offset;
+    int ok;
+} stage_lane;
+
+static uint16_t stage_pattern(size_t index) {
+    return (uint16_t)(((uint32_t)index * 2654435761u) >> 16u);
+}
+
+static void *stage_lane_main(void *raw) {
+    stage_lane *lane = (stage_lane *)raw;
+    char error[256];
+    error[0] = '\0';
+    lane->ok = h3_gpu_tensor_read_file_bf16(lane->tensor, lane->path,
+                                            lane->offset, STAGE_LANE_ELEMENTS,
+                                            error, sizeof(error));
+    if (!lane->ok) fprintf(stderr, "lane read: %s\n", error);
+    return NULL;
+}
+
+/* The Qwen loader reads one layer's tensors from several lanes at once, so the
+ * staging buffers behind h3_gpu_tensor_read_file_bf16 must not be shared. When
+ * they were, lanes overwrote each other between the pread and the copy and the
+ * text encoder ran on scrambled weights (docs/PERF_BASELINE.md, 2026-08-25). */
+static void check_concurrent_staged_reads(h3_gpu *gpu) {
+    /* Small chunks so every lane's read spans more than one staging chunk. */
+    setenv("H3_LOAD_STAGE_MIB", "8", 1);
+    char path[] = "/tmp/h3_stage_lanes_XXXXXX";
+    int fd = mkstemp(path);
+    check(fd >= 0, "staging race temp file");
+    if (fd < 0) return;
+    uint16_t *expected =
+        (uint16_t *)malloc(STAGE_LANE_ELEMENTS * STAGE_LANES * sizeof(uint16_t));
+    uint16_t *actual =
+        (uint16_t *)malloc(STAGE_LANE_ELEMENTS * sizeof(uint16_t));
+    check(expected && actual, "staging race host buffers");
+    if (!expected || !actual) {
+        free(expected);
+        free(actual);
+        close(fd);
+        unlink(path);
+        return;
+    }
+    for (size_t i = 0; i < STAGE_LANE_ELEMENTS * STAGE_LANES; i++)
+        expected[i] = stage_pattern(i);
+    size_t file_bytes = STAGE_LANE_ELEMENTS * STAGE_LANES * sizeof(uint16_t);
+    check(write(fd, expected, file_bytes) == (ssize_t)file_bytes,
+          "staging race file write");
+    close(fd);
+
+    stage_lane lanes[STAGE_LANES];
+    pthread_t workers[STAGE_LANES];
+    h3_gpu_tensor *tensors[STAGE_LANES];
+    for (int lane = 0; lane < STAGE_LANES; lane++) {
+        tensors[lane] = h3_gpu_tensor_new_bf16(gpu, STAGE_LANE_ELEMENTS);
+        check(tensors[lane] != NULL, "staging race tensor alloc");
+        lanes[lane].path = path;
+        lanes[lane].tensor = tensors[lane];
+        lanes[lane].offset =
+            (uint64_t)lane * STAGE_LANE_ELEMENTS * sizeof(uint16_t);
+    }
+    /* A race only sometimes loses: the shared-buffer build failed two rounds in
+     * three, so one round is not enough of a gate. */
+    int mismatched_lanes = 0;
+    int failed_reads = 0;
+    for (int round = 0; round < 4; round++) {
+        for (int lane = 0; lane < STAGE_LANES; lane++) {
+            lanes[lane].ok = 0;
+            check(pthread_create(&workers[lane], NULL, stage_lane_main,
+                                 &lanes[lane]) == 0,
+                  "staging race lane spawn");
+        }
+        for (int lane = 0; lane < STAGE_LANES; lane++)
+            pthread_join(workers[lane], NULL);
+        check(h3_gpu_submit(gpu), "staging race submit");
+        for (int lane = 0; lane < STAGE_LANES; lane++) {
+            if (!lanes[lane].ok) {
+                failed_reads++;
+                continue;
+            }
+            if (!tensors[lane]) continue;
+            check(h3_gpu_tensor_read_bf16(tensors[lane], actual,
+                                          STAGE_LANE_ELEMENTS),
+                  "staging race readback");
+            if (memcmp(actual, expected + (size_t)lane * STAGE_LANE_ELEMENTS,
+                       STAGE_LANE_ELEMENTS * sizeof(uint16_t)) != 0)
+                mismatched_lanes++;
+        }
+    }
+    check(failed_reads == 0, "concurrent staged reads all succeed");
+    check(mismatched_lanes == 0, "concurrent staged reads keep their own bytes");
+    if (mismatched_lanes || failed_reads) {
+        fprintf(stderr,
+                "staging race: %d lane read(s) failed, %d read foreign bytes\n",
+                failed_reads, mismatched_lanes);
+    }
+    for (int lane = 0; lane < STAGE_LANES; lane++)
+        h3_gpu_tensor_free(tensors[lane]);
+    free(expected);
+    free(actual);
+    unlink(path);
+    unsetenv("H3_LOAD_STAGE_MIB");
 }
 
 int main(void) {
@@ -3587,6 +3698,9 @@ int main(void) {
     h3_gpu_tensor_free(gaq_gate);
     h3_gpu_tensor_free(gaq_quant);
     h3_gpu_tensor_free(gaq_scales);
+
+    check_concurrent_staged_reads(gpu);
+
     h3_gpu_free(gpu);
 
     if (failures) {

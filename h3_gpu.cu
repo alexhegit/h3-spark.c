@@ -28,17 +28,24 @@ struct h3_gpu_tensor {
     int pooled;
 };
 
+/* The text encoder reads one layer's weights from several lanes at once, so a
+ * staging buffer cannot be shared: each reader claims a slot for the duration
+ * of a chunk. Four slots keep the readers overlapped without pinning more host
+ * memory than the loader needs. */
+#define H3_STAGE_SLOTS 4
+
 struct h3_gpu {
     cudaStream_t stream;
     cublasHandle_t cublas;
-    void *stage_host[2];
+    void *stage_host[H3_STAGE_SLOTS];
     size_t stage_host_bytes;
     int stage_host_pinned;
-    int stage_slot;
-    int stage_event_recorded[2];
-    cudaEvent_t stage_copied[2];
-    int stage_fd;
-    char stage_path[4096];
+    int stage_busy[H3_STAGE_SLOTS];
+    int stage_next;
+    int stage_event_recorded[H3_STAGE_SLOTS];
+    cudaEvent_t stage_copied[H3_STAGE_SLOTS];
+    pthread_mutex_t stage_lock;
+    pthread_cond_t stage_free;
     int device;
     int fast_path;
     int tensor_fast_path;
@@ -361,19 +368,18 @@ h3_gpu *h3_gpu_create(const char *shader_source_path, char *error,
         return NULL;
     }
     cublasSetStream(gpu->cublas, gpu->stream);
-    gpu->stage_host[0] = NULL;
-    gpu->stage_host[1] = NULL;
     gpu->stage_host_bytes = 0;
     gpu->stage_host_pinned = 0;
-    gpu->stage_slot = 0;
-    gpu->stage_event_recorded[0] = 0;
-    gpu->stage_event_recorded[1] = 0;
-    gpu->stage_copied[0] = NULL;
-    gpu->stage_copied[1] = NULL;
-    gpu->stage_fd = -1;
-    gpu->stage_path[0] = '\0';
-    cudaEventCreateWithFlags(&gpu->stage_copied[0], cudaEventDisableTiming);
-    cudaEventCreateWithFlags(&gpu->stage_copied[1], cudaEventDisableTiming);
+    gpu->stage_next = 0;
+    pthread_mutex_init(&gpu->stage_lock, NULL);
+    pthread_cond_init(&gpu->stage_free, NULL);
+    for (int i = 0; i < H3_STAGE_SLOTS; i++) {
+        gpu->stage_host[i] = NULL;
+        gpu->stage_busy[i] = 0;
+        gpu->stage_event_recorded[i] = 0;
+        gpu->stage_copied[i] = NULL;
+        cudaEventCreateWithFlags(&gpu->stage_copied[i], cudaEventDisableTiming);
+    }
     cudaDeviceProp props;
     if (cudaGetDeviceProperties(&props, 0) == cudaSuccess) {
         gpu->fast_path = props.major >= 12 ? 1 : 0;
@@ -414,7 +420,7 @@ void h3_gpu_free(h3_gpu *gpu) {
     gpu->ws_mlp_fc1 = gpu->ws_mlp_hidden = gpu->ws_qkv = NULL;
     gpu->ws_int8_fc1 = gpu->ws_adaln = NULL;
     if (gpu->int8_accum) cudaFree(gpu->int8_accum);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < H3_STAGE_SLOTS; i++) {
         if (gpu->stage_event_recorded[i] && gpu->stage_copied[i])
             cudaEventSynchronize(gpu->stage_copied[i]);
         if (gpu->stage_host[i]) {
@@ -423,7 +429,8 @@ void h3_gpu_free(h3_gpu *gpu) {
         }
         if (gpu->stage_copied[i]) cudaEventDestroy(gpu->stage_copied[i]);
     }
-    if (gpu->stage_fd >= 0) close(gpu->stage_fd);
+    pthread_cond_destroy(&gpu->stage_free);
+    pthread_mutex_destroy(&gpu->stage_lock);
     if (gpu->cublas) cublasDestroy(gpu->cublas);
     if (gpu->stream) cudaStreamDestroy(gpu->stream);
     free(gpu);
@@ -501,9 +508,15 @@ static int h3_tensor_check(const h3_gpu_tensor *tensor, h3_gpu_dtype dtype,
            tensor->elements >= elements;
 }
 
+/* Kept per thread: several loader lanes read at once, and a cached descriptor
+ * one lane closes must not be handed to another. */
+static __thread int h3_stage_fd = -1;
+static __thread char h3_stage_fd_path[4096];
+
 static int h3_gpu_open_stage_fd(h3_gpu *gpu, const char *path, char *error,
                                 size_t error_size) {
-    if (!gpu || !path) return -1;
+    (void)gpu;
+    if (!path) return -1;
     if (!h3_env_on("H3_LOAD_FD_CACHE")) {
         int fd = open(path, O_RDONLY);
         if (fd < 0 && error && error_size) {
@@ -512,13 +525,13 @@ static int h3_gpu_open_stage_fd(h3_gpu *gpu, const char *path, char *error,
         }
         return fd;
     }
-    if (gpu->stage_fd >= 0 && gpu->stage_path[0] &&
-        strcmp(gpu->stage_path, path) == 0)
-        return gpu->stage_fd;
-    if (gpu->stage_fd >= 0) {
-        close(gpu->stage_fd);
-        gpu->stage_fd = -1;
-        gpu->stage_path[0] = '\0';
+    if (h3_stage_fd >= 0 && h3_stage_fd_path[0] &&
+        strcmp(h3_stage_fd_path, path) == 0)
+        return h3_stage_fd;
+    if (h3_stage_fd >= 0) {
+        close(h3_stage_fd);
+        h3_stage_fd = -1;
+        h3_stage_fd_path[0] = '\0';
     }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -528,8 +541,8 @@ static int h3_gpu_open_stage_fd(h3_gpu *gpu, const char *path, char *error,
         }
         return -1;
     }
-    gpu->stage_fd = fd;
-    snprintf(gpu->stage_path, sizeof(gpu->stage_path), "%s", path);
+    h3_stage_fd = fd;
+    snprintf(h3_stage_fd_path, sizeof(h3_stage_fd_path), "%s", path);
     return fd;
 }
 
@@ -673,16 +686,18 @@ static size_t h3_stage_chunk_bytes(void) {
     return mib << 20;
 }
 
-static int h3_gpu_ensure_stage(h3_gpu *gpu, size_t bytes) {
-    if (!gpu || !bytes) return 0;
-    /* Pinning is slow — around 1.5 GB/s — so the staging pair is allocated
-     * once at a fixed size and larger tensors are copied in chunks instead of
-     * growing it. */
-    bytes = h3_stage_chunk_bytes();
-    if (gpu->stage_host[0] && gpu->stage_host[1] &&
-        gpu->stage_host_bytes >= bytes)
-        return 1;
-    for (int i = 0; i < 2; i++) {
+/* Call with stage_lock held. */
+static int h3_gpu_ensure_stage(h3_gpu *gpu) {
+    if (!gpu) return 0;
+    /* Pinning is slow — around 1.5 GB/s — so the slots are allocated once at a
+     * fixed size and larger tensors are copied in chunks instead of growing
+     * them. */
+    size_t bytes = h3_stage_chunk_bytes();
+    int ready = gpu->stage_host_bytes >= bytes;
+    for (int i = 0; ready && i < H3_STAGE_SLOTS; i++)
+        if (!gpu->stage_host[i]) ready = 0;
+    if (ready) return 1;
+    for (int i = 0; i < H3_STAGE_SLOTS; i++) {
         if (gpu->stage_event_recorded[i] && gpu->stage_copied[i])
             cudaEventSynchronize(gpu->stage_copied[i]);
         gpu->stage_event_recorded[i] = 0;
@@ -694,33 +709,74 @@ static int h3_gpu_ensure_stage(h3_gpu *gpu, size_t bytes) {
     }
     gpu->stage_host_bytes = 0;
     gpu->stage_host_pinned = 0;
-    if (cudaMallocHost(&gpu->stage_host[0], bytes) == cudaSuccess &&
-        cudaMallocHost(&gpu->stage_host[1], bytes) == cudaSuccess) {
+    int pinned = 1;
+    for (int i = 0; i < H3_STAGE_SLOTS; i++) {
+        if (cudaMallocHost(&gpu->stage_host[i], bytes) != cudaSuccess) {
+            gpu->stage_host[i] = NULL;
+            pinned = 0;
+            break;
+        }
+    }
+    if (pinned) {
         gpu->stage_host_bytes = bytes;
         gpu->stage_host_pinned = 1;
         return 1;
     }
-    if (gpu->stage_host[0]) cudaFreeHost(gpu->stage_host[0]);
-    if (gpu->stage_host[1]) cudaFreeHost(gpu->stage_host[1]);
-    gpu->stage_host[0] = malloc(bytes);
-    gpu->stage_host[1] = malloc(bytes);
-    if (!gpu->stage_host[0] || !gpu->stage_host[1]) {
-        free(gpu->stage_host[0]);
-        free(gpu->stage_host[1]);
-        gpu->stage_host[0] = NULL;
-        gpu->stage_host[1] = NULL;
-        return 0;
+    for (int i = 0; i < H3_STAGE_SLOTS; i++) {
+        if (gpu->stage_host[i]) cudaFreeHost(gpu->stage_host[i]);
+        gpu->stage_host[i] = malloc(bytes);
+        if (!gpu->stage_host[i]) {
+            for (int j = 0; j < i; j++) {
+                free(gpu->stage_host[j]);
+                gpu->stage_host[j] = NULL;
+            }
+            return 0;
+        }
     }
     gpu->stage_host_bytes = bytes;
     gpu->stage_host_pinned = 0;
     return 1;
 }
 
+/* A slot is released as soon as its copy is enqueued; whoever claims it next
+ * waits on the recorded event before overwriting the buffer. */
+static int h3_stage_claim(h3_gpu *gpu, char *error, size_t error_size) {
+    pthread_mutex_lock(&gpu->stage_lock);
+    if (!h3_gpu_ensure_stage(gpu)) {
+        pthread_mutex_unlock(&gpu->stage_lock);
+        if (error && error_size) snprintf(error, error_size, "out of memory");
+        return -1;
+    }
+    int slot = -1;
+    while (slot < 0) {
+        /* Hand out slots round-robin: coming back to the slot just released
+         * would mean waiting on its own copy instead of overlapping with it. */
+        for (int i = 0; i < H3_STAGE_SLOTS; i++) {
+            int candidate = (gpu->stage_next + i) % H3_STAGE_SLOTS;
+            if (!gpu->stage_busy[candidate]) {
+                slot = candidate;
+                break;
+            }
+        }
+        if (slot < 0) pthread_cond_wait(&gpu->stage_free, &gpu->stage_lock);
+    }
+    gpu->stage_next = (slot + 1) % H3_STAGE_SLOTS;
+    gpu->stage_busy[slot] = 1;
+    pthread_mutex_unlock(&gpu->stage_lock);
+    return slot;
+}
+
+static void h3_stage_release(h3_gpu *gpu, int slot) {
+    pthread_mutex_lock(&gpu->stage_lock);
+    gpu->stage_busy[slot] = 0;
+    pthread_cond_signal(&gpu->stage_free);
+    pthread_mutex_unlock(&gpu->stage_lock);
+}
+
 static int h3_copy_file_to_device_chunk(h3_gpu *gpu, void *device,
                                         const char *path, uint64_t offset,
-                                        size_t bytes, char *error,
+                                        size_t bytes, int slot, char *error,
                                         size_t error_size) {
-    int slot = gpu->stage_slot & 1;
     if (gpu->stage_event_recorded[slot] && gpu->stage_copied[slot] &&
         cudaEventSynchronize(gpu->stage_copied[slot]) != cudaSuccess) {
         if (error && error_size)
@@ -752,7 +808,6 @@ static int h3_copy_file_to_device_chunk(h3_gpu *gpu, void *device,
         }
         return 0;
     }
-    gpu->stage_slot = slot ^ 1;
     return 1;
 }
 
@@ -763,22 +818,20 @@ static int h3_copy_file_to_device(h3_gpu *gpu, void *device, const char *path,
                                   uint64_t offset, size_t bytes, char *error,
                                   size_t error_size) {
     if (!gpu || !device || !path || !bytes) return 0;
-    if (!h3_gpu_ensure_stage(gpu, bytes)) {
-        if (error && error_size) snprintf(error, error_size, "out of memory");
-        return 0;
-    }
-    size_t chunk_cap = gpu->stage_host_bytes;
-    if (!chunk_cap) chunk_cap = bytes;
+    int ok = 1;
     for (size_t done = 0; done < bytes;) {
+        int slot = h3_stage_claim(gpu, error, error_size);
+        if (slot < 0) return 0;
         size_t span = bytes - done;
-        if (span > chunk_cap) span = chunk_cap;
-        if (!h3_copy_file_to_device_chunk(gpu, (unsigned char *)device + done,
-                                         path, offset + done, span, error,
-                                         error_size))
-            return 0;
+        if (span > gpu->stage_host_bytes) span = gpu->stage_host_bytes;
+        ok = h3_copy_file_to_device_chunk(gpu, (unsigned char *)device + done,
+                                         path, offset + done, span, slot, error,
+                                         error_size);
+        h3_stage_release(gpu, slot);
+        if (!ok) return 0;
         done += span;
     }
-    return 1;
+    return ok;
 }
 
 h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,

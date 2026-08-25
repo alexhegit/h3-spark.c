@@ -1607,7 +1607,17 @@ VAE smokes report identical values (video abs-max 0.677619, audio 0.16749) and
 the whole suite passes. Logs: `/tmp/h3_perf_day12/bias-{fused,split,fused2,split2}.log`.
 ---
 
-## 2026-08-25 — two output-correctness findings (pre-existing, not perf)
+## 2026-08-25 — two output-correctness findings
+
+> **Superseded:** both findings below are one bug, a data race in the weight
+> staging buffer introduced on 2026-08-23 by `55a61f0`, fixed the same day it
+> was found. See *"the staging buffer was shared between loader threads"* at the
+> end of this document. The conclusion drawn here — that the problems predate
+> the optimizations — was wrong: the env switches used to test it
+> (`H3_LOAD_READ_THREADS=1 H3_GPU_SYNC_ALLOC=1 H3_SDPA_F32_WAVE=1
+> H3_F32_SPLIT_BIAS=1`) do not disable the shared staging buffer, because
+> nothing did. Rebuilding an older commit, rather than switching flags off, is
+> what settled it.
 
 Checking the actual pixels at the end of the session, rather than only hashes
 and wall clocks, turned up two problems that are independent of every change in
@@ -1678,4 +1688,96 @@ multi-step loop with core reuse, the preview decode interleaving, the audio
 branch, and the tiled VAE decode. The obvious next step is to dump the latent
 after each denoise step across two runs and find the first step that differs,
 which localizes it to a step boundary rather than a kernel.
+
+The third hypothesis is the one that was true, and the reasoning against it was
+the flaw: `h3_cuda_dit_forward_smoke` loads DiT weights on one thread, and only
+the Qwen text encoder reads a layer from several threads at once, so the smoke
+covers the staging path without ever exercising the race in it.
+---
+
+## 2026-08-25 — the staging buffer was shared between loader threads
+
+**Both findings above are one bug, and it is a regression, not a pre-existing
+condition.** The 2026-08-17 CUDA baseline (`483ffdf`) renders the fox prompt as
+a fox; every build from 2026-08-23 onward renders an unrelated scene (a
+spreadsheet, a document, handwriting) and a different one on each run.
+
+### Bisect
+
+Same command on each build, at 256×256 so the pre-optimization commits are
+affordable, scored by PSNR against the `483ffdf` output:
+
+| Build | Output | PSNR vs `483ffdf` |
+|-------|--------|------------------:|
+| `483ffdf` 2026-08-17 CUDA baseline | fox in snow | — |
+| `55a2710` wave SDPA + tiled INT8 FC2 | fox in snow | 17.62 dB |
+| **`55a61f0` default DiT MLP to BF16** | spreadsheet | **7.84 dB** |
+| `82b58b5` pre-session | spreadsheet | 8.52 dB |
+| `494f271` session HEAD | spreadsheet | 8.90 dB |
+
+`55a61f0` is the first bad commit, but not for the reason its message suggests:
+re-enabling the INT8 MLP it turned off (`H3_INT8_MLP=1`) still renders a
+spreadsheet (7.82 dB), and so does dropping the `-gencode
+arch=compute_121,code=sm_121` it added (7.85 dB). Reverting only its `h3_dit.c`
+half leaves the bug (7.83 dB), which puts it in the `h3_gpu.cu` half.
+
+### Root cause
+
+That half replaced the per-read `malloc` in `h3_gpu_tensor_load_*` and
+`h3_gpu_tensor_read_file_bf16` with one staging buffer hanging off `h3_gpu`
+(later a pinned pair, then chunked). The DiT loads weights on one thread, so
+that is safe there — but `prefetch_slot_start` in `h3_text_encoder.c` reads each
+Qwen layer's eleven tensors from up to eight lanes at once, and every lane went
+through the same buffer. Lanes overwrote each other's bytes between the `pread`
+and the `cudaMemcpy`, so an arbitrary subset of the text encoder's 50 layers got
+weights belonging to a different tensor.
+
+That single race explains both symptoms exactly: a corrupted text encoder emits
+an embedding unrelated to the prompt (so the DiT is conditioned on noise and
+falls back to arbitrary scenes), and which bytes lose the race differs per run
+(so two invocations of one command differ semantically, not numerically).
+
+### Fix
+
+`h3_gpu` now owns four staging slots instead of one buffer. A reader claims a
+slot for one chunk under a mutex, waits on that slot's copy event before
+overwriting it, and releases it as soon as its own copy is enqueued, so slots
+still pipeline reads against copies. Slots are handed out round-robin: handing
+back the slot just released would make a single-threaded loader wait on its own
+copy instead of overlapping with it (DiT load 10.8 s round-robin vs 11.7 s
+first-free). The `H3_LOAD_FD_CACHE` descriptor cache became `__thread` for the
+same reason — one lane must not close a descriptor another lane is reading.
+
+### Cost
+
+fox-fast 512×512, 22 frames, 20 steps, 45 layers, reuse 2, warm:
+
+| | Fixed | Racy (`494f271`) |
+|--|------:|-----------------:|
+| e2e wall | **32.1 s / 32.4 s** | 31.3 s / 31.5 s |
+| Qwen text encoder | 4.43 s / 4.35 s | 4.15 s / 4.16 s |
+| DiT load | 10.82 s / 10.86 s | 10.70 s / 10.87 s |
+| GPU Euler denoise | 8.75 s / 8.87 s | 8.75 s |
+| output md5 | **identical** | differs every run |
+
+Correctness costs ~0.9 s (2.9%) of end-to-end wall, all of it in the text
+encoder and the pinning of two extra slots. Serializing the whole staging path
+with one mutex instead — the first fix tried — costs 3.5 s in the text encoder
+(7.65 s) and was replaced by the slot pool. 128 MiB chunks remain the best
+setting with four slots (32/64/96/192/256 MiB all measure slower).
+
+Three prompts now render what they ask for: fox in snow, astronaut planting a
+flag on the moon, coffee cup by a rainy window. `--ssd-streaming` also renders a
+correct fox (79.2 s, BF16 weights). Whole suite passes (10 ok checks, all step
+smokes). Logs and frames: `/tmp/h3_perf_day12/verab/`.
+
+### What this says about the gates
+
+Every gate in this document passed while the pipeline was producing wrong
+videos, because all of them compare a build against itself: hashes of a
+single-threaded forward smoke, kernel-level relative L2 against a reference
+kernel, wall clocks. None of them looked at a frame, and none of them compared
+against a known-good older build. The cheap check that would have caught this on
+2026-08-23 is the one used to bisect it here: render one fixed prompt at 256×256
+and PSNR it against a stored reference clip.
 ---
