@@ -2090,6 +2090,10 @@ passes, and the rest needs a format the quality does not currently allow — and
 1.5 s of attention still at 31 TFLOP/s against a ~98 TFLOP/s BF16 peak, which is
 the largest single unclaimed gap left in the pipeline.
 
+**Amended 2026-08-26.** That last sentence is wrong. The attention kernel is not
+tensor-core bound, so the ratio to the GEMM peak does not describe a gap that
+can be claimed — see "REJECT further work on the DiT attention tile" below.
+
 Logs: `/tmp/h3_perf_day14/tf32/`.
 ---
 
@@ -2165,3 +2169,74 @@ line of work was too high, and 0.35 s is what was there. e2e is **19.4 s**.
 
 Logs: `/tmp/h3_perf_day14/qkv*.log`, `q-{vec,scalar}-*.log`, `vec.nsys-rep`.
 ---
+
+## 2026-08-26 — REJECT further work on the DiT attention tile; it is not tensor-core bound
+
+The 2026-08-26 TF32 entry called the attention kernel "1.5 s of attention still
+at 31 TFLOP/s against a ~98 TFLOP/s BF16 peak, the largest single unclaimed gap
+left in the pipeline". That framing is wrong, and it is why two earlier tile
+rewrites (a 128-query MMA, a transposed V tile) both came back empty. The
+number is right — `sdpa=1.512s` on a fox-fast profile, 3.06 ms per call for
+100.8 GFLOP — but the ratio to the GEMM peak does not describe the kernel.
+
+`ncu` cannot answer this on this machine: `/proc/driver/nvidia/params` has
+`RmProfilingAdminOnly: 1`, so a non-root profile attaches, collects nothing and
+exits without a diagnostic. Everything below is from `tools/h3_sdpa_bench.c`,
+which runs `h3_gpu_sdpa_bf16` on fox-fast's own shape (1874 tokens, 56 heads,
+d=128) and reproduces the pipeline exactly — 3.09 ms against nsys's 3.05 — with
+a one-second edit-measure loop instead of a twenty-second one.
+
+### Pricing each part by deleting it
+
+Each row is a deliberately wrong kernel that keeps the work of interest and
+drops one other thing, so the difference prices that thing:
+
+| Ablation | Wall | Cost of the part |
+|----------|-----:|-----------------:|
+| baseline | 3.06 ms | |
+| both MMA loops replaced by two float adds | 2.99 ms | **0.11 ms** |
+| K/V loaded from tile 0 every iteration | 2.58 ms | 0.52 ms |
+| V fragments as aligned 32-bit loads | 2.90 ms | 0.19 ms |
+| V stored to shared without the BF16→F16 convert | 2.90 ms | 0.17 ms |
+
+The first row settles it. Removing **both** matmuls saves 0.11 ms of 3.06, yet
+100.8 GFLOP cannot cross the tensor cores in less than 1.03 ms at the ~98
+TFLOP/s the GEMMs reach. So the MMA pipe is busy for at least a third of the
+kernel and is almost entirely *hidden underneath* something else: there is a
+~2.9 ms non-MMA critical path, and the tensor cores are idling inside it, not
+limiting it. A faster matmul, a bigger tile or a better fragment layout all
+attack the wrong term.
+
+### Occupancy is not the term either
+
+180 registers, 34,816 bytes of shared memory, 128 threads, no spills. Both
+limits independently allow 2 blocks per SM — 8 warps of the 48 an sm_121 SM can
+hold, 16.7%. That looks like the obvious answer, and the instruction count
+agrees: the non-MMA work is ~0.6 ms at a perfect issue rate against 2.56 ms
+measured, so ~23% issue efficiency, which is what 2 warps per scheduler with
+long LDS and MUFU chains produces.
+
+It is still not the answer. Shared memory is 683 bytes over the threshold for a
+third block, so trimming the row padding plus `__launch_bounds__(128, 3)` buys
+one, with **no spills**:
+
+| Config | Registers | Spills | smem | Blocks/SM | Wall |
+|--------|----------:|-------:|-----:|----------:|-----:|
+| shipping | 180 | 0 | 34816 | 2 | 3.04–3.09 ms |
+| `LD=132`, min 3 blocks | 168 | 0 | 33792 | **3** | 3.09 ms |
+| `LD=132`, min 4 blocks | 128 | 348 B | 33792 | 4 | 7.81 ms |
+| `LD=130` | 180 | 0 | 33280 | 3 | 3.35 ms |
+
+50% more warps, no spills, no gain. Padding is the reverse: `LD=130` costs 10%
+to bank conflicts, and `LD=136` is already the best of `{130,132,136,144}`.
+
+So the costs are diffuse — nothing above 0.52 ms, most of it under 0.2 — over a
+floor of 1.03 ms, and the two levers that usually move a kernel like this are
+measured to do nothing. Attention is within roughly 1.5–2× of its structural
+floor, and 15% of it is 0.2 s of a 19 s run. Everything else here is worth
+more; the tile stays as it is. `tools/h3_sdpa_bench.c` stays too, so the next
+attempt starts with a measurement instead of a rewrite.
+
+Logs: `/tmp/h3_perf_day14/ncu_sdpa.txt` (the empty profile).
+---
+
