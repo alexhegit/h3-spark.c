@@ -2404,3 +2404,171 @@ is taken off its GPU.
 
 e2e is **16.7 s**, 3.4× off the 56.3 s this started at.
 
+## The GPU is 84.5 % busy, and most of the idle is not for sale
+
+The section above left `cudaStreamSynchronize` (4.9 s) and `cudaEventSynchronize`
+(3.3 s) labelled as benign without measuring them, which is not the same as
+knowing. An API total is not a cost: a sync that waits for work which had to
+happen anyway is free. What costs is the GPU going idle while the host sits
+inside a call. So rebuild the GPU's busy timeline from the nsys SQLite — every
+kernel, memcpy and memset interval, merged — and attribute each idle gap to
+whatever API call spanned it:
+
+| | |
+|---|----:|
+| GPU span | 15.397 s |
+| GPU busy | 13.012 s (84.5 %) |
+| GPU idle | 2.384 s (15.5 %) |
+| in 229 gaps >2 ms | 2.025 s |
+
+| GPU idle | at | host was inside |
+|---:|---:|---|
+| 341.6 ms | 0.00 s | `cudaMallocHost` |
+| 316.8 ms | 0.57 s | `cuLibraryLoadData` |
+| 228.7 ms | 12.95 s | `cuLibraryLoadData` |
+| 26.5 ms | 0.44 s | `cudaEventSynchronize` |
+| 14.4 ms | 0.51 s | `cudaEventSynchronize` |
+
+The two synchronize rows really are benign, but for a reason worth stating:
+aggregating all 229 gaps by the API that spans them puts 147.7 ms of idle on
+`cudaEventSynchronize` and none on `cudaStreamSynchronize`. Eight seconds of API
+time against 148 ms of consequence is what a correctly-placed wait looks like.
+(Reading only the largest gaps understates this at 41 ms; the aggregate is the
+number to quote.)
+
+The same aggregate names the real host-side costs, and launch latency is not
+among them:
+
+| API spanning the gap | GPU idle | gaps |
+|---|----:|----:|
+| `cudaMallocAsync` | 665.1 ms | 110 |
+| `cuLibraryLoadData` | 574.2 ms | 5 |
+| `cudaMallocHost` | 341.6 ms | 1 |
+| `cudaMemcpyAsync` | 214.9 ms | 70 |
+| `cudaEventSynchronize` | 147.7 ms | 33 |
+
+Device allocation, not kernel launching, is what the GPU waits on most after the
+two items already priced and rejected below.
+
+### REJECT priming the memory pool
+
+The 665 ms on `cudaMallocAsync` localizes precisely. All 110 stalls fall between
+t=2.70s and t=3.63s, and the last kernel to run before each one is the RoPE
+setup's cast — the only cast in that window, and a one-shot. So the picture is
+not a cast that allocates repeatedly; it is the DiT's load allocating its 109
+weight tensors back to back, 18.3 GiB in all, with no kernel in between for the
+GPU to run.
+
+The pool's release threshold is already 24 GiB, but that only keeps blocks that
+have been *freed*. A fresh process starts with an empty pool, so the DiT's first
+18 GiB comes from the driver one tensor at a time. Consolidating that into a
+single allocation up front, immediately freed, should leave the memory parked in
+the pool for the per-tensor requests to hit.
+
+It does exactly that, and it buys nothing:
+
+| prime | wall | text encoder | DiT load |
+|---|---:|---:|---:|
+| off | 15.90, 15.94, 15.88 | 2.181s | 1.227s |
+| 17 GiB, background thread | 15.92, 15.90, 15.99 | 2.515s | 0.931s |
+
+DiT load gives up 0.29s every run and the text encoder takes on 0.31s every run.
+Chunking the prime into 512 MiB and 256 MiB pieces, on the theory that one giant
+mapping holds the pool's lock long enough to stall the encoder's own
+allocations, changed nothing: 15.80 and 15.94, with the same 0.33s handed to the
+encoder. A synchronous prime at context creation moves the same cost outside the
+named phases instead, where it shows up as 0.47s of startup against 0.58s of
+phase gains.
+
+Three placements, one result — and the reason is not the one to reach for first.
+It is not bandwidth. Device allocation is *serialized against host-to-device
+copies* on this platform, and a weight load is nothing but host-to-device
+copies. See the section below, which measures it; the explanation that used to
+sit here blamed memory bandwidth and was wrong.
+
+### REJECT pipelining the DiT load's allocations
+
+Since priming only relocates the cost, the obvious next move is to overlap
+instead of pre-pay: allocate block N+1 while block N is still being read. A
+microbenchmark says that should be free — mapping 12.5 GiB takes 0.446 s alone
+and 0.470 s while four threads read a weight file, a 1.05× slowdown for
+something that hides 100% of the reads.
+
+It is not free, and the microbenchmark was measuring the wrong thing. The
+loader's reads are not file reads; each one lands in the device through
+`cudaMemcpyAsync`. Asking the same question about *that*:
+
+| mapping 12.5 GiB in 100 allocations | time | vs alone |
+|---|---:|---:|
+| alone | 0.446 s | |
+| beside 4 threads reading a weight file | 0.470 s | 1.05× |
+| beside continuous H2D `cudaMemcpyAsync` | 5.938 s | **13.31×** |
+
+Allocation drops from 30 GB/s to 2.3 GB/s the moment copies are in flight. That
+single fact explains every attempt in this section:
+
+- The prime during the text encoder phase contended with the encoder's copies,
+  so it gave back exactly what it saved.
+- A prefetch thread allocating on the loader's own stream was worse still
+  (DiT load 1.16 s → 1.81 s), because `cudaMallocAsync` is stream-ordered: it
+  queued behind the copies rather than running beside them.
+- Giving the prefetch thread its own stream removed that regression and left
+  DiT load unchanged at 1.27 s, which is the honest answer — the contention is
+  per-context, not per-stream.
+
+So the serial alternation the loader already does is not a missed opportunity,
+it is the shape the platform forces. The 665 ms is only reducible by mapping
+fewer bytes, not by mapping them at a better time. Worth remembering before the
+next "the GPU is idle here" reading: idle that coincides with allocation is not
+idle waiting to be filled.
+
+One measurement note that cost real time here. The first probe used plain
+`read()` for the concurrent load and reported that overlap was free. Anything
+claiming to model the loader has to include the loader's CUDA calls, not just
+its file I/O — the two answers differ by 13×.
+
+`cuLibraryLoadData` is 545 ms over 21 calls, matching the two bursts almost
+exactly, and it is not our code: the binary carries one `sm_121` cubin at 1.5 MB
+total, so this is cuBLAS lazily loading its own kernel modules — once at the
+first GEMM, once more when the VAE asks for shapes nothing has used yet.
+
+**Which is a trap, and `CUDA_MODULE_LOADING=EAGER` is the way out of it.** Eager
+loading moves every module to context creation, so if those 545 ms were on the
+critical path the phases would get shorter:
+
+| | e2e | TE | video VAE |
+|---|----:|---:|----------:|
+| `LAZY` (default) | 16.52 s | 2.152 s | 2.836 s |
+| `EAGER` | 17.48 s | 2.156 s | 2.799 s |
+
+The text encoder does not move at all and the VAE gives back 37 ms of 228,
+while e2e loses a second to loading modules the run never calls. The bursts sit
+inside phases that are waiting on file reads, so the module load was already
+free — it shows up as GPU idle without being wall. **GPU idle is not recoverable
+wall**, and 545 ms of it here buys 37 ms.
+
+That leaves the 341.6 ms of first-context pinning, which the pool cannot remove
+because nothing can be read until a buffer exists to read into. Pinning less is
+the obvious lever and it is a wash, because chunk size sets read efficiency too:
+
+| slot size | pin | TE read | DiT read | e2e (3 runs) |
+|---|----:|--------:|---------:|-------------:|
+| 32 MiB | 0.078 s | 3.647 s | 0.653 s | 16.51 s |
+| 64 MiB | 0.151 s | 3.863 s | 0.614 s | 16.51 / 16.48 / 16.45 s |
+| 128 MiB (default) | 0.458 s | 2.916 s | 0.514 s | 16.47 / 16.46 / 16.52 s |
+| 256 MiB | 0.478 s | 2.965 s | 0.507 s | 16.95 s |
+
+64 MiB pins 0.3 s faster and reads 0.9 s slower, and the medians land 10 ms
+apart. Keep 128 MiB.
+
+So the remaining 1.5 s of idle is 220-odd gaps of 2–10 ms, which is launch
+latency and per-op overhead with no single lever behind it. The host-side
+surface that the staging pool came out of is now closed; what is left is either
+serial by construction or already hidden behind I/O.
+
+One thing this did settle: the candidate timing added two module loads and no
+time (544.8 ms / 21 calls against 553.9 ms / 19 with `H3_DISABLE_LT_AUTOTUNE=1`),
+so it is not paying for itself in `cuLibraryLoadData`.
+
+Warm steady state after these runs is **16.5 s**.
+
