@@ -2813,6 +2813,30 @@ against the base commit, and two of them disagreed. And **check determinism
 before bisecting**: the commit-by-commit bisect this was headed for would have
 produced whichever answer the coin gave and pointed at the wrong change.
 
+### The absolute e2e number drifts about half a second with machine state
+
+Re-measuring after several hours of continuous verification runs, the commit that
+claimed **15.5 s** (15.40, 15.49, 15.57) now measures **16.04 s** (16.04, 15.81,
+16.28) — the same commit, same shape, same warm page cache. Interleaving it
+against the fix above separates the two: 16.04 s mean against 15.96 s, so the
+candidate verification costs nothing, and the drift is the machine.
+
+It shows up as a uniform ~1.5 % on every GPU phase with I/O untouched:
+
+| | 15.40 s run | 15.88 s run |
+|---|---:|---:|
+| text encoder | 2.103 s | 2.250 s |
+| DiT total | 9.356 s | 9.555 s |
+| video VAE | 2.463 s | 2.603 s |
+| audio VAE | 0.216 s | 0.211 s |
+| TE read | 2.984 s | 2.920 s |
+
+Reads identical, every compute phase up by the same fraction: that is clocks,
+not code. So **the e2e figures in this file carry about ±0.5 s of machine state
+on top of the ±0.15 s of run-to-run spread**, and any change worth less than
+that has to be argued from paired phase measurements — which is what the last
+few entries here already do, and why they were accepted at all.
+
 Also recorded while testing the weight cache: the header carries magic, version,
 block index, key and per-section dimensions, so truncation and whole-file
 garbage both fall back to the checkpoint (verified). The payload itself is not
