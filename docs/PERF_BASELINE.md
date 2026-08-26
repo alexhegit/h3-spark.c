@@ -1491,7 +1491,10 @@ K=5376 for FC1, N=5376 K=14336 for FC2, N=5376 K=7168 for the attention output)
 runs at **143 TFLOP/s** through `cublasGemmEx`, and cuBLASLt's best heuristic
 candidate is within 1% of it (144 TFLOP/s). Those shapes at that rate account
 for essentially all of the denoise's 4.96 s of INT8 GEMM time, so the GEMM is
-done — 89% of the 160 TFLOP/s INT8 ceiling. Re-confirmed the INT8-vs-BF16 MLP
+done — 89% of the 160 TFLOP/s INT8 ceiling. **(Corrected 2026-08-26: that
+ceiling was wrong. FP8 runs these shapes at 190–203 TFLOP/s and NVFP4 at
+289–365 through the same tensor cores, so 143 was a cuBLAS INT8 kernel limit,
+not the chip's. See "narrow formats" below.)** Re-confirmed the INT8-vs-BF16 MLP
 choice at the same time: BF16 denoise linear is 8.19 s against INT8's 5.31 s.
 Logs: `/tmp/h3_perf_day12/stage-{64,128,256}.log`, `pw-{0,18}.log`,
 `pwf-{0,16}.log`, `mlp-{i8,bf16}.log`, `int8_bench.cu`.
@@ -1513,7 +1516,10 @@ fox-fast (`512² / 22f / steps=20 / L45 / reuse=2`), one clean run per column:
 Where the remaining 26.8 s goes, and what is left in each:
 
 - **denoise 8.80 s.** INT8 GEMM 4.96 s at 143 TFLOP/s, i.e. 89% of this chip's
-  INT8 ceiling — done. Attention 1.60 s at 31 TFLOP/s of a ~98 TFLOP/s BF16
+  INT8 ceiling — done. *(Corrected 2026-08-26: not done, and the accounting
+  missed the apply pass. FP8 does these shapes at ~195 TFLOP/s and NVFP4 at
+  ~320; the reachable saving is ~2.2 s, at a quality cost that rejects it for
+  now.)* Attention 1.60 s at 31 TFLOP/s of a ~98 TFLOP/s BF16
   peak, the largest single remaining headroom. The other ~2.2 s is the
   memory-bound glue between GEMMs (int32→scale→BF16 0.74 s, fused
   SwiGLU-quantize 0.54 s, QKV RoPE 0.36 s, gate/AdaLN quantize 0.35 s), all of
@@ -1867,4 +1873,152 @@ it is 3.5 s of F32 GEMM. The text encoder still stages 46.86 GiB per run for a
 twelve-token prompt, which is the next structural target — the same
 sidecar-cache reasoning does not apply (its output depends on the prompt), but
 an INT8 or FP8 weight cache would halve the bytes for every prompt.
+---
+
+## 2026-08-26 — narrow formats: FP8 is 1.8× and NVFP4 2.8× the INT8 path, and both cost visible quality
+
+This set out to confirm a decision that had already been made on architectural
+grounds: INT8 sits at 89% of this chip's 8-bit ceiling, FP8 shares the same
+8-bit tensor cores so it cannot be faster, therefore sub-8-bit work has no speed
+upside and buys only error. Every load-bearing part of that was wrong. It is the
+clearest case so far for measuring instead of reasoning from the architecture.
+
+`tests/bench_gemm_precision.cu`, now with a build rule so it can be re-taken:
+
+    make -f Makefile.linux h3_gemm_precision && ./h3_gemm_precision
+
+### Rate, at the token count fox-fast actually runs
+
+CUDA-event timed, 30 iterations, `tokens=1870`. `int8+apply` is what the DiT
+pays today: the `i32` GEMM plus the separate `h3_int8_apply_scales_bf16_kernel`
+pass, charged together, because INT8 matmul here cannot write BF16.
+
+| Shape | bf16 | int8 | **int8+apply** | fp8 e4m3 | int8 D=i8 | nvfp4 | mxfp8 |
+|-------|-----:|-----:|---------------:|---------:|----------:|------:|------:|
+| qkv `out=21504 k=5376` | 92.6 | 140.9 | **105.5** | 193.0 | 176.1 | **289.5** | 195.7 |
+| attn-out `out=5376 k=7168` | 93.5 | 144.8 | **112.8** | 203.1 | 179.6 | **343.3** | 199.5 |
+| fc1 `out=28672 k=5376` | 93.0 | 143.6 | **107.6** | 190.8 | 182.3 | **293.5** | 51.4 |
+| fc2 `out=5376 k=14336` | 93.7 | 145.2 | **129.1** | 194.8 | 165.5 | **365.2** | 135.4 |
+
+All figures TFLOP/s. Summed over one layer's four GEMMs, in elapsed time:
+
+| Path | One layer | vs today |
+|------|----------:|---------:|
+| int8 + apply (today) | 12.97 ms | 1.00× |
+| int8, D=`i8` | 8.16 ms | 0.63× |
+| fp8 e4m3 → BF16 | 7.45 ms | **0.57×** |
+| nvfp4 → BF16 | 4.67 ms | **0.36×** |
+
+**The 160 TFLOP/s INT8 ceiling quoted on 2026-08-25 was not the hardware's.**
+FP8 reaches 190–203 and NVFP4 289–365 through the same tensor cores, so 143 was
+the limit of cuBLAS's INT8 kernels, not of the chip. Two other costs surface in
+the same table: the `int32` accumulator write alone is 19% of INT8 GEMM time
+(`int8` 10.06 ms vs `int8 D=i8` 8.16 ms for the layer), and the apply pass adds
+another 2.9 ms on top — together nearly a third of the INT8 linear path spent on
+being unable to write BF16 out of the GEMM. FP8 writes BF16 directly.
+
+Against the denoise's measured 5.25 s of `gpu-op linear`, FP8 would be worth
+about **2.2 s** and NVFP4 about **3.4 s** — 10% and 15% of a 22.6 s e2e. Upper
+bounds: that 5.25 s also contains the quantize kernels, which do not shrink.
+
+### Accuracy, on the real weights
+
+`tests/probe_fp8_weight_error.py` against the checkpoint, relL2 of the
+quantized weight against BF16. Four projections at blocks 0, 3, 25, 49; spread
+across blocks is small, so one representative block:
+
+| Tensor | int8/chan | fp8/tensor | fp8/chan | nvfp4/16 |
+|--------|----------:|-----------:|---------:|---------:|
+| `blocks.25.mlp.fc1` | 0.01005 | 0.02652 | 0.02661 | 0.09450 |
+| `blocks.25.mlp.fc2` | 0.01308 | 0.02647 | 0.02646 | 0.09447 |
+| `blocks.25.attn.qkv_proj` | 0.01061 | 0.02647 | 0.02646 | 0.09387 |
+| `blocks.25.attn.out_proj` | 0.01047 | 0.02651 | 0.02644 | 0.09540 |
+
+**Per-channel FP8 is not better than per-tensor FP8** — identical to four
+digits, across every tensor measured. E4M3's error is mantissa-bound, not
+range-bound, so a finer scale buys nothing; the 4-bit exponent is spending eight
+bits' worth of budget on dynamic range that a per-channel scale already
+supplies. That justifies the cheapest granularity for weights, which is also
+the one the GEMM can fold. It also means FP8 is 2.1× INT8's weight error with no
+way to close the gap by rescaling, and NVFP4 is 7.4×.
+
+Through a whole MLP, weights and activations together
+(`tests/probe_fp8_mlp_error.py`):
+
+| Scheme | MLP relL2 |
+|--------|----------:|
+| int8, per-channel weights / per-token activations (today) | 0.00440 |
+| fp8, per-tensor weights / per-token activations | **0.02125** |
+
+4.8× today's error, and it is the activations that dominate: the linear probe
+splits FP8's 0.04697 into 0.01774 from weights alone and 0.04362 from
+activations alone. Per-token is already the finest activation granularity a
+row-major GEMM can use, so this is not fixable by rescaling either.
+
+The shipped kernels are worse still than the model of them. `h3_cuda_ops`, at
+the DiT's own width, against a BF16 MLP:
+
+| Path | relL2 |
+|------|------:|
+| INT8 MLP | 0.00691 |
+| FP8 MLP | **0.07783** |
+
+11× rather than 4.8×, because the fused SwiGLU quantizes its intermediate too
+and E4M3 loses more there than the probe's per-tensor model assumed. This is the
+number the decision rests on: it is measured through the code that would ship,
+not through an approximation of it.
+
+### What that error does to the output
+
+`scripts/quant_sensitivity.sh` puts a format's error through the whole pipeline
+before anyone implements it: `H3_INT8_LEVELS` coarsens every quantized tensor by
+a known factor, so 48 levels reproduces FP8's *weight* error and 13 levels lands
+on FP8's *whole-MLP* error (0.02216 against FP8's 0.02125) as well as NVFP4's
+weight error.
+
+| Levels | MLP relL2 | PSNR vs 127 | Denoise |
+|-------:|----------:|------------:|--------:|
+| 127 (today) | 0.00440 | — | 8.72 s |
+| 48 | 0.00771 | 18.68 dB | 8.70 s |
+| 13 | 0.02216 | 15.96 dB | 8.77 s |
+
+**PSNR is the wrong gate here, and reading it as one would have given the wrong
+answer.** 18.68 dB sounds fatal, but the 48-level frame is a sharp, correctly
+lit, on-prompt fox — as good as the reference, just a different sample. Euler
+denoise is chaotic: any perturbation moves the trajectory to a neighbouring
+valid sample, so a low PSNR against a reference render says the output moved,
+not that it got worse. Only the frames answer the quality question.
+
+They do answer it, though. At 13 levels — FP8's error level, by whole-MLP relL2
+— the fox is still coherent but the fur has lost its fine structure, the
+background pines have gone muddy, and the face is misshapen. That is the
+admissibility bar FP8 fails: not a different sample, a worse one.
+
+### Where this leaves the narrow-precision work
+
+The FP8 path is implemented and unit-tested in `h3_gpu.cu`
+(`h3_gpu_quantize_weight_fp8`, `h3_gpu_linear_fp8_bf16`, `h3_gpu_mlp_fp8_bf16`,
+with a plan cache for the cuBLASLt descriptors) and deliberately **not wired
+into the DiT**. The speed is real and larger than expected; the quality cost is
+also real and larger than the usual "FP8 needs no calibration" story admits.
+Blanket FP8 is a **REJECT** on that evidence.
+
+Two things stay open, both grounded in the tables above rather than in
+speculation:
+
+- **MXFP8**, e4m3 with a UE8M0 scale every 32 values of K, is supported here and
+  matches plain FP8's rate on two of the four shapes (195.7, 199.5 TFLOP/s).
+  Its scale granularity attacks exactly the activation error that dominates
+  FP8's, which is the only identified route to 8-bit that is both fast and
+  accurate. Unresolved: the single heuristic candidate collapses on fc1
+  (51.4 TFLOP/s), so it needs an algorithm search before it means anything.
+- **Dropping the `i32` accumulator** is worth 19% of INT8 GEMM time at today's
+  accuracy — `int8 D=i8` measures it. That needs the epilogue to produce `i8`,
+  which is a real change to the scale handling, but it costs no precision.
+
+MXFP4 is not available (`no algorithm` on every shape); NVFP4 is, and is the
+fastest thing on the chip by a wide margin, but at 7.4× the weight error it is
+past the 13-level frame, not short of it.
+
+Logs: `/tmp/h3_perf_day14/bench_gemm_precision.log`, `/tmp/h3_levels/`.
 ---

@@ -3122,6 +3122,103 @@ int main(void) {
         }
     }
 
+    /* FP8 against BF16 at a real DiT projection shape. The gate is looser than
+     * INT8's because E4M3 is genuinely coarser — 2.6% relative error on real
+     * weights against INT8's 1.2% — and the frame comparison in
+     * scripts/quant_sensitivity.sh is what established that this much error
+     * leaves image quality intact. The gate exists to catch a broken scale or
+     * layout, which lands far above this, not to certify quality. */
+    {
+        const uint32_t fq_rows = 128;
+        const uint32_t fq_in = 5376;
+        const uint32_t fq_out = 5376;
+        size_t fq_in_count = (size_t)fq_rows * fq_in;
+        size_t fq_weight_count = (size_t)fq_out * fq_in;
+        size_t fq_out_count = (size_t)fq_rows * fq_out;
+        uint16_t *fq_input = malloc(fq_in_count * sizeof(*fq_input));
+        uint16_t *fq_weight = malloc(fq_weight_count * sizeof(*fq_weight));
+        uint16_t *fq_got_fp8 = malloc(fq_out_count * sizeof(*fq_got_fp8));
+        uint16_t *fq_got_bf16 = malloc(fq_out_count * sizeof(*fq_got_bf16));
+        check(fq_input && fq_weight && fq_got_fp8 && fq_got_bf16,
+              "fp8 linear host alloc");
+        if (fq_input && fq_weight && fq_got_fp8 && fq_got_bf16) {
+            for (size_t i = 0; i < fq_in_count; i++)
+                fq_input[i] = f32_to_bf16(sinf((float)i * 0.017f) +
+                                          0.3f * cosf((float)i * 0.101f));
+            for (size_t i = 0; i < fq_weight_count; i++)
+                fq_weight[i] = f32_to_bf16(cosf((float)i * 0.0027f) * 0.02f);
+
+            h3_gpu_tensor *f_in =
+                h3_gpu_tensor_from_bf16(gpu, fq_input, fq_in_count);
+            h3_gpu_tensor *f_weight =
+                h3_gpu_tensor_from_bf16(gpu, fq_weight, fq_weight_count);
+            h3_gpu_tensor *f_weight_f8 =
+                h3_gpu_tensor_new_f8(gpu, fq_weight_count);
+            h3_gpu_tensor *f_weight_scale = h3_gpu_tensor_new_f32(gpu, 1);
+            h3_gpu_tensor *f_quant = h3_gpu_tensor_new_f8(gpu, fq_in_count);
+            h3_gpu_tensor *f_scales = h3_gpu_tensor_new_f32(gpu, fq_rows);
+            h3_gpu_tensor *f_out_fp8 =
+                h3_gpu_tensor_new_bf16(gpu, fq_out_count);
+            h3_gpu_tensor *f_out_bf16 =
+                h3_gpu_tensor_new_bf16(gpu, fq_out_count);
+            check(f_in && f_weight && f_weight_f8 && f_weight_scale &&
+                      f_quant && f_scales && f_out_fp8 && f_out_bf16,
+                  "fp8 linear device alloc");
+            if (f_in && f_weight && f_weight_f8 && f_weight_scale && f_quant &&
+                f_scales && f_out_fp8 && f_out_bf16) {
+                check(h3_gpu_quantize_weight_fp8(gpu, f_weight_f8,
+                                                 f_weight_scale, f_weight,
+                                                 fq_out, fq_in),
+                      "quantize_weight_fp8");
+                check(h3_gpu_linear_fp8_bf16(gpu, f_out_fp8, f_quant, f_scales,
+                                             f_in, f_weight_f8,
+                                             f_weight_scale, fq_rows, fq_in,
+                                             fq_out),
+                      "linear_fp8_bf16");
+                check(h3_gpu_linear_bf16(gpu, f_out_bf16, f_in, f_weight, NULL,
+                                         fq_rows, fq_in, fq_out),
+                      "linear_bf16 reference");
+                check(h3_gpu_submit(gpu), "submit fp8 linear pair");
+                check(h3_gpu_tensor_read_bf16(f_out_fp8, fq_got_fp8,
+                                              fq_out_count),
+                      "read linear_fp8");
+                check(h3_gpu_tensor_read_bf16(f_out_bf16, fq_got_bf16,
+                                              fq_out_count),
+                      "read linear_bf16");
+                double err = 0.0;
+                double norm = 0.0;
+                for (size_t i = 0; i < fq_out_count; i++) {
+                    double a = bf16_to_f32(fq_got_fp8[i]);
+                    double b = bf16_to_f32(fq_got_bf16[i]);
+                    err += (a - b) * (a - b);
+                    norm += b * b;
+                }
+                double rel = norm > 0.0 ? sqrt(err / norm) : 1.0;
+                printf("fp8 linear vs BF16 linear relL2 at DiT width: %.5f\n",
+                       rel);
+                if (!(rel < 6e-2)) {
+                    fprintf(stderr,
+                            "FAIL: fp8 linear relL2 %.5f is too far from "
+                            "BF16\n",
+                            rel);
+                    failures++;
+                }
+            }
+            h3_gpu_tensor_free(f_out_bf16);
+            h3_gpu_tensor_free(f_out_fp8);
+            h3_gpu_tensor_free(f_scales);
+            h3_gpu_tensor_free(f_quant);
+            h3_gpu_tensor_free(f_weight_scale);
+            h3_gpu_tensor_free(f_weight_f8);
+            h3_gpu_tensor_free(f_weight);
+            h3_gpu_tensor_free(f_in);
+        }
+        free(fq_got_bf16);
+        free(fq_got_fp8);
+        free(fq_weight);
+        free(fq_input);
+    }
+
     const uint32_t hm_rows = 3;
     const uint32_t hm_heads = 2;
     const uint32_t hm_dim = 8;
@@ -3403,6 +3500,72 @@ int main(void) {
                             rel);
                     failures++;
                 }
+
+                /* Same comparison for the FP8 MLP, against the same BF16
+                 * result, so the two quantized paths are gated side by side. */
+                h3_gpu_tensor *t_fc1_f8 = h3_gpu_tensor_new_f8(gpu, fc1_count);
+                h3_gpu_tensor *t_fc1_f8_scale = h3_gpu_tensor_new_f32(gpu, 1);
+                h3_gpu_tensor *t_fc2_f8 = h3_gpu_tensor_new_f8(gpu, fc2_count);
+                h3_gpu_tensor *t_fc2_f8_scale = h3_gpu_tensor_new_f32(gpu, 1);
+                h3_gpu_tensor *t_quant_f8 = h3_gpu_tensor_new_f8(
+                    gpu, (size_t)q_rows * q_hidden);
+                h3_gpu_tensor *t_fc1_out = h3_gpu_tensor_new_bf16(
+                    gpu, (size_t)q_rows * q_hidden * 2u);
+                h3_gpu_tensor *t_out_fp8 =
+                    h3_gpu_tensor_new_bf16(gpu, out_count);
+                uint16_t *q_got_fp8 = malloc(out_count * sizeof(*q_got_fp8));
+                check(t_fc1_f8 && t_fc1_f8_scale && t_fc2_f8 &&
+                          t_fc2_f8_scale && t_quant_f8 && t_fc1_out &&
+                          t_out_fp8 && q_got_fp8,
+                      "fp8 MLP alloc");
+                if (t_fc1_f8 && t_fc1_f8_scale && t_fc2_f8 && t_fc2_f8_scale &&
+                    t_quant_f8 && t_fc1_out && t_out_fp8 && q_got_fp8) {
+                    check(h3_gpu_quantize_weight_fp8(gpu, t_fc1_f8,
+                                                     t_fc1_f8_scale, t_fc1,
+                                                     q_hidden * 2u, q_in),
+                          "quantize fp8 fc1");
+                    check(h3_gpu_quantize_weight_fp8(gpu, t_fc2_f8,
+                                                     t_fc2_f8_scale, t_fc2,
+                                                     q_out, q_hidden),
+                          "quantize fp8 fc2");
+                    check(h3_gpu_mlp_fp8_bf16(gpu, t_out_fp8, t_fc1_out,
+                                              t_quant_f8, t_scales, t_in,
+                                              t_fc1_f8, t_fc1_f8_scale,
+                                              t_fc2_f8, t_fc2_f8_scale, q_rows,
+                                              q_in, q_hidden, q_out),
+                          "wide mlp_fp8_bf16");
+                    check(h3_gpu_submit(gpu), "submit fp8 MLP");
+                    check(h3_gpu_tensor_read_bf16(t_out_fp8, q_got_fp8,
+                                                  out_count),
+                          "read wide mlp_fp8");
+                    double fp8_err = 0.0;
+                    double fp8_norm = 0.0;
+                    for (size_t i = 0; i < out_count; i++) {
+                        double a = bf16_to_f32(q_got_fp8[i]);
+                        double b = bf16_to_f32(q_got_bf16[i]);
+                        fp8_err += (a - b) * (a - b);
+                        fp8_norm += b * b;
+                    }
+                    double fp8_rel =
+                        fp8_norm > 0.0 ? sqrt(fp8_err / fp8_norm) : 1.0;
+                    printf("fp8 MLP vs BF16 MLP relL2 at DiT width: %.5f\n",
+                           fp8_rel);
+                    if (!(fp8_rel < 8e-2)) {
+                        fprintf(stderr,
+                                "FAIL: fp8 MLP relL2 %.5f is too far from "
+                                "BF16\n",
+                                fp8_rel);
+                        failures++;
+                    }
+                }
+                free(q_got_fp8);
+                h3_gpu_tensor_free(t_out_fp8);
+                h3_gpu_tensor_free(t_fc1_out);
+                h3_gpu_tensor_free(t_quant_f8);
+                h3_gpu_tensor_free(t_fc2_f8_scale);
+                h3_gpu_tensor_free(t_fc2_f8);
+                h3_gpu_tensor_free(t_fc1_f8_scale);
+                h3_gpu_tensor_free(t_fc1_f8);
             }
             h3_gpu_tensor_free(t_out_bf16);
             h3_gpu_tensor_free(t_out_int8);

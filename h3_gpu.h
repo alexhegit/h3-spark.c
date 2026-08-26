@@ -11,7 +11,9 @@ typedef enum {
     H3_GPU_F32 = 0,
     H3_GPU_BF16,
     H3_GPU_I8,
-    H3_GPU_U32
+    H3_GPU_U32,
+    /* One byte like I8, but the Blackwell tensor cores read it as E4M3. */
+    H3_GPU_F8E4M3
 } h3_gpu_dtype;
 
 typedef struct {
@@ -52,6 +54,7 @@ int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_new_f8(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_f32(h3_gpu *gpu, const float *values,
                                       size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
@@ -324,6 +327,31 @@ int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
                                 h3_gpu_tensor *scales,
                                 const h3_gpu_tensor *input, uint32_t rows,
                                 uint32_t columns);
+/* FP8-E4M3 linear. Weights carry one scale for the whole tensor, which the
+ * GEMM folds in; activations keep a scale per token. Faster than the INT8 path
+ * and less accurate — see the comment on the implementation. */
+int h3_gpu_quantize_weight_fp8(h3_gpu *gpu, h3_gpu_tensor *output,
+                               h3_gpu_tensor *scale,
+                               const h3_gpu_tensor *input, uint32_t rows,
+                               uint32_t columns);
+int h3_gpu_linear_fp8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           h3_gpu_tensor *quantized_input,
+                           h3_gpu_tensor *input_scales,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *weight_scale, uint32_t rows,
+                           uint32_t input_dim, uint32_t output_dim);
+int h3_gpu_mlp_fp8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                        h3_gpu_tensor *fc1_output,
+                        h3_gpu_tensor *quantized_activation,
+                        h3_gpu_tensor *activation_scales,
+                        const h3_gpu_tensor *input,
+                        const h3_gpu_tensor *fc1_weight,
+                        const h3_gpu_tensor *fc1_scale,
+                        const h3_gpu_tensor *fc2_weight,
+                        const h3_gpu_tensor *fc2_scale, uint32_t rows,
+                        uint32_t input_dim, uint32_t hidden_dim,
+                        uint32_t output_dim);
 int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,

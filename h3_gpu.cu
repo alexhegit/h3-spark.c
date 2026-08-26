@@ -6,6 +6,7 @@ extern "C" {
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#include <cuda_fp8.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -107,6 +108,22 @@ static double h3_gpu_seconds_delta(double value, double start) {
 static int h3_env_on(const char *name) {
     const char *value = getenv(name);
     return value && *value && strcmp(value, "0") != 0;
+}
+
+/* Quantization levels per side of zero, normally INT8's 127. Lowering it
+ * coarsens every quantized tensor by a known factor, which is how a narrower
+ * format's error can be put through the full pipeline before anyone writes the
+ * kernels for it: 48 levels lands on FP8-E4M3's measured weight error and 13
+ * lands on NVFP4's. */
+static float h3_int8_levels(void) {
+    static float levels = 0.0f;
+    if (levels == 0.0f) {
+        const char *value = getenv("H3_INT8_LEVELS");
+        long parsed = value && *value ? strtol(value, NULL, 10) : 127;
+        if (parsed < 1 || parsed > 127) parsed = 127;
+        levels = (float)parsed;
+    }
+    return levels;
 }
 
 static void h3_gpu_op_events_destroy(h3_gpu *gpu) {
@@ -277,6 +294,7 @@ static size_t h3_dtype_bytes(h3_gpu_dtype dtype) {
     case H3_GPU_F32: return sizeof(float);
     case H3_GPU_BF16: return sizeof(uint16_t);
     case H3_GPU_I8: return sizeof(int8_t);
+    case H3_GPU_F8E4M3: return 1;
     case H3_GPU_U32: return sizeof(uint32_t);
     default: return 0;
     }
@@ -468,6 +486,10 @@ h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements) {
 
 h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements) {
     return h3_tensor_alloc(gpu, elements, H3_GPU_I8);
+}
+
+h3_gpu_tensor *h3_gpu_tensor_new_f8(h3_gpu *gpu, size_t elements) {
+    return h3_tensor_alloc(gpu, elements, H3_GPU_F8E4M3);
 }
 
 static int h3_gpu_workspace_disabled(void) {
@@ -1477,7 +1499,6 @@ typedef struct {
 static int h3_lt_ensure(h3_gpu *gpu) {
     if (gpu->lt_ready) return gpu->lt != NULL;
     gpu->lt_ready = 1;
-    if (h3_env_on("H3_F32_SPLIT_BIAS")) return 0;
     if (cublasLtCreate(&gpu->lt) != CUBLAS_STATUS_SUCCESS) {
         gpu->lt = NULL;
         return 0;
@@ -1498,7 +1519,7 @@ static int h3_linear_f32_bias_fused(h3_gpu *gpu, h3_gpu_tensor *output,
                                     uint32_t input_dim, uint32_t output_dim,
                                     cublasComputeType_t compute) {
     static h3_lt_bias_plan plans[16];
-    if (!h3_lt_ensure(gpu)) return 0;
+    if (h3_env_on("H3_F32_SPLIT_BIAS") || !h3_lt_ensure(gpu)) return 0;
     cublasLtMatmulDesc_t desc = NULL;
     cublasLtMatrixLayout_t la = NULL, lb = NULL, lc = NULL;
     cublasOperation_t transpose = CUBLAS_OP_T;
@@ -4366,7 +4387,7 @@ __global__ static void h3_gate_adaln_quantize_int8_kernel(
     const uint16_t *gate_modulation, const uint32_t *row_map,
     const uint16_t *weight, const uint16_t *norm_modulation,
     uint16_t *gated_residual, int8_t *quantized, float *scales,
-    h3_gate_adaln_args args, uint32_t padded_rows) {
+    h3_gate_adaln_args args, uint32_t padded_rows, float levels) {
     uint32_t row = (uint32_t)blockIdx.x;
     uint32_t tid = threadIdx.x;
     uint32_t threads = blockDim.x;
@@ -4428,16 +4449,15 @@ __global__ static void h3_gate_adaln_quantize_int8_kernel(
         __syncthreads();
     }
     float clipped_max = reductions[0];
-    float qscale =
-        clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
-    float qinv = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    float qscale = clipped_max > 0.0f ? clipped_max / levels : 1.0f / levels;
+    float qinv = clipped_max > 0.0f ? levels / clipped_max : levels;
     if (tid == 0) scales[row] = qscale;
     __syncthreads();
     for (uint32_t column = tid; column < args.width; column += threads) {
         float value = h3_bf16_bits_to_f32(row_values[column]) * qinv;
         int qv = (int)rintf(value);
-        if (qv > 127) qv = 127;
-        if (qv < -127) qv = -127;
+        if (qv > (int)levels) qv = (int)levels;
+        if (qv < -(int)levels) qv = -(int)levels;
         quantized[out_base + column] = (int8_t)qv;
     }
 }
@@ -6418,6 +6438,7 @@ struct h3_int8_quant_args {
     uint32_t dispatch_rows;
     uint32_t columns;
     float clip;
+    float levels;
 };
 
 __global__ static void h3_quantize_bf16_int8_rows_kernel(
@@ -6453,15 +6474,16 @@ __global__ static void h3_quantize_bf16_int8_rows_kernel(
         __syncthreads();
     }
     float clipped_max = reductions[0] * args.clip;
-    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
-    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    float levels = args.levels;
+    float scale = clipped_max > 0.0f ? clipped_max / levels : 1.0f / levels;
+    float inverse = clipped_max > 0.0f ? levels / clipped_max : levels;
     if (tid == 0) scales[row] = scale;
     __syncthreads();
     for (uint32_t column = tid; column < args.columns; column += threads) {
         float value = h3_bf16_bits_to_f32(row_input[column]) * inverse;
         int quantized = (int)rintf(value);
-        if (quantized > 127) quantized = 127;
-        if (quantized < -127) quantized = -127;
+        if (quantized > (int)levels) quantized = (int)levels;
+        if (quantized < -(int)levels) quantized = -(int)levels;
         output[base + column] = (int8_t)quantized;
     }
 }
@@ -6478,7 +6500,8 @@ static int h3_gpu_quantize_bf16_int8_rows(
         output->elements < (size_t)dispatch_rows * columns ||
         scales->elements < dispatch_rows)
         return h3_gpu_fail(gpu, "invalid BF16→INT8 row quantize request");
-    h3_int8_quant_args args = {rows, dispatch_rows, columns, clip};
+    h3_int8_quant_args args = {rows, dispatch_rows, columns, clip,
+                               h3_int8_levels()};
     unsigned threads = 256;
     h3_quantize_bf16_int8_rows_kernel<<<dispatch_rows, threads,
                                           threads * sizeof(float),
@@ -6515,6 +6538,7 @@ struct h3_int8_swiglu_quant_args {
     uint32_t rows;
     uint32_t dispatch_rows;
     uint32_t width;
+    float levels;
 };
 
 /* One block per row: reads the FC1 int32 accumulator, applies the row and
@@ -6566,14 +6590,15 @@ __global__ static void h3_int8_swiglu_quant_kernel(
         __syncthreads();
     }
     float row_max = reductions[0];
-    float scale = row_max > 0.0f ? row_max / 127.0f : 1.0f / 127.0f;
-    float inverse = row_max > 0.0f ? 127.0f / row_max : 127.0f;
+    float levels = args.levels;
+    float scale = row_max > 0.0f ? row_max / levels : 1.0f / levels;
+    float inverse = row_max > 0.0f ? levels / row_max : levels;
     if (tid == 0) output_scales[row] = scale;
     for (uint32_t column = tid; column < args.width; column += threads) {
         int quantized =
             (int)rintf(h3_bf16_bits_to_f32(activated[column]) * inverse);
-        if (quantized > 127) quantized = 127;
-        if (quantized < -127) quantized = -127;
+        if (quantized > (int)levels) quantized = (int)levels;
+        if (quantized < -(int)levels) quantized = -(int)levels;
         output[out_base + column] = (int8_t)quantized;
     }
 }
@@ -6754,9 +6779,453 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     return ok;
 }
 
+/* FP8-E4M3 linear.
+ *
+ * Measured on this part at the DiT's shapes, FP8 runs the tensor cores at
+ * ~192 TFLOP/s against INT8's ~145, and because cuBLASLt writes BF16 straight
+ * out there is no int32 accumulator to land and re-read. The price is accuracy:
+ * on real DiT weights E4M3 lands at 2.6% relative error against INT8's 1.2%,
+ * which the frame comparison in scripts/quant_sensitivity.sh found acceptable
+ * and NVFP4's 9.4% not.
+ *
+ * Weights carry one scale for the whole tensor, which cuBLASLt folds into the
+ * GEMM for free; per-channel weight scales measured no better, so the extra
+ * vector would buy nothing. Activations keep a scale per token, applied to the
+ * BF16 result afterwards. */
+#define H3_FP8_E4M3_MAX 448.0f
+
+__global__ static void h3_fp8_amax_kernel(const uint16_t *input, size_t count,
+                                          unsigned int *amax_bits) {
+    extern __shared__ float reductions[];
+    uint32_t tid = threadIdx.x;
+    float local = 0.0f;
+    for (size_t index = (size_t)blockIdx.x * blockDim.x + tid; index < count;
+         index += (size_t)gridDim.x * blockDim.x) {
+        float value = fabsf(h3_bf16_bits_to_f32(input[index]));
+        if (value > local) local = value;
+    }
+    reductions[tid] = local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride; stride >>= 1u) {
+        if (tid < stride) {
+            float other = reductions[tid + stride];
+            if (other > reductions[tid]) reductions[tid] = other;
+        }
+        __syncthreads();
+    }
+    /* Non-negative floats order the same as their bit patterns, so an integer
+     * atomic max is exact here. */
+    if (tid == 0) atomicMax(amax_bits, __float_as_uint(reductions[0]));
+}
+
+__global__ static void h3_fp8_scale_from_amax_kernel(
+    const unsigned int *amax_bits, float *scale) {
+    float amax = __uint_as_float(*amax_bits);
+    scale[0] = amax > 0.0f ? amax / H3_FP8_E4M3_MAX : 1.0f / H3_FP8_E4M3_MAX;
+}
+
+__global__ static void h3_quantize_bf16_fp8_tensor_kernel(
+    const uint16_t *input, __nv_fp8_storage_t *output, const float *scale,
+    size_t count) {
+    float inverse = 1.0f / scale[0];
+    for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < count; index += (size_t)gridDim.x * blockDim.x)
+        output[index] = __nv_cvt_float_to_fp8(
+            h3_bf16_bits_to_f32(input[index]) * inverse, __NV_SATFINITE,
+            __NV_E4M3);
+}
+
+__global__ static void h3_quantize_bf16_fp8_rows_kernel(
+    const uint16_t *input, __nv_fp8_storage_t *output, float *scales,
+    h3_int8_quant_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.dispatch_rows) return;
+
+    extern __shared__ float reductions[];
+    size_t base = (size_t)row * args.columns;
+    if (row >= args.rows) {
+        for (uint32_t column = tid; column < args.columns; column += threads)
+            output[base + column] = 0;
+        if (tid == 0) scales[row] = 1.0f;
+        return;
+    }
+
+    const uint16_t *row_input = input + base;
+    float local_max = 0.0f;
+    for (uint32_t column = tid; column < args.columns; column += threads) {
+        float value = fabsf(h3_bf16_bits_to_f32(row_input[column]));
+        if (value > local_max) local_max = value;
+    }
+    reductions[tid] = local_max;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) {
+            float other = reductions[tid + stride];
+            if (other > reductions[tid]) reductions[tid] = other;
+        }
+        __syncthreads();
+    }
+    float clipped_max = reductions[0] * args.clip;
+    float scale = clipped_max > 0.0f ? clipped_max / H3_FP8_E4M3_MAX
+                                     : 1.0f / H3_FP8_E4M3_MAX;
+    float inverse = 1.0f / scale;
+    if (tid == 0) scales[row] = scale;
+    __syncthreads();
+    for (uint32_t column = tid; column < args.columns; column += threads)
+        output[base + column] = __nv_cvt_float_to_fp8(
+            h3_bf16_bits_to_f32(row_input[column]) * inverse, __NV_SATFINITE,
+            __NV_E4M3);
+}
+
+/* The GEMM already carried the weight's scale, so only the per-token scale is
+ * left; doing it in place keeps the traffic to one read and one write. */
+__global__ static void h3_fp8_apply_row_scales_bf16_kernel(
+    uint16_t *values, const float *row_scales, uint32_t rows,
+    uint32_t output_dim) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t count = (size_t)rows * output_dim;
+    if (index >= count) return;
+    float scaled = h3_bf16_bits_to_f32(values[index]) *
+                   row_scales[index / output_dim];
+    values[index] = h3_f32_to_bf16_bits(scaled);
+}
+
+int h3_gpu_quantize_weight_fp8(h3_gpu *gpu, h3_gpu_tensor *output,
+                               h3_gpu_tensor *scale,
+                               const h3_gpu_tensor *input, uint32_t rows,
+                               uint32_t columns) {
+    size_t count = (size_t)rows * columns;
+    if (!gpu || !output || !scale || !input || !rows || !columns ||
+        input->dtype != H3_GPU_BF16 || output->dtype != H3_GPU_F8E4M3 ||
+        scale->dtype != H3_GPU_F32 || input->elements < count ||
+        output->elements < count || scale->elements < 1)
+        return h3_gpu_fail(gpu, "invalid BF16→FP8 weight quantize request");
+
+    unsigned int *amax = NULL;
+    if (cudaMalloc((void **)&amax, sizeof(unsigned int)) != cudaSuccess)
+        return h3_gpu_fail(gpu, "cannot allocate FP8 amax");
+    int ok = h3_cuda_check(
+        gpu, cudaMemsetAsync(amax, 0, sizeof(unsigned int), gpu->stream),
+        "h3_fp8_amax_reset");
+    unsigned threads = 256;
+    unsigned blocks = (unsigned)((count + threads - 1) / threads);
+    if (blocks > 4096u) blocks = 4096u;
+    if (ok) {
+        h3_fp8_amax_kernel<<<blocks, threads, threads * sizeof(float),
+                             gpu->stream>>>((const uint16_t *)input->device,
+                                            count, amax);
+        h3_fp8_scale_from_amax_kernel<<<1, 1, 0, gpu->stream>>>(
+            amax, (float *)scale->device);
+        h3_quantize_bf16_fp8_tensor_kernel<<<blocks, threads, 0, gpu->stream>>>(
+            (const uint16_t *)input->device,
+            (__nv_fp8_storage_t *)output->device, (const float *)scale->device,
+            count);
+        gpu->stats.direct_dispatches += 3;
+        ok = h3_cuda_check(gpu, cudaGetLastError(),
+                           "h3_quantize_bf16_fp8_tensor");
+    }
+    /* The scale lives on the stream, so the scratch cannot go until it drains. */
+    if (ok)
+        ok = h3_cuda_check(gpu, cudaStreamSynchronize(gpu->stream),
+                           "h3_quantize_weight_fp8 sync");
+    cudaFree(amax);
+    return ok;
+}
+
+typedef struct {
+    int rows;
+    int input_dim;
+    int output_dim;
+    cublasLtMatmulAlgo_t algo;
+    int valid;
+} h3_lt_fp8_plan;
+
+/* FP8 GEMM into a BF16 destination, with the weight's tensor scale folded in.
+ * Returns 0 when cuBLASLt has no algorithm, so callers keep their INT8 path. */
+static int h3_fp8_gemm_bf16(h3_gpu *gpu, const void *weight,
+                            const void *weight_scale, const void *input,
+                            void *destination, uint32_t rows,
+                            uint32_t input_dim, uint32_t output_dim) {
+    static h3_lt_fp8_plan plans[16];
+    if (!h3_lt_ensure(gpu)) return 0;
+    cublasLtMatmulDesc_t desc = NULL;
+    cublasLtMatrixLayout_t la = NULL, lb = NULL, ld = NULL;
+    cublasOperation_t transpose = CUBLAS_OP_T;
+    cublasOperation_t straight = CUBLAS_OP_N;
+    int ok = 0;
+    if (cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) !=
+        CUBLAS_STATUS_SUCCESS)
+        return 0;
+    if (cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                       &transpose, sizeof(transpose)) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                       &straight, sizeof(straight)) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulDescSetAttribute(desc,
+                                       CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                       &weight_scale, sizeof(weight_scale)) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatrixLayoutCreate(&la, CUDA_R_8F_E4M3, (int)input_dim,
+                                   (int)output_dim, (int)input_dim) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatrixLayoutCreate(&lb, CUDA_R_8F_E4M3, (int)input_dim,
+                                   (int)rows, (int)input_dim) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatrixLayoutCreate(&ld, CUDA_R_16BF, (int)output_dim,
+                                   (int)rows, (int)output_dim) ==
+            CUBLAS_STATUS_SUCCESS) {
+        h3_lt_fp8_plan *plan = NULL;
+        for (unsigned i = 0; i < 16u; i++) {
+            if (plans[i].valid && plans[i].rows == (int)rows &&
+                plans[i].input_dim == (int)input_dim &&
+                plans[i].output_dim == (int)output_dim) {
+                plan = &plans[i];
+                break;
+            }
+            if (!plans[i].valid && !plan) plan = &plans[i];
+        }
+        if (plan && !plan->valid) {
+            cublasLtMatmulPreference_t preference = NULL;
+            cublasLtMatmulHeuristicResult_t result;
+            int found = 0;
+            if (cublasLtMatmulPreferenceCreate(&preference) ==
+                CUBLAS_STATUS_SUCCESS) {
+                cublasLtMatmulPreferenceSetAttribute(
+                    preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    &gpu->lt_workspace_bytes,
+                    sizeof(gpu->lt_workspace_bytes));
+                if (cublasLtMatmulAlgoGetHeuristic(gpu->lt, desc, la, lb, ld,
+                                                   ld, preference, 1, &result,
+                                                   &found) ==
+                        CUBLAS_STATUS_SUCCESS &&
+                    found > 0) {
+                    plan->algo = result.algo;
+                    plan->rows = (int)rows;
+                    plan->input_dim = (int)input_dim;
+                    plan->output_dim = (int)output_dim;
+                    plan->valid = 1;
+                }
+                cublasLtMatmulPreferenceDestroy(preference);
+            }
+        }
+        if (plan && plan->valid) {
+            float alpha = 1.0f;
+            float beta = 0.0f;
+            ok = cublasLtMatmul(gpu->lt, desc, &alpha, weight, la, input, lb,
+                                &beta, destination, ld, destination, ld,
+                                &plan->algo, gpu->lt_workspace,
+                                gpu->lt_workspace_bytes,
+                                gpu->stream) == CUBLAS_STATUS_SUCCESS;
+        }
+    }
+    if (ld) cublasLtMatrixLayoutDestroy(ld);
+    if (lb) cublasLtMatrixLayoutDestroy(lb);
+    if (la) cublasLtMatrixLayoutDestroy(la);
+    cublasLtMatmulDescDestroy(desc);
+    if (ok) gpu->stats.direct_dispatches++;
+    return ok;
+}
+
+int h3_gpu_linear_fp8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           h3_gpu_tensor *quantized_input,
+                           h3_gpu_tensor *input_scales,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *weight_scale, uint32_t rows,
+                           uint32_t input_dim, uint32_t output_dim) {
+    size_t output_count = (size_t)rows * output_dim;
+    if (!gpu || !output || !quantized_input || !input_scales || !input ||
+        !weight || !weight_scale || !rows || !input_dim || !output_dim ||
+        output->dtype != H3_GPU_BF16 || input->dtype != H3_GPU_BF16 ||
+        quantized_input->dtype != H3_GPU_F8E4M3 ||
+        weight->dtype != H3_GPU_F8E4M3 ||
+        input_scales->dtype != H3_GPU_F32 ||
+        weight_scale->dtype != H3_GPU_F32 ||
+        output->elements < output_count ||
+        input->elements < (size_t)rows * input_dim ||
+        quantized_input->elements < (size_t)rows * input_dim ||
+        weight->elements < (size_t)output_dim * input_dim ||
+        input_scales->elements < rows || weight_scale->elements < 1)
+        return h3_gpu_fail(gpu, "invalid FP8 linear request");
+
+    h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
+    h3_int8_quant_args args = {rows, rows, input_dim, 1.0f, H3_FP8_E4M3_MAX};
+    unsigned threads = 256;
+    h3_quantize_bf16_fp8_rows_kernel<<<rows, threads, threads * sizeof(float),
+                                       gpu->stream>>>(
+        (const uint16_t *)input->device,
+        (__nv_fp8_storage_t *)quantized_input->device,
+        (float *)input_scales->device, args);
+    gpu->stats.direct_dispatches++;
+    if (!h3_cuda_check(gpu, cudaGetLastError(),
+                       "h3_quantize_bf16_fp8_rows")) {
+        h3_gpu_op_end(gpu);
+        return 0;
+    }
+    if (!h3_fp8_gemm_bf16(gpu, weight->device, weight_scale->device,
+                          quantized_input->device, output->device, rows,
+                          input_dim, output_dim)) {
+        h3_gpu_op_end(gpu);
+        return h3_gpu_fail(gpu, "no cuBLASLt FP8 algorithm for this shape");
+    }
+    unsigned blocks = (unsigned)((output_count + threads - 1) / threads);
+    h3_fp8_apply_row_scales_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (uint16_t *)output->device, (const float *)input_scales->device, rows,
+        output_dim);
+    gpu->stats.direct_dispatches++;
+    int ok = h3_cuda_check(gpu, cudaGetLastError(),
+                           "h3_fp8_apply_row_scales_bf16");
+    h3_gpu_op_end(gpu);
+    return ok;
+}
+
+/* FC1's BF16 result straight into FC2's FP8 input: applies the token scale,
+ * runs SwiGLU and requantizes, so the gate/up pair never lands in memory. The
+ * weight scale is already inside the GEMM, which is why only one vector is
+ * read here where the INT8 twin reads two. */
+__global__ static void h3_fp8_swiglu_quant_kernel(
+    const uint16_t *fused, const float *input_scales,
+    __nv_fp8_storage_t *output, float *output_scales,
+    h3_int8_swiglu_quant_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.dispatch_rows) return;
+
+    extern __shared__ float shared[];
+    float *reductions = shared;
+    uint16_t *activated = (uint16_t *)(shared + threads);
+    size_t out_base = (size_t)row * args.width;
+    if (row >= args.rows) {
+        for (uint32_t column = tid; column < args.width; column += threads)
+            output[out_base + column] = 0;
+        if (tid == 0) output_scales[row] = 1.0f;
+        return;
+    }
+
+    const uint16_t *row_fused = fused + (size_t)row * args.width * 2u;
+    float input_scale = input_scales[row];
+    float local_max = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float gate = h3_bf16_bits_to_f32(row_fused[column]) * input_scale;
+        float up =
+            h3_bf16_bits_to_f32(row_fused[args.width + column]) * input_scale;
+        uint16_t bits =
+            h3_f32_to_bf16_bits(gate / (1.0f + expf(-gate)) * up);
+        activated[column] = bits;
+        float magnitude = fabsf(h3_bf16_bits_to_f32(bits));
+        if (magnitude > local_max) local_max = magnitude;
+    }
+    reductions[tid] = local_max;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) {
+            float other = reductions[tid + stride];
+            if (other > reductions[tid]) reductions[tid] = other;
+        }
+        __syncthreads();
+    }
+    float row_max = reductions[0];
+    float scale =
+        row_max > 0.0f ? row_max / H3_FP8_E4M3_MAX : 1.0f / H3_FP8_E4M3_MAX;
+    float inverse = 1.0f / scale;
+    if (tid == 0) output_scales[row] = scale;
+    for (uint32_t column = tid; column < args.width; column += threads)
+        output[out_base + column] = __nv_cvt_float_to_fp8(
+            h3_bf16_bits_to_f32(activated[column]) * inverse, __NV_SATFINITE,
+            __NV_E4M3);
+}
+
+int h3_gpu_mlp_fp8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                        h3_gpu_tensor *fc1_output,
+                        h3_gpu_tensor *quantized_activation,
+                        h3_gpu_tensor *activation_scales,
+                        const h3_gpu_tensor *input,
+                        const h3_gpu_tensor *fc1_weight,
+                        const h3_gpu_tensor *fc1_scale,
+                        const h3_gpu_tensor *fc2_weight,
+                        const h3_gpu_tensor *fc2_scale, uint32_t rows,
+                        uint32_t input_dim, uint32_t hidden_dim,
+                        uint32_t output_dim) {
+    size_t output_count = (size_t)rows * output_dim;
+    if (!gpu || !output || !fc1_output || !quantized_activation ||
+        !activation_scales || !input || !fc1_weight || !fc1_scale ||
+        !fc2_weight || !fc2_scale || !rows || !input_dim || !hidden_dim ||
+        !output_dim || output->dtype != H3_GPU_BF16 ||
+        fc1_output->dtype != H3_GPU_BF16 || input->dtype != H3_GPU_BF16 ||
+        quantized_activation->dtype != H3_GPU_F8E4M3 ||
+        fc1_weight->dtype != H3_GPU_F8E4M3 ||
+        fc2_weight->dtype != H3_GPU_F8E4M3 ||
+        activation_scales->dtype != H3_GPU_F32 ||
+        fc1_scale->dtype != H3_GPU_F32 || fc2_scale->dtype != H3_GPU_F32 ||
+        output->elements < output_count ||
+        fc1_output->elements < (size_t)rows * hidden_dim * 2u ||
+        quantized_activation->elements <
+            (size_t)rows * (input_dim > hidden_dim ? input_dim : hidden_dim) ||
+        activation_scales->elements < rows)
+        return h3_gpu_fail(gpu, "invalid FP8 MLP request");
+
+    /* The SwiGLU row lives in shared memory, so a wide hidden dimension has to
+     * fall back to the INT8 path rather than silently overflowing. */
+    unsigned fused_threads = 256;
+    size_t fused_shared =
+        fused_threads * sizeof(float) + (size_t)hidden_dim * sizeof(uint16_t);
+    if (fused_shared > 46u * 1024u)
+        return h3_gpu_fail(gpu, "FP8 MLP hidden dimension too wide to fuse");
+
+    h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
+    unsigned threads = 256;
+    h3_int8_quant_args quant = {rows, rows, input_dim, 1.0f, H3_FP8_E4M3_MAX};
+    h3_quantize_bf16_fp8_rows_kernel<<<rows, threads, threads * sizeof(float),
+                                       gpu->stream>>>(
+        (const uint16_t *)input->device,
+        (__nv_fp8_storage_t *)quantized_activation->device,
+        (float *)activation_scales->device, quant);
+    gpu->stats.direct_dispatches++;
+    int ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_fp8_mlp input quant");
+    if (ok)
+        ok = h3_fp8_gemm_bf16(gpu, fc1_weight->device, fc1_scale->device,
+                              quantized_activation->device,
+                              fc1_output->device, rows, input_dim,
+                              hidden_dim * 2u);
+    if (ok) {
+        /* The scale buffer is read as FC1's input scale and rewritten as
+         * FC2's; every read of a row precedes the reduction barrier in the
+         * block that owns it, so the reuse is safe. */
+        h3_int8_swiglu_quant_args args = {rows, rows, hidden_dim,
+                                          H3_FP8_E4M3_MAX};
+        h3_fp8_swiglu_quant_kernel<<<rows, fused_threads, fused_shared,
+                                     gpu->stream>>>(
+            (const uint16_t *)fc1_output->device,
+            (const float *)activation_scales->device,
+            (__nv_fp8_storage_t *)quantized_activation->device,
+            (float *)activation_scales->device, args);
+        gpu->stats.direct_dispatches++;
+        ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_fp8_swiglu_quant");
+    }
+    if (ok)
+        ok = h3_fp8_gemm_bf16(gpu, fc2_weight->device, fc2_scale->device,
+                              quantized_activation->device, output->device,
+                              rows, hidden_dim, output_dim);
+    if (ok) {
+        unsigned blocks = (unsigned)((output_count + threads - 1) / threads);
+        h3_fp8_apply_row_scales_bf16_kernel<<<blocks, threads, 0,
+                                              gpu->stream>>>(
+            (uint16_t *)output->device,
+            (const float *)activation_scales->device, rows, output_dim);
+        gpu->stats.direct_dispatches++;
+        ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_fp8_mlp output scale");
+    }
+    h3_gpu_op_end(gpu);
+    return ok;
+}
+
 __global__ static void h3_quantize_bf16_int8_head_major_kernel(
     const uint16_t *input, int8_t *output, float *scales, uint32_t rows,
-    uint32_t padded_rows, uint32_t heads, uint32_t head_dim) {
+    uint32_t padded_rows, uint32_t heads, uint32_t head_dim, float levels) {
     uint32_t row = (uint32_t)blockIdx.x;
     uint32_t tid = threadIdx.x;
     uint32_t threads = blockDim.x;
@@ -6791,8 +7260,8 @@ __global__ static void h3_quantize_bf16_int8_head_major_kernel(
         __syncthreads();
     }
     float clipped_max = reductions[0];
-    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
-    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    float scale = clipped_max > 0.0f ? clipped_max / levels : 1.0f / levels;
+    float inverse = clipped_max > 0.0f ? levels / clipped_max : levels;
     if (tid == 0) scales[row] = scale;
     __syncthreads();
     for (uint32_t column = tid; column < columns; column += threads) {
@@ -6802,8 +7271,8 @@ __global__ static void h3_quantize_bf16_int8_head_major_kernel(
             ((size_t)head * rows + row) * head_dim + dim;
         int quantized =
             (int)rintf(h3_bf16_bits_to_f32(input[in_index]) * inverse);
-        if (quantized > 127) quantized = 127;
-        if (quantized < -127) quantized = -127;
+        if (quantized > (int)levels) quantized = (int)levels;
+        if (quantized < -(int)levels) quantized = -(int)levels;
         output[out_base + column] = (int8_t)quantized;
     }
 }
@@ -6832,7 +7301,8 @@ int h3_gpu_linear_int8_head_major_bf16(
                                                 threads * sizeof(float),
                                                 gpu->stream>>>(
         (const uint16_t *)input->device, (int8_t *)quantized_input->device,
-        (float *)input_scales->device, rows, padded_rows, heads, head_dim);
+        (float *)input_scales->device, rows, padded_rows, heads, head_dim,
+        h3_int8_levels());
     gpu->stats.direct_dispatches++;
     if (!h3_cuda_check(gpu, cudaGetLastError(),
                        "h3_quantize_bf16_int8_head_major")) {
@@ -6852,6 +7322,7 @@ struct h3_int8_group_quant_args {
     uint32_t columns;
     uint32_t group_size;
     uint32_t groups;
+    float levels;
 };
 
 __global__ static void h3_quantize_bf16_int8_groups_kernel(
@@ -6889,16 +7360,17 @@ __global__ static void h3_quantize_bf16_int8_groups_kernel(
         __syncthreads();
     }
     float clipped_max = reductions[0];
-    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
-    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    float levels = args.levels;
+    float scale = clipped_max > 0.0f ? clipped_max / levels : 1.0f / levels;
+    float inverse = clipped_max > 0.0f ? levels / clipped_max : levels;
     if (tid == 0) scales[(size_t)row * args.groups + group] = scale;
     __syncthreads();
     for (uint32_t column = tid; column < args.group_size; column += threads) {
         int quantized = (int)rintf(
             h3_bf16_bits_to_f32(input[row_base + group_start + column]) *
             inverse);
-        if (quantized > 127) quantized = 127;
-        if (quantized < -127) quantized = -127;
+        if (quantized > (int)levels) quantized = (int)levels;
+        if (quantized < -(int)levels) quantized = -(int)levels;
         output[row_base + group_start + column] = (int8_t)quantized;
     }
 }
@@ -6918,7 +7390,7 @@ static int h3_gpu_quantize_bf16_int8_groups(
         scales->elements < (size_t)dispatch_rows * groups)
         return h3_gpu_fail(gpu, "invalid grouped INT8 quantize request");
     h3_int8_group_quant_args args = {rows, dispatch_rows, columns, group_size,
-                                     groups};
+                                     groups, h3_int8_levels()};
     unsigned threads = 256;
     dim3 blocks(dispatch_rows, groups, 1);
     h3_quantize_bf16_int8_groups_kernel<<<blocks, threads,
@@ -7199,7 +7671,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
             /* The scale buffer is read as the FC1 input scale and rewritten as
              * the FC2 input scale; every read of a row precedes the reduction
              * barrier in the block that owns it, so the reuse is safe. */
-            h3_int8_swiglu_quant_args args = {rows, padded_rows, hidden_dim};
+            h3_int8_swiglu_quant_args args = {rows, padded_rows, hidden_dim,
+                                              h3_int8_levels()};
             h3_int8_swiglu_quant_kernel<<<padded_rows, fused_threads,
                                             fused_shared, gpu->stream>>>(
                 accum, (const float *)activation_scales->device,
@@ -7326,7 +7799,8 @@ int h3_gpu_gate_adaln_quantize_int8(
             (const uint16_t *)norm_modulation->device,
             (uint16_t *)gated_residual->device,
             (int8_t *)quantized_output->device,
-            (float *)quantized_scales->device, args, padded_rows);
+            (float *)quantized_scales->device, args, padded_rows,
+            h3_int8_levels());
         gpu->stats.direct_dispatches++;
         return h3_cuda_check(gpu, cudaGetLastError(),
                              "h3_gate_adaln_quantize_int8");
