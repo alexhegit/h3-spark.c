@@ -362,6 +362,11 @@ int h3_gpu_mlp_fp8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                         const h3_gpu_tensor *fc2_scale, uint32_t rows,
                         uint32_t input_dim, uint32_t hidden_dim,
                         uint32_t output_dim);
+/* defer_scales leaves the INT8 GEMM's int32 accumulator unscaled for a
+ * following consumer to fold the rescale into its own first read, skipping a
+ * full BF16 round trip through memory. Only h3_gpu_gate_adaln_quantize_int8
+ * consumes it today, and only when called immediately afterwards: the next
+ * INT8 GEMM reuses the same accumulator. Output is bit-identical either way. */
 int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,
@@ -370,7 +375,8 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             const h3_gpu_tensor *weight_scales,
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim,
-                            int use_slower_uncached_int8_scales);
+                            int use_slower_uncached_int8_scales,
+                            int defer_scales);
 /* Consume SDPA's native [head,row,dimension] BF16 layout without a full
  * BF16 transpose, gathering directly into the projection's row-major int8. */
 int h3_gpu_linear_int8_head_major_bf16(
@@ -381,7 +387,8 @@ int h3_gpu_linear_int8_head_major_bf16(
                             const h3_gpu_tensor *weight,
                             const h3_gpu_tensor *weight_scales,
                             uint32_t rows, uint32_t heads,
-                            uint32_t head_dim, uint32_t output_dim);
+                            uint32_t head_dim, uint32_t output_dim,
+                            int defer_scales);
 int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          h3_gpu_tensor *activated,
                          h3_gpu_tensor *quantized_activation,
@@ -398,7 +405,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          int use_slower_grouped_quantizer,
                          int use_slower_dynamic_fc1_k,
                          int use_int8_row_fc2,
-                         int input_is_quantized);
+                         int input_is_quantized,
+                         int defer_output_scales);
 int h3_gpu_silu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *input, uint32_t elements);
 int h3_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -477,7 +485,8 @@ int h3_gpu_gate_adaln_quantize_int8(
                      const h3_gpu_tensor *row_map, uint32_t rows,
                      uint32_t padded_rows, uint32_t width, uint32_t slots,
                      uint32_t gate_slot, uint32_t shift_slot,
-                     uint32_t scale_slot, float epsilon);
+                     uint32_t scale_slot, float epsilon,
+                     int fuse_branch_rescale);
 int h3_gpu_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                          h3_gpu_tensor *key, h3_gpu_tensor *value,
                          const h3_gpu_tensor *qkv,

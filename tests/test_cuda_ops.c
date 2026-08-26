@@ -3170,7 +3170,7 @@ int main(void) {
         check(h3_gpu_linear_int8_bf16(gpu, iq_out_t, iq_quant_t,
                                       iq_input_scale_t, iq_input_t, iq_weight_i8,
                                       iq_weight_scale_t, iq_rows, iq_cols,
-                                      iq_out, 0),
+                                      iq_out, 0, 0),
               "linear_int8_bf16");
         check(h3_gpu_submit(gpu), "submit int8 linear");
         float iq_got_scales[iq_out];
@@ -3361,7 +3361,7 @@ int main(void) {
         check(h3_gpu_linear_int8_head_major_bf16(
                   gpu, hm_out_t, hm_quant_t, hm_input_scale_t, hm_input_t,
                   hm_weight_i8, hm_weight_scale_t, hm_rows, hm_heads, hm_dim,
-                  hm_out),
+                  hm_out, 0),
               "linear_int8_head_major");
         check(h3_gpu_submit(gpu), "submit head_major int8");
         check(h3_gpu_tensor_read_bf16(hm_out_t, hm_out_bf16,
@@ -3470,7 +3470,7 @@ int main(void) {
                   gpu, mlp8_out_t, mlp8_act, mlp8_quant, mlp8_act_scales,
                   mlp8_in_t, mlp8_fc1_i8, mlp8_fc1_scale_t, mlp8_fc2_i8,
                   mlp8_fc2_scale_t, mlp8_fc1_bf16_t, mlp8_fc2_bf16_t, mlp8_rows,
-                  mlp8_in, mlp8_hidden, mlp8_out, 0, 0, 1, 0),
+                  mlp8_in, mlp8_hidden, mlp8_out, 0, 0, 1, 0, 0),
               "mlp_int8_bf16");
         check(h3_gpu_submit(gpu), "submit mlp_int8");
         check(h3_gpu_tensor_read_bf16(mlp8_out_t, mlp8_out_bf16,
@@ -3550,7 +3550,8 @@ int main(void) {
                 check(h3_gpu_mlp_int8_bf16(
                           gpu, t_out_int8, t_act, t_quant, t_scales, t_in,
                           t_fc1_i8, t_fc1_scale, t_fc2_i8, t_fc2_scale, t_fc1,
-                          t_fc2, q_rows, q_in, q_hidden, q_out, 0, 0, 1, 0),
+                          t_fc2, q_rows, q_in, q_hidden, q_out, 0, 0, 1, 0,
+                          0),
                       "wide mlp_int8_bf16");
                 check(h3_gpu_mlp_bf16(gpu, t_out_bf16, t_in, t_fc1, t_fc2,
                                       q_rows, q_in, q_hidden, q_out),
@@ -3732,7 +3733,7 @@ int main(void) {
         check(h3_gpu_gate_adaln_quantize_int8(
                   gpu, gaq_gate, gaq_quant, gaq_scales, gaq_res, gaq_branch,
                   gaq_norm, gaq_mod, gaq_mod, gaq_map_t, gaq_rows, gaq_padded,
-                  gaq_width, gaq_slots, 0, 1, 2, 1e-5f),
+                  gaq_width, gaq_slots, 0, 1, 2, 1e-5f, 0),
               "gate_adaln_quantize_int8");
         check(h3_gpu_submit(gpu), "submit gate_adaln_quantize");
         check(h3_gpu_tensor_read_bf16(gaq_gate, gaq_gate_out_bf16,

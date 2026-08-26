@@ -2673,3 +2673,42 @@ check that blocking is not what makes it exact.
 At 0.178 s this is still 60× off the roof and still load-bound, now at ~120 G
 loads/s.
 
+### KEEP letting the gate kernel apply the projection's INT8 rescale
+
+Two of the block's four INT8 projections still ended in a separate rescale pass.
+`h3_int8_apply_scales_bf16_kernel` runs 270 times in a four-step generation for
+69.6 ms — exactly twice per block-step, which is `attn.out_proj` and FC2, the two
+that were never folded into a consumer the way QKV and FC1 were.
+
+Both feed the same consumer, `h3_gate_adaln_quantize_int8`, so one fusion covers
+them. The rescale is pure bandwidth: 4 bytes of int32 accumulator in, 2 bytes of
+BF16 out, 257 µs per call for 64.5 MB, which is 250 GB/s and therefore the whole
+cost. The gate kernel then reads those same 2 bytes straight back. Letting it
+read the accumulator instead and scale inline removes 6 bytes per element and
+adds 2, so two thirds of the pass should disappear:
+
+| | apply_scales | gate kernel | net |
+|---|---:|---:|---:|
+| split | 69.6 ms / 270 | 95.0 ms / 258 | |
+| fused | 3.0 ms / 12 | 116.9 ms / 258 | −44.7 ms |
+
+Scaled to twenty steps that is −164 ms of kernel time against a −169 ms
+prediction from the bandwidth arithmetic alone. The denoise phase gives back
+0.105 s of it (8.291 s → 8.186 s over paired runs); the rest is latency the
+phase was already hiding.
+
+Bit-identical because the fused path reproduces the rounding rather than
+skipping it: it computes `bf16(accum * input_scale * weight_scale)` in that
+multiplication order and converts back to float, which is precisely what the
+separate kernel wrote to memory. The twelve surviving calls are the last block
+of each pass, whose gate is not the quantizing one.
+
+Two things this cost that are worth writing down. The producer defers by *not*
+writing its BF16 output, so a kill switch that disables only the consumer leaves
+the gate reading a buffer nobody wrote — the first A/B produced a different md5
+for exactly that reason. One switch has to govern both ends. And because the
+deferral is only valid until the next INT8 GEMM reuses the shared accumulator,
+the record is cleared on entry to every GEMM and the consumer checks that it
+matches its own shape, so a consumer that asks to fuse when the producer took a
+different path falls back to reading BF16 instead of reading stale memory.
+

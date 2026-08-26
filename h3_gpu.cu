@@ -68,6 +68,15 @@ struct h3_gpu {
     cudaEvent_t *op_events;
     int32_t *int8_accum;
     size_t int8_accum_bytes;
+    /* An INT8 GEMM whose caller asked to defer the rescale leaves its int32
+     * accumulator and the two scale vectors here for the next consumer to fold
+     * into its own first read. Valid only until the following INT8 GEMM
+     * overwrites the shared accumulator, which is why the only callers are ops
+     * that run immediately after their producer. */
+    const float *int8_defer_input_scales;
+    const float *int8_defer_weight_scales;
+    uint32_t int8_defer_rows;
+    uint32_t int8_defer_columns;
     uint64_t int8_cublas_ok;
     uint64_t int8_naive_fallback;
     h3_gpu_tensor *ws_mlp_fc1;
@@ -4564,12 +4573,20 @@ int h3_gpu_gate_adaln_bf16(
 
 /* Single kernel: fused gate+AdaLN then INT8 row quantize from smem.
  * Avoids writing the BF16 AdaLN temp to HBM. Opt out H3_SPLIT_ADALN_QUANT=1. */
+/* branch_accum, when non-NULL, replaces the BF16 branch with the int32
+ * accumulator of the INT8 GEMM that produced it, rescaled here. The BF16
+ * rounding below is the same one h3_int8_apply_scales_bf16_kernel applies, in
+ * the same multiplication order, so the gated result is bit for bit what the
+ * split pair produced — the pair just wrote 2 bytes per element to memory and
+ * read them straight back. */
 __global__ static void h3_gate_adaln_quantize_int8_kernel(
     const uint16_t *residual, const uint16_t *branch,
     const uint16_t *gate_modulation, const uint32_t *row_map,
     const uint16_t *weight, const uint16_t *norm_modulation,
     uint16_t *gated_residual, int8_t *quantized, float *scales,
-    h3_gate_adaln_args args, uint32_t padded_rows, float levels) {
+    h3_gate_adaln_args args, uint32_t padded_rows, float levels,
+    const int32_t *branch_accum, const float *branch_input_scales,
+    const float *branch_weight_scales) {
     uint32_t row = (uint32_t)blockIdx.x;
     uint32_t tid = threadIdx.x;
     uint32_t threads = blockDim.x;
@@ -4587,13 +4604,20 @@ __global__ static void h3_gate_adaln_quantize_int8_kernel(
     }
     size_t base = (size_t)row_map[row] * args.slots * args.width;
     float local_sum = 0.0f;
+    float branch_row_scale = branch_accum ? branch_input_scales[row] : 0.0f;
     for (uint32_t column = tid; column < args.width; column += threads) {
         size_t index = (size_t)row * args.width + column;
         float gate = h3_bf16_bits_to_f32(
             gate_modulation[base + args.gate_slot * args.width + column]);
+        float branch_value;
+        if (branch_accum)
+            branch_value = h3_bf16_bits_to_f32(h3_f32_to_bf16_bits(
+                (float)branch_accum[index] * branch_row_scale *
+                branch_weight_scales[column]));
+        else
+            branch_value = h3_bf16_bits_to_f32(branch[index]);
         uint16_t gated = h3_f32_to_bf16_bits(
-            h3_bf16_bits_to_f32(residual[index]) +
-            h3_bf16_bits_to_f32(branch[index]) * gate);
+            h3_bf16_bits_to_f32(residual[index]) + branch_value * gate);
         gated_residual[index] = gated;
         row_values[column] = gated;
         float value = h3_bf16_bits_to_f32(gated);
@@ -7001,7 +7025,8 @@ static int h3_gpu_linear_int8_bf16_impl(
     h3_gpu_tensor *input_scales, const h3_gpu_tensor *input,
     const h3_gpu_tensor *weight, const h3_gpu_tensor *weight_scales,
     uint32_t rows, uint32_t input_dim, uint32_t output_dim,
-    int use_slower_uncached_int8_scales, int input_is_quantized) {
+    int use_slower_uncached_int8_scales, int input_is_quantized,
+    int defer_scales) {
     (void)use_slower_uncached_int8_scales;
     uint32_t padded_rows = (rows + 127u) & ~127u;
     if (padded_rows < rows) padded_rows = rows;
@@ -7024,6 +7049,13 @@ static int h3_gpu_linear_int8_bf16_impl(
          input->elements < (size_t)rows * input_dim) ||
         !rows || !input_dim || !output_dim)
         return h3_gpu_fail(gpu, "invalid INT8 linear request");
+
+    /* Cleared up front so the deferral record is only ever set by the path that
+     * actually skipped the rescale; a consumer that asks to fuse but finds no
+     * record falls back to reading the BF16 output, which every other path
+     * still writes. */
+    gpu->int8_defer_rows = 0;
+    gpu->int8_defer_columns = 0;
 
     if (!input_is_quantized) {
         if (!h3_gpu_quantize_bf16_int8_rows(
@@ -7054,6 +7086,14 @@ static int h3_gpu_linear_int8_bf16_impl(
         h3_int8_gemm_accum(gpu, weight->device, quantized_input->device, rows,
                            input_dim, output_dim);
     if (accum) {
+        if (defer_scales) {
+            gpu->int8_defer_input_scales = (const float *)input_scales->device;
+            gpu->int8_defer_weight_scales =
+                (const float *)weight_scales->device;
+            gpu->int8_defer_rows = rows;
+            gpu->int8_defer_columns = output_dim;
+            return 1;
+        }
         unsigned threads = 256;
         unsigned blocks = (unsigned)((output_count + threads - 1) / threads);
         h3_int8_apply_scales_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
@@ -7086,12 +7126,13 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             const h3_gpu_tensor *weight_scales,
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim,
-                            int use_slower_uncached_int8_scales) {
+                            int use_slower_uncached_int8_scales,
+                            int defer_scales) {
     h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
     int ok = h3_gpu_linear_int8_bf16_impl(
         gpu, output, quantized_input, input_scales, input, weight,
         weight_scales, rows, input_dim, output_dim,
-        use_slower_uncached_int8_scales, 0);
+        use_slower_uncached_int8_scales, 0, defer_scales);
     h3_gpu_op_end(gpu);
     return ok;
 }
@@ -7598,7 +7639,8 @@ int h3_gpu_linear_int8_head_major_bf16(
     h3_gpu *gpu, h3_gpu_tensor *output, h3_gpu_tensor *quantized_input,
     h3_gpu_tensor *input_scales, const h3_gpu_tensor *input,
     const h3_gpu_tensor *weight, const h3_gpu_tensor *weight_scales,
-    uint32_t rows, uint32_t heads, uint32_t head_dim, uint32_t output_dim) {
+    uint32_t rows, uint32_t heads, uint32_t head_dim, uint32_t output_dim,
+    int defer_scales) {
     uint32_t input_dim = heads * head_dim;
     uint32_t padded_rows = (rows + 127u) & ~127u;
     if (padded_rows < rows) padded_rows = rows;
@@ -7628,7 +7670,7 @@ int h3_gpu_linear_int8_head_major_bf16(
     }
     int ok = h3_gpu_linear_int8_bf16_impl(
         gpu, output, quantized_input, input_scales, NULL, weight,
-        weight_scales, rows, input_dim, output_dim, 0, 1);
+        weight_scales, rows, input_dim, output_dim, 0, 1, defer_scales);
     h3_gpu_op_end(gpu);
     return ok;
 }
@@ -7918,7 +7960,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          uint32_t output_dim,
                          int use_slower_grouped_quantizer,
                          int use_slower_dynamic_fc1_k, int use_int8_row_fc2,
-                         int input_is_quantized) {
+                         int input_is_quantized, int defer_output_scales) {
     (void)use_slower_grouped_quantizer;
     (void)use_slower_dynamic_fc1_k;
     uint32_t padded_rows = (rows + 127u) & ~127u;
@@ -8004,7 +8046,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         if (fused_ok)
             return h3_gpu_linear_int8_bf16_impl(
                 gpu, output, quantized_activation, activation_scales, NULL,
-                fc2_weight, fc2_scales, rows, hidden_dim, output_dim, 0, 1);
+                fc2_weight, fc2_scales, rows, hidden_dim, output_dim, 0, 1,
+                defer_output_scales);
         if (accum) return 0; /* the kernel failed, not the GEMM buffer */
         /* No INT8 GEMM available: fall through to the split path. */
         if (!input_is_quantized) input_is_quantized = 1;
@@ -8026,7 +8069,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
             if (!h3_gpu_linear_int8_bf16_impl(
                     gpu, fc1_fused, quantized_activation, activation_scales,
                     NULL, fc1_weight, fc1_scales, rows, input_dim,
-                    hidden_dim * 2u, 0, 1))
+                    hidden_dim * 2u, 0, 1, 0))
                 ok = 0;
             h3_gpu_op_end(gpu);
         }
@@ -8057,7 +8100,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
             else if (!h3_gpu_linear_int8_bf16_impl(
                          gpu, output, quantized_activation, activation_scales,
                          NULL, fc2_weight, fc2_scales, rows, hidden_dim,
-                         output_dim, 0, 1))
+                         output_dim, 0, 1, 0))
                 ok = 0;
         }
     } else if (ok &&
@@ -8078,13 +8121,21 @@ int h3_gpu_gate_adaln_quantize_int8(
     const h3_gpu_tensor *norm_modulation, const h3_gpu_tensor *row_map,
     uint32_t rows, uint32_t padded_rows, uint32_t width, uint32_t slots,
     uint32_t gate_slot, uint32_t shift_slot, uint32_t scale_slot,
-    float epsilon) {
+    float epsilon, int fuse_branch_rescale) {
     size_t elements = (size_t)rows * width;
     if (!gpu || !gated_residual || !quantized_output || !quantized_scales ||
         !residual || !branch || !norm_weight || !gate_modulation ||
         !norm_modulation || !row_map || !rows || padded_rows < rows || !width ||
         gate_slot >= slots || shift_slot >= slots || scale_slot >= slots)
         return h3_gpu_fail(gpu, "invalid gate AdaLN quantize request");
+
+    /* Only fold in the producer's rescale if that producer actually left one:
+     * the record has to match this call's shape, or the branch tensor already
+     * holds finished BF16 and reading the accumulator would be wrong. */
+    const int32_t *branch_accum = NULL;
+    if (fuse_branch_rescale && gpu->int8_defer_rows == rows &&
+        gpu->int8_defer_columns == width && gpu->int8_accum)
+        branch_accum = gpu->int8_accum;
 
     /* Default: single kernel. Opt out H3_SPLIT_ADALN_QUANT=1. */
     if (!h3_env_on("H3_SPLIT_ADALN_QUANT") && width <= 5376u &&
@@ -8117,11 +8168,21 @@ int h3_gpu_gate_adaln_quantize_int8(
             (uint16_t *)gated_residual->device,
             (int8_t *)quantized_output->device,
             (float *)quantized_scales->device, args, padded_rows,
-            h3_int8_levels());
+            h3_int8_levels(), branch_accum, gpu->int8_defer_input_scales,
+            gpu->int8_defer_weight_scales);
         gpu->stats.direct_dispatches++;
         return h3_cuda_check(gpu, cudaGetLastError(),
                              "h3_gate_adaln_quantize_int8");
     }
+
+    /* The split path below reads the branch as BF16, which a deferred producer
+     * never wrote. Callers gate their deferral request on the same conditions
+     * as the fused kernel above, so reaching here with a record in hand means
+     * those conditions drifted apart; say so rather than read stale memory. */
+    if (branch_accum)
+        return h3_gpu_fail(gpu,
+                           "fused branch rescale requested but the fused gate "
+                           "AdaLN quantize path was not taken");
 
     h3_gpu_tensor *adaln =
         h3_gpu_workspace_bf16(gpu, &gpu->ws_adaln, elements);
@@ -8216,7 +8277,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
     int ok = h3_gpu_linear_int8_bf16_impl(
         gpu, qkv, quantized_input, input_scales, NULL, weight, weight_scales,
-        rows, input_dim, inner * 3u, 0, 1);
+        rows, input_dim, inner * 3u, 0, 1, 0);
     h3_gpu_op_end(gpu);
     ok = ok &&
         h3_gpu_qkv_rope_bf16_layout(gpu, query, key, value, qkv, q_norm,
