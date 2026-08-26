@@ -662,6 +662,84 @@ static void check_concurrent_staged_reads(h3_gpu *gpu) {
     unsetenv("H3_LOAD_STAGE_MIB");
 }
 
+/* The DiT's quantized weight cache stores what the quantizer produced and
+ * replays it on the next run, so a hit is only bit-identical if the INT8 and
+ * F32 payloads survive the file round trip exactly (docs/PERF_BASELINE.md,
+ * 2026-08-26). An offset past the first staging chunk keeps the multi-chunk
+ * path in the test. */
+static void check_int8_cache_round_trip(h3_gpu *gpu) {
+    enum { WEIGHT_ELEMENTS = 3 << 20, SCALE_ELEMENTS = 512, PAD = 4096 };
+    char path[] = "/tmp/h3_int8_cache_XXXXXX";
+    int fd = mkstemp(path);
+    check(fd >= 0, "int8 cache temp file");
+    if (fd < 0) return;
+    setenv("H3_LOAD_STAGE_MIB", "1", 1);
+
+    int8_t *weight = (int8_t *)malloc(WEIGHT_ELEMENTS);
+    int8_t *weight_back = (int8_t *)malloc(WEIGHT_ELEMENTS);
+    float *scale = (float *)malloc(SCALE_ELEMENTS * sizeof(float));
+    float *scale_back = (float *)malloc(SCALE_ELEMENTS * sizeof(float));
+    check(weight && weight_back && scale && scale_back, "int8 cache buffers");
+    if (!weight || !weight_back || !scale || !scale_back) goto done;
+    for (size_t i = 0; i < WEIGHT_ELEMENTS; i++)
+        weight[i] = (int8_t)((i * 31u + (i >> 7)) & 0xffu);
+    for (size_t i = 0; i < SCALE_ELEMENTS; i++)
+        scale[i] = (float)((double)i * 1e-3 + 1.0 / (double)(i + 3));
+
+    char padding[PAD];
+    memset(padding, 0, sizeof(padding));
+    check(write(fd, padding, PAD) == PAD, "int8 cache header pad");
+    check(write(fd, weight, WEIGHT_ELEMENTS) == (ssize_t)WEIGHT_ELEMENTS,
+          "int8 cache weight write");
+    check(write(fd, scale, SCALE_ELEMENTS * sizeof(float)) ==
+              (ssize_t)(SCALE_ELEMENTS * sizeof(float)),
+          "int8 cache scale write");
+    close(fd);
+    fd = -1;
+
+    h3_gpu_tensor *device_weight = h3_gpu_tensor_new_i8(gpu, WEIGHT_ELEMENTS);
+    h3_gpu_tensor *device_scale = h3_gpu_tensor_new_f32(gpu, SCALE_ELEMENTS);
+    check(device_weight && device_scale, "int8 cache tensors");
+    if (device_weight && device_scale) {
+        char message[256];
+        check(h3_gpu_tensor_read_file_i8(device_weight, path, PAD,
+                                         WEIGHT_ELEMENTS, message,
+                                         sizeof(message)),
+              "int8 cache weight read");
+        check(h3_gpu_tensor_read_file_f32(device_scale, path,
+                                          PAD + WEIGHT_ELEMENTS,
+                                          SCALE_ELEMENTS, message,
+                                          sizeof(message)),
+              "int8 cache scale read");
+        check(h3_gpu_submit(gpu), "int8 cache submit");
+        check(h3_gpu_tensor_read_i8(device_weight, weight_back,
+                                    WEIGHT_ELEMENTS),
+              "int8 cache weight readback");
+        check(h3_gpu_tensor_read_f32(device_scale, scale_back, SCALE_ELEMENTS),
+              "int8 cache scale readback");
+        check(memcmp(weight, weight_back, WEIGHT_ELEMENTS) == 0,
+              "int8 cache weights survive the round trip exactly");
+        check(memcmp(scale, scale_back, SCALE_ELEMENTS * sizeof(float)) == 0,
+              "int8 cache scales survive the round trip exactly");
+        /* A short file must be refused rather than half-filling the tensor. */
+        check(!h3_gpu_tensor_read_file_i8(device_weight, path, PAD,
+                                         WEIGHT_ELEMENTS * 4, message,
+                                         sizeof(message)),
+              "int8 cache rejects a read past the tensor");
+    }
+    h3_gpu_tensor_free(device_weight);
+    h3_gpu_tensor_free(device_scale);
+
+done:
+    if (fd >= 0) close(fd);
+    free(weight);
+    free(weight_back);
+    free(scale);
+    free(scale_back);
+    unlink(path);
+    unsetenv("H3_LOAD_STAGE_MIB");
+}
+
 int main(void) {
     char error[256];
     h3_gpu *gpu = h3_gpu_create(NULL, error, sizeof(error));
@@ -3863,6 +3941,7 @@ int main(void) {
     h3_gpu_tensor_free(gaq_scales);
 
     check_concurrent_staged_reads(gpu);
+    check_int8_cache_round_trip(gpu);
 
     h3_gpu_free(gpu);
 

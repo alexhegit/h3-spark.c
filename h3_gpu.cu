@@ -916,6 +916,34 @@ int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                   file_offset, bytes, error, error_size);
 }
 
+int h3_gpu_tensor_read_file_i8(h3_gpu_tensor *tensor, const char *path,
+                               uint64_t file_offset, size_t elements,
+                               char *error, size_t error_size) {
+    if (!tensor || !tensor->owner || tensor->dtype != H3_GPU_I8 ||
+        tensor->elements < elements)
+        return 0;
+    return h3_copy_file_to_device(tensor->owner, tensor->device, path,
+                                  file_offset, elements, error, error_size);
+}
+
+int h3_gpu_tensor_read_file_f32(h3_gpu_tensor *tensor, const char *path,
+                                uint64_t file_offset, size_t elements,
+                                char *error, size_t error_size) {
+    if (!tensor || !tensor->owner || tensor->dtype != H3_GPU_F32 ||
+        tensor->elements < elements)
+        return 0;
+    return h3_copy_file_to_device(tensor->owner, tensor->device, path,
+                                  file_offset, elements * sizeof(float), error,
+                                  error_size);
+}
+
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements) {
+    if (!h3_tensor_check(tensor, H3_GPU_I8, elements) || !values) return 0;
+    return cudaMemcpy(values, tensor->device, elements,
+                      cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
 int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                    uint64_t file_offset, size_t elements,
                                    char *error, size_t error_size) {

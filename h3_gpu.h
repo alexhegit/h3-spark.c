@@ -72,6 +72,16 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
 int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                  uint64_t file_offset, size_t elements,
                                  char *error, size_t error_size);
+/* Same staged parallel read for the quantized weight cache, whose payload is
+ * already in the layout the GEMM wants. */
+int h3_gpu_tensor_read_file_i8(h3_gpu_tensor *tensor, const char *path,
+                               uint64_t file_offset, size_t elements,
+                               char *error, size_t error_size);
+int h3_gpu_tensor_read_file_f32(h3_gpu_tensor *tensor, const char *path,
+                                uint64_t file_offset, size_t elements,
+                                char *error, size_t error_size);
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements);
 /* As above, but ask Darwin to avoid retaining a second copy in the file cache.
  * Intended for large sequential weight streams whose destination is the only
  * useful resident copy. */

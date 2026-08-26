@@ -2240,3 +2240,78 @@ attempt starts with a measurement instead of a rewrite.
 Logs: `/tmp/h3_perf_day14/ncu_sdpa.txt` (the empty profile).
 ---
 
+## 2026-08-26 — KEEP caching the DiT's quantized weights (load 2.68 → 1.64 s, and the variance collapses)
+
+`load_core` reads `attn.qkv_proj`, `attn.out_proj`, `mlp.fc1` and `mlp.fc2` as
+BF16, quantizes each to INT8 plus a scale per row, and then
+`release_block_bf16_after_int8` frees the BF16 — nothing else ever reads it.
+Those four are essentially the whole warm load: 18.005 GiB of INT8 against the
+34.145 GiB of BF16 that produced it, and the transform's only inputs are the
+checkpoint's own bytes. Same shape as the AdaLN tables, so the same fix.
+
+`dit-int8-<key>-b<NN>.bin` under `$H3_DIT_INT8_CACHE`, else
+`$XDG_CACHE_HOME/h3-spark`, else `~/.cache/h3-spark`, holds one block's four
+INT8 payloads and their scales, each section aligned to 4 KiB so the hit path
+is the same staged parallel pread the checkpoint uses. The key hashes the
+version, the three dimensions, and the path, size and mtime of the shard
+holding `blocks.0.attn.qkv_proj.weight`, so a swapped checkpoint misses. A hit
+skips the four BF16 reads, the three quantize kernels and the BF16 allocations,
+and reads INT8 straight into the tensors the GEMM already wants; a truncated or
+unreadable file falls back to the checkpoint instead of failing. The cache is
+bypassed unless all three INT8 paths are on and no `keep_bf16_*` wants the
+original. `H3_DIT_INT8_CACHE=off` disables it.
+
+Because the file holds exactly what the quantizer produced, a hit is
+**bit-identical**, not merely close: md5 `f5282774d3a4` on the cold write, on
+both warm runs, on all four arms of the A/B and on all five steady-state runs.
+
+### It moves more than the read
+
+| | Cache off | Cache on |
+|--|----------:|---------:|
+| bytes staged in DiT load | 34.145 GiB | **18.005 GiB** |
+| DiT load allocations | 50.600 GiB | **18.300 GiB** |
+| DiT load wall | 2.681 s | **1.61–1.67 s** |
+| DiT load read | 1.350 s | **0.49–0.51 s** |
+
+### The page cache is the real story
+
+The first interleaved A/B looked better than the truth — 21.8/22.1 s off
+against 19.7/20.1 s on — and the reason is instructive. The hot files are 63 GB
+of text encoder, 62 GB of transformer and 10 GB of VAE against 121 GB of RAM
+and ~93 GB of usable page cache, so the working set does not fit and each run
+evicts what the next one needs. Adding an 18 GiB cache file to that made the
+`off` arm slower than it had been before the change (its DiT read went 1.35 →
+3.5 s), and one `on` run paid 7.36 s for a text-encoder read that costs 2.9 s
+when resident. Interleaving cannot measure this: each arm hands the next a
+poisoned cache.
+
+Run consecutively instead, and the arms separate for a better reason than
+bytes. Warm, the 62 GB of BF16 transformer shards stop being read at all, which
+takes the working set from ~135 GB to ~92 GB — under the limit — and everything
+stops fighting:
+
+| Five consecutive warm runs | e2e | DiT load | DiT read | TE read |
+|---|----:|---------:|---------:|--------:|
+| | 18.23 s | 1.666 s | 0.506 s | 3.122 s |
+| | 18.00 s | 1.610 s | 0.505 s | 2.865 s |
+| | 18.37 s | 1.639 s | 0.502 s | 2.940 s |
+| | 18.42 s | 1.647 s | 0.504 s | 2.974 s |
+| | 18.19 s | 1.666 s | 0.493 s | 2.930 s |
+
+Against 19.29 s before the change, that is −1.1 s, but the spread matters as
+much as the median: **±0.2 s where it used to be ±2 s**, and the text encoder's
+read stops oscillating between 2.9 and 7.4 s even though nothing in the text
+encoder changed. Fitting in RAM is worth more than it looks.
+
+The cold run pays for it once: 43.4 s, with the DiT load at 26.6 s to read back
+and write 18 GiB, and 18 GiB of disk. `tests/test_cuda_ops.c` gates the new
+primitives — `h3_gpu_tensor_read_file_i8`, `..._read_file_f32`,
+`..._read_i8` — on an exact multi-chunk round trip, since a hit is only
+bit-identical if the payload is.
+
+e2e is **18.2 s**, 3.1× off the 56.3 s this started at.
+
+Logs: `/tmp/h3_perf_day14/q8_{cold,warm1,warm2}.log`, `q8ab/`.
+---
+

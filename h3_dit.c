@@ -3,6 +3,8 @@
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -10,7 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 enum {
     TEXT_DIM = 5120,
@@ -1249,8 +1253,223 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
     }
 }
 
+/* The four wide weights are read as BF16 for one reason: to be turned into
+ * INT8 plus a scale per row, after which the BF16 is freed unread by anything
+ * else. That transform depends on the checkpoint and nothing else — not the
+ * prompt, not the schedule — so it is the same shape as the AdaLN tables, and
+ * caching it halves the bytes the load has to move as well as skipping the
+ * quantize kernels. A hit is bit-identical because the file holds exactly what
+ * the quantizer produced. */
+enum { DIT_INT8_CACHE_VERSION = 1, DIT_INT8_CACHE_ALIGN = 4096 };
+
+typedef struct {
+    char magic[8];
+    uint32_t version;
+    uint32_t block;
+    uint64_t key;
+    uint64_t elements[4];
+    uint64_t rows[4];
+} dit_int8_cache_header;
+
+/* Order matches the file layout: weight payload then its scales, per tensor. */
+static void dit_int8_cache_sections(h3_dit_block *block,
+                                    h3_gpu_tensor ***weights,
+                                    h3_gpu_tensor ***scales,
+                                    uint64_t *elements, uint64_t *rows) {
+    weights[0] = &block->qkv_int8;
+    weights[1] = &block->out_int8;
+    weights[2] = &block->fc1_int8;
+    weights[3] = &block->fc2_int8;
+    scales[0] = &block->qkv_scales;
+    scales[1] = &block->out_scales;
+    scales[2] = &block->fc1_scales;
+    scales[3] = &block->fc2_scales;
+    rows[0] = INNER * 3;
+    rows[1] = HIDDEN;
+    rows[2] = FFN * 2;
+    rows[3] = HIDDEN;
+    elements[0] = (uint64_t)INNER * 3 * HIDDEN;
+    elements[1] = (uint64_t)HIDDEN * INNER;
+    elements[2] = (uint64_t)FFN * 2 * HIDDEN;
+    elements[3] = (uint64_t)HIDDEN * FFN;
+}
+
+static uint64_t dit_int8_cache_hash(uint64_t hash, const void *data,
+                                    size_t bytes) {
+    const unsigned char *cursor = data;
+    for (size_t index = 0; index < bytes; index++) {
+        hash ^= cursor[index];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+/* Identifies the checkpoint by the shard holding the first block's QKV weight,
+ * so a swapped or rewritten checkpoint misses instead of being reused. */
+static uint64_t dit_int8_cache_key(h3_dit *dit) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor =
+        h3_weight_find(dit->weights, "blocks.0.attn.qkv_proj.weight", &header);
+    if (!tensor || !header || !header->path) return 0;
+    struct stat status;
+    if (stat(header->path, &status) != 0) return 0;
+    uint32_t shape[] = {DIT_INT8_CACHE_VERSION, HIDDEN, INNER, FFN};
+    uint64_t hash = 14695981039346656037ull;
+    hash = dit_int8_cache_hash(hash, shape, sizeof(shape));
+    hash = dit_int8_cache_hash(hash, header->path, strlen(header->path));
+    uint64_t identity[] = {(uint64_t)status.st_size,
+                           (uint64_t)status.st_mtime};
+    hash = dit_int8_cache_hash(hash, identity, sizeof(identity));
+    return hash ? hash : 1;
+}
+
+static int dit_int8_cache_path(char *path, size_t size, uint64_t key,
+                               unsigned block) {
+    const char *setting = getenv("H3_DIT_INT8_CACHE");
+    if (setting && (!strcmp(setting, "0") || !strcmp(setting, "off")))
+        return 0;
+    char root[768];
+    if (setting && *setting) {
+        snprintf(root, sizeof(root), "%s", setting);
+    } else {
+        const char *base = getenv("XDG_CACHE_HOME");
+        if (base && *base) {
+            snprintf(root, sizeof(root), "%s/h3-spark", base);
+        } else {
+            const char *home = getenv("HOME");
+            if (!home || !*home) return 0;
+            snprintf(root, sizeof(root), "%s/.cache/h3-spark", home);
+        }
+    }
+    if (mkdir(root, 0755) != 0 && errno != EEXIST) return 0;
+    snprintf(path, size, "%s/dit-int8-%016llx-b%02u.bin", root,
+             (unsigned long long)key, block);
+    return 1;
+}
+
+static uint64_t dit_int8_cache_align(uint64_t offset) {
+    uint64_t remainder = offset % DIT_INT8_CACHE_ALIGN;
+    return remainder ? offset + (DIT_INT8_CACHE_ALIGN - remainder) : offset;
+}
+
+/* Whether the cache can stand in for the read at all: every quantized path has
+ * to be on, and no caller may still want the BF16 original. */
+static int dit_int8_cacheable(const h3_dit *dit) {
+    return dit->int8_mlp && dit->int8_qkv && dit->int8_attention_out &&
+           !dit->keep_bf16_mlp && !dit->keep_bf16_qkv &&
+           !dit->keep_bf16_attention_out;
+}
+
+static int dit_int8_cache_load(h3_dit *dit, h3_dit_block *block,
+                               unsigned index, uint64_t key) {
+    char path[1024];
+    if (!key || !dit_int8_cache_path(path, sizeof(path), key, index)) return 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    dit_int8_cache_header header;
+    int ok = read(fd, &header, sizeof(header)) == (ssize_t)sizeof(header) &&
+             !memcmp(header.magic, "H3DITQ\0", 7) &&
+             header.version == DIT_INT8_CACHE_VERSION &&
+             header.block == index && header.key == key;
+    close(fd);
+    if (!ok) return 0;
+
+    h3_gpu_tensor **weights[4], **scales[4];
+    uint64_t elements[4], rows[4];
+    dit_int8_cache_sections(block, weights, scales, elements, rows);
+    for (unsigned section = 0; section < 4; section++)
+        if (header.elements[section] != elements[section] ||
+            header.rows[section] != rows[section])
+            return 0;
+
+    char unused[256];
+    uint64_t offset = dit_int8_cache_align(sizeof(header));
+    for (unsigned section = 0; section < 4 && ok; section++) {
+        *weights[section] = h3_gpu_tensor_new_i8(dit->gpu, elements[section]);
+        *scales[section] = h3_gpu_tensor_new_f32(dit->gpu, rows[section]);
+        ok = *weights[section] && *scales[section] &&
+             h3_gpu_tensor_read_file_i8(*weights[section], path, offset,
+                                        elements[section], unused,
+                                        sizeof(unused));
+        offset = dit_int8_cache_align(offset + elements[section]);
+        ok = ok && h3_gpu_tensor_read_file_f32(*scales[section], path, offset,
+                                               rows[section], unused,
+                                               sizeof(unused));
+        offset = dit_int8_cache_align(offset + rows[section] * sizeof(float));
+    }
+    if (!ok) {
+        /* A truncated or unreadable cache must not be fatal: drop what was
+         * allocated and let the caller read the checkpoint instead. */
+        for (unsigned section = 0; section < 4; section++) {
+            free_tensor(weights[section]);
+            free_tensor(scales[section]);
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static int dit_int8_cache_write(int fd, uint64_t offset, const void *data,
+                                size_t bytes) {
+    const unsigned char *cursor = data;
+    while (bytes) {
+        ssize_t written = pwrite(fd, cursor, bytes, (off_t)offset);
+        if (written <= 0) return 0;
+        cursor += written;
+        offset += (uint64_t)written;
+        bytes -= (size_t)written;
+    }
+    return 1;
+}
+
+static void dit_int8_cache_store(h3_dit_block *block, unsigned index,
+                                 uint64_t key) {
+    char path[1024];
+    if (!key || !dit_int8_cache_path(path, sizeof(path), key, index)) return;
+    char temporary[1088];
+    snprintf(temporary, sizeof(temporary), "%s.tmp%d", path, (int)getpid());
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+
+    h3_gpu_tensor **weights[4], **scales[4];
+    uint64_t elements[4], rows[4];
+    dit_int8_cache_sections(block, weights, scales, elements, rows);
+    dit_int8_cache_header header;
+    memset(&header, 0, sizeof(header));
+    memcpy(header.magic, "H3DITQ\0", 7);
+    header.version = DIT_INT8_CACHE_VERSION;
+    header.block = index;
+    header.key = key;
+    for (unsigned section = 0; section < 4; section++) {
+        header.elements[section] = elements[section];
+        header.rows[section] = rows[section];
+    }
+    int ok = dit_int8_cache_write(fd, 0, &header, sizeof(header));
+    uint64_t offset = dit_int8_cache_align(sizeof(header));
+    for (unsigned section = 0; section < 4 && ok; section++) {
+        int8_t *payload = malloc(elements[section]);
+        float *scale = malloc(rows[section] * sizeof(*scale));
+        ok = payload && scale &&
+             h3_gpu_tensor_read_i8(*weights[section], payload,
+                                   elements[section]) &&
+             h3_gpu_tensor_read_f32(*scales[section], scale, rows[section]) &&
+             dit_int8_cache_write(fd, offset, payload, elements[section]);
+        offset = dit_int8_cache_align(offset + elements[section]);
+        ok = ok && dit_int8_cache_write(fd, offset, scale,
+                                        rows[section] * sizeof(*scale));
+        offset = dit_int8_cache_align(offset + rows[section] * sizeof(*scale));
+        free(payload);
+        free(scale);
+    }
+    close(fd);
+    if (!ok || rename(temporary, path) != 0) unlink(temporary);
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
+    uint64_t cache_key =
+        (!dit->ssd_streaming && dit_int8_cacheable(dit)) ? dit_int8_cache_key(dit)
+                                                         : 0;
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
         if (!dit->block_active[index]) {
             report(progress, opaque, "load transformer core", (int)index + 1,
@@ -1264,6 +1483,11 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
+        } else if (cache_key &&
+                   dit_int8_cache_load(dit, &dit->blocks[index], index,
+                                       cache_key)) {
+            if (!load_block_norms(dit, &dit->blocks[index], prefix,
+                                  error, error_size)) return 0;
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
@@ -1275,7 +1499,8 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                     error, error_size)) return 0;
             if (dit->int8_attention_out &&
                 !quantize_block_attention_out(
-                    dit, &dit->blocks[index], error, error_size)) return 0;
+                    dit, &dit->blocks[index], error, error_size))
+                return 0;
             if ((dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out) &&
                 !release_block_bf16_after_int8(dit, &dit->blocks[index])) {
                 fail(error, error_size,
@@ -1283,6 +1508,8 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      h3_gpu_error(dit->gpu));
                 return 0;
             }
+            if (cache_key)
+                dit_int8_cache_store(&dit->blocks[index], index, cache_key);
         }
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
