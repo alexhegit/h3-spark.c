@@ -30,6 +30,7 @@ h3_cuda_smoke
 h3_cuda_ops
 h3_cuda_probe
 h3_gemm_precision
+h3_sdpa_bench
 h3_cuda_dit_block_smoke
 h3_cuda_text_smoke
 h3_cuda_vision_smoke
