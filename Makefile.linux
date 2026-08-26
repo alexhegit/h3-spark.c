@@ -8,7 +8,7 @@ CUDA_LIB := /usr/local/cuda/lib64
 CFLAGS := -std=c11 -O2 -Wall -Wextra -Wpedantic -MMD -MP -I. -Ithird_party -D_GNU_SOURCE \
 	-I/usr/local/cuda/include
 NVCCFLAGS := -std=c++17 -O2 -Xcompiler -fPIC -I. \
-	-gencode arch=compute_121,code=sm_121
+	-gencode arch=compute_121,code=sm_121 $(NVCC_EXTRA)
 LDFLAGS := -L$(CUDA_LIB) -Wl,-rpath,$(CUDA_LIB) -lcudart -lcublas -lcublasLt \
 	-lstdc++ -licuuc -lm -pthread
 

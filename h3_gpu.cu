@@ -5388,6 +5388,22 @@ h3_sdpa_f32_wave_d64_q4_kernel(const float *query, const float *key,
  * accumulate in F32. */
 enum { H3_MMA_F32_M = 64u, H3_MMA_F32_N = 64u, H3_MMA_F32_LD = 72u };
 
+/* Each block re-reads its head's whole K and V, so the row tile sets how many
+ * times that traffic is paid: at M=64 a 1797-row head needs 29 blocks and the
+ * video VAE's attention moves 854 MB per call. Widening the tile costs warps,
+ * not registers or shared memory, because a warp owns 16 rows either way. */
+#ifndef H3_MMA_F32_WARPS
+#define H3_MMA_F32_WARPS 8u
+#endif
+#define H3_MMA_F32_ROWS (H3_MMA_F32_WARPS * 16u)
+#define H3_MMA_F32_THREADS (H3_MMA_F32_WARPS * 32u)
+/* Big enough for the four K/V tiles, or for Q's two halves, whichever wants
+ * more: past eight warps the row tile is the larger of the two. */
+#define H3_MMA_F32_SHARED                                                      \
+    (4u * H3_MMA_F32_N > 2u * H3_MMA_F32_ROWS                                  \
+         ? 4u * H3_MMA_F32_N * H3_MMA_F32_LD                                   \
+         : 2u * H3_MMA_F32_ROWS * H3_MMA_F32_LD)
+
 /* One FP16 keeps 11 bits of mantissa, which leaves the scores about 0.4% off an
  * exact F32 dot product — fine for the DiT, whose inputs are BF16 anyway, but
  * this attention is the only 16-bit step in an otherwise F32 decoder. So each
@@ -5411,23 +5427,28 @@ __device__ __forceinline__ static uint32_t h3_pack_f16_lo_pair(float low,
     return h3_pack_f16_pair(low_residual, high_residual);
 }
 
-__global__ __launch_bounds__(128) static void h3_sdpa_f32_mma_d64_kernel(
+__global__ __launch_bounds__(H3_MMA_F32_THREADS) static void
+h3_sdpa_f32_mma_d64_kernel(
     const float *__restrict__ query, const float *__restrict__ key,
     const float *__restrict__ value, float *__restrict__ output,
     h3_sdpa_args args) {
-    __shared__ uint16_t k_tile[H3_MMA_F32_N * H3_MMA_F32_LD];
-    __shared__ uint16_t k_low_tile[H3_MMA_F32_N * H3_MMA_F32_LD];
-    __shared__ uint16_t v_tile[H3_MMA_F32_N * H3_MMA_F32_LD];
-    __shared__ uint16_t v_low_tile[H3_MMA_F32_N * H3_MMA_F32_LD];
+    /* One block of shared memory carved into the four K/V tiles, so that Q can
+     * borrow it in halves: at H3_MMA_F32_WARPS=8 each Q half needs two tiles'
+     * worth of rows, which separate arrays could not guarantee were adjacent. */
+    __shared__ uint16_t tiles[H3_MMA_F32_SHARED];
+    uint16_t *k_tile = tiles;
+    uint16_t *k_low_tile = tiles + H3_MMA_F32_N * H3_MMA_F32_LD;
+    uint16_t *v_tile = tiles + 2u * H3_MMA_F32_N * H3_MMA_F32_LD;
+    uint16_t *v_low_tile = tiles + 3u * H3_MMA_F32_N * H3_MMA_F32_LD;
     /* Q is read into fragments before the loop's first barrier, so its two
-     * halves borrow the V and low-K tiles. */
-    uint16_t *q_tile = v_tile;
-    uint16_t *q_low_tile = k_low_tile;
+     * halves borrow the K and V tiles. */
+    uint16_t *q_tile = tiles;
+    uint16_t *q_low_tile = tiles + H3_MMA_F32_ROWS * H3_MMA_F32_LD;
 
     const uint32_t sequence = args.sequence;
     const uint32_t heads = args.heads;
     const uint32_t head = (uint32_t)blockIdx.y;
-    const uint32_t m0 = (uint32_t)blockIdx.x * H3_MMA_F32_M;
+    const uint32_t m0 = (uint32_t)blockIdx.x * H3_MMA_F32_ROWS;
     const uint32_t tid = (uint32_t)threadIdx.x;
     const uint32_t warp = tid >> 5u;
     const uint32_t lane = tid & 31u;
@@ -5436,7 +5457,8 @@ __global__ __launch_bounds__(128) static void h3_sdpa_f32_mma_d64_kernel(
     const uint32_t row_a = warp * 16u + group;
     const uint32_t row_b = row_a + 8u;
 
-    for (uint32_t i = tid; i < H3_MMA_F32_M * 32u; i += 128u) {
+    for (uint32_t i = tid; i < H3_MMA_F32_ROWS * 32u;
+         i += H3_MMA_F32_THREADS) {
         uint32_t row = i >> 5u;
         uint32_t column = (i & 31u) * 2u;
         uint32_t packed = 0;
@@ -5486,7 +5508,8 @@ __global__ __launch_bounds__(128) static void h3_sdpa_f32_mma_d64_kernel(
 
     for (uint32_t n0 = 0; n0 < sequence; n0 += H3_MMA_F32_N) {
         __syncthreads();
-        for (uint32_t i = tid; i < H3_MMA_F32_N * 32u; i += 128u) {
+        for (uint32_t i = tid; i < H3_MMA_F32_N * 32u;
+             i += H3_MMA_F32_THREADS) {
             uint32_t row = i >> 5u;
             uint32_t column = (i & 31u) * 2u;
             uint32_t packed_k = 0;
@@ -5680,8 +5703,9 @@ int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     int ok = 1;
     if (head_dim == 64u && !h3_env_on("H3_SDPA_F32_WAVE") &&
         !h3_env_on("H3_SDPA_PARALLEL") && !h3_env_on("H3_SDPA_WAVE_OFF")) {
-        dim3 blocks((sequence + H3_MMA_F32_M - 1u) / H3_MMA_F32_M, heads, 1);
-        dim3 threads(128, 1, 1);
+        dim3 blocks((sequence + H3_MMA_F32_ROWS - 1u) / H3_MMA_F32_ROWS, heads,
+                    1);
+        dim3 threads(H3_MMA_F32_THREADS, 1, 1);
         h3_sdpa_f32_mma_d64_kernel<<<blocks, threads, 0, gpu->stream>>>(
             (const float *)query->device, (const float *)key->device,
             (const float *)value->device, (float *)output->device, args);

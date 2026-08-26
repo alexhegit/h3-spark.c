@@ -2572,3 +2572,59 @@ so it is not paying for itself in `cuLibraryLoadData`.
 
 Warm steady state after these runs is **16.5 s**.
 
+## KEEP widening the F32 attention's row tile to eight warps
+
+The video VAE's attention was the one line item left unexplained: 615 ms over
+144 calls, and an earlier attempt to price it derived 98 TFLOP/s, which F32 data
+cannot reach. That arithmetic was wrong because the shape was. The decoder works
+in `TILE_PIXELS = 256` tiles at `SPATIAL_RATIO = 16`, so a 512×512 frame is 2×2
+tiles of 18×18 latents, and the sequence is 7 × 18 × 18 + `SUFFIX` = **2273**,
+not the 7173 a full-frame latent would give. 36 layers × 4 tiles = the 144 calls.
+`grid=36x32` from the kernel trace confirms it: 36 row blocks of 64, 32 heads.
+
+Three ablations, cheapest first. **The MMA count is free.** Q·K is
+hi·hi + hi·lo + lo·hi and P·V is the same — the comment claiming P·V stays single
+FP16 is stale — so dropping two of Q·K's three halves the score matmul:
+
+| | sdpa | phase |
+|---|----:|----:|
+| as shipped | 0.622 s | 2.788 s |
+| two of three Q·K MMAs removed | 0.625 s | 2.790 s |
+| whole hi/lo scheme removed, both matmuls | 0.604 s | 2.816 s |
+
+Removing the *entire* split — every residual pack, four of six MMAs — buys 32 ms
+of 636. So **you cannot buy speed with decode quality here**: ~22 bits of score
+precision costs 5 %, and that line of enquiry is closed, not deferred.
+
+What did cost was traffic. Every block walks its head's whole K and V, so the
+row tile sets how many times that is paid: at M=64 a 2273-row head takes 36
+blocks, and a warp owns 16 rows either way, so a wider tile costs warps rather
+than registers or shared memory. Eight warps halves the block count:
+
+| | sdpa | phase | e2e |
+|---|----:|----:|----:|
+| 4 warps, M=64 | 0.635 / 0.633 s | 2.813 / 2.816 s | 16.47 s |
+| 8 warps, M=128 | 0.320 / 0.320 s | 2.536 / 2.528 s | 16.25 s |
+
+**1.98×, and bit-identical** — `f5282774d3a4` either way, because grouping more
+rows into a block changes no row's accumulation order. Q's staging has to be
+re-laid-out for it: it borrowed the V and low-K tiles, which only hold 64 rows,
+so the four tiles become one carved buffer and Q takes it in halves.
+
+Two traps worth recording. The first measurement of this said 0.631 vs 0.630 s —
+a clean null — because `make h3 NVCC_EXTRA=-DH3_MMA_F32_WARPS=8u` does not
+rebuild `h3_gpu.o` when only the flag changed, so both arms ran the 4-warp
+binary. Checking `blockX` in the kernel trace is what caught it; **an ablation
+that changes launch geometry has to be verified in the trace, not the wall.**
+The second: 12 and 16 warps do not build. Q's two halves want
+2 × ROWS × LD, which passes 48 KB of static shared memory at 12 warps
+(`uses too much shared data (0xd800 bytes, 0xc000 max)`), and a failed build
+silently leaves the previous binary in place to be measured again.
+
+So eight warps is the ceiling until Q stops being staged through shared memory
+at all — each thread's fragment rows are known, so it could load them straight
+from global and leave the buffer to K/V, which would allow 16 warps and halve
+the traffic again. That is the open end here.
+
+e2e is **16.25 s**, 3.5× off the 56.3 s this started at.
+
