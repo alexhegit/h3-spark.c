@@ -2712,3 +2712,45 @@ the record is cleared on entry to every GEMM and the consumer checks that it
 matches its own shape, so a consumer that asks to fuse when the producer took a
 different path falls back to reading BF16 instead of reading stale memory.
 
+### KEEP transposing the Conv1d weight to `[ic][k][oc]`
+
+The register-blocked kernel's input read is a warp-wide broadcast, but its
+weight read is not. Consecutive threads walk output channels, and in the
+checkpoint's `[oc][ic][k]` layout those sit a full `ic*k` stride apart, so every
+lane pulls its own 32-byte sector to use 4 bytes of it. That eightfold waste is
+not part of the 341 GB — it *is* the 341 GB: `8 × Σ(out_len × oc × ic × k)`
+comes to 341 GB exactly, so the entire excess traffic is this one access
+pattern.
+
+Transposed to `[ic][k][oc]` the output channels are adjacent, one `float4` per
+thread covers the block's four, and a warp's loads coalesce into contiguous
+lines. Same values, same `fmaf` order over ic then k, so only the address
+arithmetic moves:
+
+| | conv | audio VAE phase |
+|---|---:|---:|
+| `[oc][ic][k]` | 0.179, 0.178 s | 0.298, 0.295 s |
+| `[ic][k][oc]` | 0.092, 0.093 s | 0.208, 0.213 s |
+
+1.93×, and md5 unchanged.
+
+The transpose is rebuilt per call into one grown-on-demand scratch buffer, which
+is not the obvious choice and is the point worth recording. Keying a cache on
+the weight's device pointer looks free and is wrong: the VAE streams its
+weights, so the allocator hands a later layer the address a freed one had, and
+the cache returns a filter transposed for a different shape. That is what
+happened — 127 of 128 convolutions matched bit for bit and the last one differed
+in every single element. Rebuilding costs two passes over ~46 MB across the whole
+decode, well under a millisecond, against the 86 ms the layout wins.
+
+Worth noting how cheaply this was caught: running both kernels into separate
+buffers and printing per-call shape and mismatch count named the failing
+convolution and its exact shape on the first try, where the md5 alone said only
+that something among 128 calls was wrong. The unit tests passed throughout —
+their conv shapes are too small to reach the blocked path at all.
+
+e2e is **15.5 s** (15.40, 15.49, 15.57), 3.6× off the 56.3 s this started at. The
+two fusions above are worth 0.19 s between them at the phase level, and the e2e
+mean moved from 15.91 s to 15.72 s — the same 0.19 s. Run-to-run spread is now
+wider than either individual change, which is why both were accepted on paired
+phase measurements rather than on wall time.

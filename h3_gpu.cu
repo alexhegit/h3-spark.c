@@ -77,6 +77,15 @@ struct h3_gpu {
     const float *int8_defer_weight_scales;
     uint32_t int8_defer_rows;
     uint32_t int8_defer_columns;
+    /* Scratch for the Conv1d weight transposed to [ic][k][oc], the layout that
+     * makes the weight read coalesce. Rebuilt per call rather than cached by
+     * source pointer: the VAE streams its weights, so the allocator hands the
+     * same address to a later layer with a different shape and a pointer-keyed
+     * cache silently returns the wrong filter. Transposing costs about two
+     * passes over 46 MB across the whole decode, which the layout wins back
+     * many times over. */
+    void *conv_weight_scratch;
+    size_t conv_weight_scratch_bytes;
     uint64_t int8_cublas_ok;
     uint64_t int8_naive_fallback;
     h3_gpu_tensor *ws_mlp_fc1;
@@ -491,6 +500,9 @@ void h3_gpu_free(h3_gpu *gpu) {
     h3_gpu_tensor_free(gpu->ws_adaln);
     gpu->ws_mlp_fc1 = gpu->ws_mlp_hidden = gpu->ws_qkv = NULL;
     gpu->ws_int8_fc1 = gpu->ws_adaln = NULL;
+    if (gpu->conv_weight_scratch) cudaFree(gpu->conv_weight_scratch);
+    gpu->conv_weight_scratch = NULL;
+    gpu->conv_weight_scratch_bytes = 0;
     if (gpu->int8_accum) cudaFree(gpu->int8_accum);
     for (int i = 0; i < H3_STAGE_SLOTS; i++) {
         if (gpu->stage_event_recorded[i] && gpu->stage_copied[i])
@@ -5937,6 +5949,98 @@ __global__ static void h3_conv1d_f32_blocked_kernel(const float *input,
     }
 }
 
+/* The blocked kernel's input read is a warp-wide broadcast, but its weight read
+ * is not: consecutive threads walk output channels, and in the checkpoint's
+ * [oc][ic][k] layout those are a full ic*k stride apart, so each lane pulls its
+ * own 32-byte sector to use 4 bytes of it. That eightfold waste is the whole
+ * 341 GB the audio VAE issues to do 85 GFLOP. Transposed to [ic][k][oc] the
+ * output channels are adjacent, one float4 per thread covers the block's four,
+ * and a warp's loads coalesce into contiguous lines.
+ *
+ * Same values, same fmaf order over ic then k, so every output keeps its bits;
+ * only the address arithmetic moves. */
+__global__ static void h3_conv1d_weight_transpose_kernel(
+    const float *source, float *destination, uint32_t output_channels,
+    uint32_t input_channels, uint32_t kernel) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)output_channels * input_channels * kernel;
+    if (index >= total) return;
+    uint32_t k = (uint32_t)(index % kernel);
+    size_t rest = index / kernel;
+    uint32_t ic = (uint32_t)(rest % input_channels);
+    uint32_t oc = (uint32_t)(rest / input_channels);
+    destination[((size_t)ic * kernel + k) * output_channels + oc] =
+        source[index];
+}
+
+__global__ static void h3_conv1d_f32_coalesced_kernel(const float *input,
+                                                      const float *weight,
+                                                      const float *bias,
+                                                      float *output,
+                                                      h3_conv1d_args args) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t channel_groups = args.output_channels / 4u;
+    uint32_t time_groups =
+        (args.output_length + H3_CONV1D_TIME_BLOCK - 1u) / H3_CONV1D_TIME_BLOCK;
+    size_t total = (size_t)args.batch * time_groups * channel_groups;
+    if (index >= total) return;
+    uint32_t channel_group = (uint32_t)(index % channel_groups);
+    size_t rest = index / channel_groups;
+    uint32_t time_group = (uint32_t)(rest % time_groups);
+    uint32_t batch = (uint32_t)(rest / time_groups);
+    uint32_t oc0 = channel_group * 4u;
+    uint32_t t0 = time_group * H3_CONV1D_TIME_BLOCK;
+
+    float acc[4][H3_CONV1D_TIME_BLOCK];
+    float4 base4 = args.has_bias ? *(const float4 *)(bias + oc0)
+                                 : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float base[4] = {base4.x, base4.y, base4.z, base4.w};
+#pragma unroll
+    for (uint32_t c = 0; c < 4u; c++)
+#pragma unroll
+        for (uint32_t t = 0; t < H3_CONV1D_TIME_BLOCK; t++)
+            acc[c][t] = base[c];
+
+    for (uint32_t ic = 0; ic < args.input_channels; ic++) {
+        for (uint32_t k = 0; k < args.kernel; k++) {
+            float in_value[H3_CONV1D_TIME_BLOCK];
+#pragma unroll
+            for (uint32_t t = 0; t < H3_CONV1D_TIME_BLOCK; t++) {
+                in_value[t] = 0.0f;
+                uint32_t t_out = t0 + t;
+                if (t_out >= args.output_length) continue;
+                int32_t t_in = (int32_t)t_out * (int32_t)args.stride -
+                               (int32_t)args.padding +
+                               (int32_t)k * (int32_t)args.dilation;
+                if (t_in < 0 || t_in >= (int32_t)args.length) continue;
+                in_value[t] = input[((size_t)batch * args.length +
+                                     (size_t)t_in) *
+                                        args.input_channels +
+                                    ic];
+            }
+            float4 w4 = *(const float4 *)(
+                weight + ((size_t)ic * args.kernel + k) * args.output_channels +
+                oc0);
+            const float w[4] = {w4.x, w4.y, w4.z, w4.w};
+#pragma unroll
+            for (uint32_t c = 0; c < 4u; c++)
+#pragma unroll
+                for (uint32_t t = 0; t < H3_CONV1D_TIME_BLOCK; t++)
+                    acc[c][t] = fmaf(in_value[t], w[c], acc[c][t]);
+        }
+    }
+
+#pragma unroll
+    for (uint32_t t = 0; t < H3_CONV1D_TIME_BLOCK; t++) {
+        uint32_t t_out = t0 + t;
+        if (t_out >= args.output_length) continue;
+        float4 out4 = make_float4(acc[0][t], acc[1][t], acc[2][t], acc[3][t]);
+        *(float4 *)(output + ((size_t)batch * args.output_length + t_out) *
+                                 args.output_channels +
+                             oc0) = out4;
+    }
+}
+
 __global__ static void h3_conv1d_f32_kernel(const float *input,
                                             const float *weight,
                                             const float *bias, float *output,
@@ -5965,6 +6069,34 @@ __global__ static void h3_conv1d_f32_kernel(const float *input,
         }
     }
     output[index] = acc;
+}
+
+/* Transposes the weight into scratch and returns it, or NULL to let the caller
+ * fall back to the [oc][ic][k] kernel. */
+static const float *h3_conv1d_weight_transposed(h3_gpu *gpu,
+                                                const float *source,
+                                                uint32_t output_channels,
+                                                uint32_t input_channels,
+                                                uint32_t kernel) {
+    size_t count = (size_t)output_channels * input_channels * kernel;
+    size_t bytes = count * sizeof(float);
+    if (gpu->conv_weight_scratch_bytes < bytes) {
+        if (gpu->conv_weight_scratch) cudaFree(gpu->conv_weight_scratch);
+        gpu->conv_weight_scratch = NULL;
+        gpu->conv_weight_scratch_bytes = 0;
+        if (cudaMalloc(&gpu->conv_weight_scratch, bytes) != cudaSuccess) {
+            gpu->conv_weight_scratch = NULL;
+            return NULL;
+        }
+        gpu->conv_weight_scratch_bytes = bytes;
+    }
+    unsigned threads = 256;
+    unsigned blocks = (unsigned)((count + threads - 1) / threads);
+    h3_conv1d_weight_transpose_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        source, (float *)gpu->conv_weight_scratch, output_channels,
+        input_channels, kernel);
+    if (cudaGetLastError() != cudaSuccess) return NULL;
+    return (const float *)gpu->conv_weight_scratch;
 }
 
 static int h3_gpu_conv1d_impl(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -6007,7 +6139,27 @@ static int h3_gpu_conv1d_impl(h3_gpu *gpu, h3_gpu_tensor *output,
     /* Blocking costs 16x the parallelism, so it only pays while there is still
      * enough of it to fill the device. H3_DISABLE_CONV1D_BLOCK=1 forces the
      * one-output-per-thread kernel. */
-    if (blocked_threads >= 4096u && !h3_env_on("H3_DISABLE_CONV1D_BLOCK")) {
+    const float *transposed = NULL;
+    if (blocked_threads >= 4096u && (output_channels % 4u) == 0u &&
+        H3_CONV1D_CHANNEL_BLOCK == 4u && !h3_env_on("H3_DISABLE_CONV1D_BLOCK") &&
+        !h3_env_on("H3_DISABLE_CONV1D_COALESCED"))
+        transposed = h3_conv1d_weight_transposed(
+            gpu, (const float *)weight->device, output_channels,
+            input_channels, kernel);
+    if (transposed) {
+        size_t coalesced_threads =
+            (size_t)batch *
+            ((output_length + H3_CONV1D_TIME_BLOCK - 1u) /
+             H3_CONV1D_TIME_BLOCK) *
+            (output_channels / 4u);
+        unsigned blocks =
+            (unsigned)((coalesced_threads + threads - 1) / threads);
+        h3_conv1d_f32_coalesced_kernel<<<blocks, threads, 0, gpu->stream>>>(
+            (const float *)input->device, transposed,
+            bias ? (const float *)bias->device : NULL,
+            (float *)output->device, args);
+    } else if (blocked_threads >= 4096u &&
+               !h3_env_on("H3_DISABLE_CONV1D_BLOCK")) {
         unsigned blocks =
             (unsigned)((blocked_threads + threads - 1) / threads);
         h3_conv1d_f32_blocked_kernel<<<blocks, threads, 0, gpu->stream>>>(
