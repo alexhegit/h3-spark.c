@@ -1581,6 +1581,61 @@ static int h3_lt_ensure(h3_gpu *gpu) {
     return 1;
 }
 
+/* How many of cuBLASLt's ranked candidates to actually time. Six covers the
+ * spread seen on the video VAE's four shapes without making the one-time cost
+ * visible. */
+#define H3_LT_CANDIDATES 6
+
+/* Times each candidate on the real operands and returns the fastest. The
+ * output is left holding a garbage product, so the caller must run the winner
+ * afterwards — which it does anyway. */
+static int h3_lt_time_candidates(h3_gpu *gpu, cublasLtMatmulDesc_t desc,
+                                 cublasLtMatrixLayout_t la,
+                                 cublasLtMatrixLayout_t lb,
+                                 cublasLtMatrixLayout_t lc, const void *a,
+                                 const void *b, void *d,
+                                 cublasLtMatmulHeuristicResult_t *results,
+                                 int count) {
+    if (count <= 1 || h3_env_on("H3_DISABLE_LT_AUTOTUNE")) return 0;
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cudaEvent_t start, stop;
+    if (cudaEventCreate(&start) != cudaSuccess) return 0;
+    if (cudaEventCreate(&stop) != cudaSuccess) {
+        cudaEventDestroy(start);
+        return 0;
+    }
+    int best = 0;
+    float best_ms = 0.0f;
+    for (int index = 0; index < count; index++) {
+        /* One warm run so the first candidate is not charged for whatever the
+         * stream was doing, then one timed run. */
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass == 1) cudaEventRecord(start, gpu->stream);
+            if (cublasLtMatmul(gpu->lt, desc, &alpha, a, la, b, lb, &beta, d,
+                               lc, d, lc, &results[index].algo,
+                               gpu->lt_workspace, gpu->lt_workspace_bytes,
+                               gpu->stream) != CUBLAS_STATUS_SUCCESS) {
+                best_ms = best_ms > 0.0f ? best_ms : 0.0f;
+                goto next;
+            }
+        }
+        cudaEventRecord(stop, gpu->stream);
+        if (cudaEventSynchronize(stop) == cudaSuccess) {
+            float elapsed = 0.0f;
+            if (cudaEventElapsedTime(&elapsed, start, stop) == cudaSuccess &&
+                elapsed > 0.0f && (best_ms == 0.0f || elapsed < best_ms)) {
+                best_ms = elapsed;
+                best = index;
+            }
+        }
+    next:;
+    }
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return best;
+}
+
 static int h3_linear_f32_bias_fused(h3_gpu *gpu, h3_gpu_tensor *output,
                                     const h3_gpu_tensor *input,
                                     const h3_gpu_tensor *weight,
@@ -1629,7 +1684,7 @@ static int h3_linear_f32_bias_fused(h3_gpu *gpu, h3_gpu_tensor *output,
         }
         if (plan && !plan->valid) {
             cublasLtMatmulPreference_t preference = NULL;
-            cublasLtMatmulHeuristicResult_t result;
+            cublasLtMatmulHeuristicResult_t results[H3_LT_CANDIDATES];
             int found = 0;
             if (cublasLtMatmulPreferenceCreate(&preference) ==
                 CUBLAS_STATUS_SUCCESS) {
@@ -1637,12 +1692,21 @@ static int h3_linear_f32_bias_fused(h3_gpu *gpu, h3_gpu_tensor *output,
                     preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                     &gpu->lt_workspace_bytes,
                     sizeof(gpu->lt_workspace_bytes));
-                if (cublasLtMatmulAlgoGetHeuristic(gpu->lt, desc, la, lb, lc,
-                                                   lc, preference, 1, &result,
-                                                   &found) ==
+                if (cublasLtMatmulAlgoGetHeuristic(
+                        gpu->lt, desc, la, lb, lc, lc, preference,
+                        H3_LT_CANDIDATES, results, &found) ==
                         CUBLAS_STATUS_SUCCESS &&
                     found > 0) {
-                    plan->algo = result.algo;
+                    /* The heuristic's own ranking is not reliable here: asking
+                     * for a different compute type on the video VAE's shapes
+                     * made it pick a tiling that ran 16% faster for the same
+                     * TF32 math. Every shape that reaches this cache is used
+                     * ~144 times in a decode, so timing the candidates once is
+                     * cheap against getting the order wrong 144 times. */
+                    int best = h3_lt_time_candidates(
+                        gpu, desc, la, lb, lc, weight->device, input->device,
+                        output->device, results, found);
+                    plan->algo = results[best].algo;
                     plan->rows = (int)rows;
                     plan->input_dim = (int)input_dim;
                     plan->output_dim = (int)output_dim;

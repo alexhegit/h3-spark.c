@@ -2352,3 +2352,28 @@ loads anything), and the win lands where the loading is. Output md5 is
 `f5282774d3a4` — the same bytes as before, because nothing about the data
 changed, only who owns the buffer it lands in.
 
+## KEEP timing cuBLASLt's candidates for the F32 GEMM
+
+The biased F32 linear asked `cublasLtMatmulAlgoGetHeuristic` for one result and
+used it. Asking the same call for `CUBLAS_COMPUTE_32F_FAST_16BF` instead of
+`..._FAST_TF32` exposed the problem: cuBLAS returned *TF32* kernels either way —
+still `s1688gemm`, the m16n8k8 instruction — but under the BF16 request it chose
+128x256 and 128x128x32 tiles instead of 256x128 and 256x64, and ran 0.18 s
+faster for identical output bits. Identical is expected: these GEMMs do not
+split K, so tile shape cannot change the order a dot product accumulates in.
+
+So the ranking, not the math, was wrong. The plan cache is per shape and the
+video VAE uses each of its four shapes 144 times per decode, so timing six
+candidates once and keeping the winner is cheap against getting the order wrong
+144 times:
+
+| video VAE | linear | phase |
+|---|----:|----:|
+| first heuristic result (`H3_DISABLE_LT_AUTOTUNE=1`) | 1.616 s | 3.041 s |
+| fastest of six timed | 1.391 s | 2.835 s |
+
+Do not read this off the e2e wall: at ±0.15 s of run-to-run spread the two arms
+overlap, and the arm with the slower VAE measured the faster wall. The gpu-op
+accumulators separate cleanly and repeatably (1.614/1.616/1.622 s against
+1.559/1.371/1.391 s).
+
