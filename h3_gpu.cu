@@ -5818,6 +5818,101 @@ struct h3_conv1d_args {
     uint32_t has_bias;
 };
 
+/* One thread per output element costs two global loads per FMA, and the audio
+ * VAE's 122 convolutions issue 341 GB of them to do 85 GFLOP of work — 0.18
+ * TFLOP/s against an FP32 roof of ~31, with both roofs putting the whole decode
+ * near 3 ms rather than 478. The loads are the entire cost, so each thread takes
+ * a 4x4 block of (time, output channel) instead: one weight load now feeds four
+ * outputs and one input load feeds four channels, which is a quarter of the
+ * loads per FMA. The accumulation stays fmaf over ic then k, ascending, so every
+ * output lands on the same bits as before.
+ *
+ * 4x4 is the measured optimum: 8x4 and 4x8 give up 0.013 s and 8x8 gives up
+ * 0.073 s, because blocking trades parallelism for reuse and the later stages
+ * run only 8 or 16 channels wide. */
+#ifndef H3_CONV1D_TIME_BLOCK
+#define H3_CONV1D_TIME_BLOCK 4u
+#endif
+#ifndef H3_CONV1D_CHANNEL_BLOCK
+#define H3_CONV1D_CHANNEL_BLOCK 4u
+#endif
+
+__global__ static void h3_conv1d_f32_blocked_kernel(const float *input,
+                                                    const float *weight,
+                                                    const float *bias,
+                                                    float *output,
+                                                    h3_conv1d_args args) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t channel_groups =
+        (args.output_channels + H3_CONV1D_CHANNEL_BLOCK - 1u) /
+        H3_CONV1D_CHANNEL_BLOCK;
+    uint32_t time_groups =
+        (args.output_length + H3_CONV1D_TIME_BLOCK - 1u) / H3_CONV1D_TIME_BLOCK;
+    size_t total = (size_t)args.batch * time_groups * channel_groups;
+    if (index >= total) return;
+    /* Consecutive threads walk output channels so that the input load below is
+     * one broadcast across the warp. */
+    uint32_t channel_group = (uint32_t)(index % channel_groups);
+    size_t rest = index / channel_groups;
+    uint32_t time_group = (uint32_t)(rest % time_groups);
+    uint32_t batch = (uint32_t)(rest / time_groups);
+    uint32_t oc0 = channel_group * H3_CONV1D_CHANNEL_BLOCK;
+    uint32_t t0 = time_group * H3_CONV1D_TIME_BLOCK;
+
+    float acc[H3_CONV1D_CHANNEL_BLOCK][H3_CONV1D_TIME_BLOCK];
+#pragma unroll
+    for (uint32_t c = 0; c < H3_CONV1D_CHANNEL_BLOCK; c++) {
+        float base = args.has_bias && oc0 + c < args.output_channels
+                         ? bias[oc0 + c]
+                         : 0.0f;
+#pragma unroll
+        for (uint32_t t = 0; t < H3_CONV1D_TIME_BLOCK; t++) acc[c][t] = base;
+    }
+
+    for (uint32_t ic = 0; ic < args.input_channels; ic++) {
+        for (uint32_t k = 0; k < args.kernel; k++) {
+            float in_value[H3_CONV1D_TIME_BLOCK];
+#pragma unroll
+            for (uint32_t t = 0; t < H3_CONV1D_TIME_BLOCK; t++) {
+                in_value[t] = 0.0f;
+                uint32_t t_out = t0 + t;
+                if (t_out >= args.output_length) continue;
+                int32_t t_in = (int32_t)t_out * (int32_t)args.stride -
+                               (int32_t)args.padding +
+                               (int32_t)k * (int32_t)args.dilation;
+                if (t_in < 0 || t_in >= (int32_t)args.length) continue;
+                in_value[t] = input[((size_t)batch * args.length +
+                                     (size_t)t_in) *
+                                        args.input_channels +
+                                    ic];
+            }
+#pragma unroll
+            for (uint32_t c = 0; c < H3_CONV1D_CHANNEL_BLOCK; c++) {
+                if (oc0 + c >= args.output_channels) continue;
+                float w = weight[((size_t)(oc0 + c) * args.input_channels + ic) *
+                                     args.kernel +
+                                 k];
+#pragma unroll
+                for (uint32_t t = 0; t < H3_CONV1D_TIME_BLOCK; t++)
+                    acc[c][t] = fmaf(in_value[t], w, acc[c][t]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (uint32_t c = 0; c < H3_CONV1D_CHANNEL_BLOCK; c++) {
+        if (oc0 + c >= args.output_channels) continue;
+#pragma unroll
+        for (uint32_t t = 0; t < H3_CONV1D_TIME_BLOCK; t++) {
+            uint32_t t_out = t0 + t;
+            if (t_out >= args.output_length) continue;
+            output[((size_t)batch * args.output_length + t_out) *
+                       args.output_channels +
+                   oc0 + c] = acc[c][t];
+        }
+    }
+}
+
 __global__ static void h3_conv1d_f32_kernel(const float *input,
                                             const float *weight,
                                             const float *bias, float *output,
@@ -5880,12 +5975,28 @@ static int h3_gpu_conv1d_impl(h3_gpu *gpu, h3_gpu_tensor *output,
                            stride,        padding,        dilation,
                            bias ? 1u : 0u};
     unsigned threads = 256;
-    unsigned blocks =
-        (unsigned)((output_count + threads - 1) / threads);
-    h3_conv1d_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
-        (const float *)input->device, (const float *)weight->device,
-        bias ? (const float *)bias->device : NULL, (float *)output->device,
-        args);
+    size_t blocked_threads =
+        (size_t)batch *
+        ((output_length + H3_CONV1D_TIME_BLOCK - 1u) / H3_CONV1D_TIME_BLOCK) *
+        ((output_channels + H3_CONV1D_CHANNEL_BLOCK - 1u) /
+         H3_CONV1D_CHANNEL_BLOCK);
+    /* Blocking costs 16x the parallelism, so it only pays while there is still
+     * enough of it to fill the device. H3_DISABLE_CONV1D_BLOCK=1 forces the
+     * one-output-per-thread kernel. */
+    if (blocked_threads >= 4096u && !h3_env_on("H3_DISABLE_CONV1D_BLOCK")) {
+        unsigned blocks =
+            (unsigned)((blocked_threads + threads - 1) / threads);
+        h3_conv1d_f32_blocked_kernel<<<blocks, threads, 0, gpu->stream>>>(
+            (const float *)input->device, (const float *)weight->device,
+            bias ? (const float *)bias->device : NULL,
+            (float *)output->device, args);
+    } else {
+        unsigned blocks = (unsigned)((output_count + threads - 1) / threads);
+        h3_conv1d_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+            (const float *)input->device, (const float *)weight->device,
+            bias ? (const float *)bias->device : NULL,
+            (float *)output->device, args);
+    }
     gpu->stats.mps_conv_dispatches++;
     int conv_ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_conv1d_f32");
     h3_gpu_op_end(gpu);

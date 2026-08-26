@@ -2628,3 +2628,48 @@ the traffic again. That is the open end here.
 
 e2e is **16.25 s**, 3.5× off the 56.3 s this started at.
 
+## KEEP a 4×4 register block in the audio VAE's Conv1d
+
+This kernel had never been looked at, and pricing it before touching it was the
+whole trick. Instrumenting the launch gives the 122 real shapes — seven stages of
+`b=2` with channels doubling from 8 to 512 as the length halves from 29600 to 185,
+kernels of 3, 7 and 11 — and from those the roofs:
+
+| | |
+|---|----:|
+| total work | 85.3 GFLOP |
+| measured | 477.7 ms |
+| achieved | **0.18 TFLOP/s** against an FP32 roof of ~31 |
+| traffic if each value were read once | 0.65 GB, i.e. 1.4 GB/s of ~273 |
+| loads actually issued | 341 GB — **525×** the ideal |
+| floor if compute-bound (31 TFLOP/s) | 2.8 ms |
+| floor if traffic-bound (250 GB/s) | 2.6 ms |
+
+Both roofs say ~3 ms and the kernel took 478. Nothing about the convolution is
+expensive; the schedule was. One thread per output element means two global loads
+per FMA — 85.3 G loads, about 178 G/s, near the rate the device can issue them —
+and consecutive lanes walk output channels while the weight index strides by
+`ic*k`, so each 4-byte weight drags in its own 32-byte sector.
+
+Both problems are the same problem: nothing is reused. Giving each thread a 4×4
+block of (time, output channel) makes one weight load feed four outputs and one
+input load feed four channels, taking loads per FMA from 2 to 0.5:
+
+| | conv | phase | e2e |
+|---|----:|------:|----:|
+| one output per thread | 0.498 s | 0.614 s | 16.10 s |
+| 4×4 register block | 0.178 s | 0.294 s | 15.80 s |
+
+**2.8×, bit-identical.** Exactness is not luck: the accumulation stays `fmaf`
+over `ic` then `k` ascending, so each output sums in the order it always did.
+Out-of-range taps now multiply by a zeroed operand instead of skipping, which is
+the same bits for finite weights.
+
+Bigger blocks are worse — 8×4 and 4×8 lose 0.013 s, 8×8 loses 0.073 s — because
+blocking pays 16× parallelism for its reuse and the last stages are only 8 or 16
+channels wide. All four configurations produce identical output, which is the
+check that blocking is not what makes it exact.
+
+At 0.178 s this is still 60× off the roof and still load-bound, now at ~120 G
+loads/s.
+
