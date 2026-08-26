@@ -434,6 +434,42 @@ h3_gpu *h3_gpu_create(const char *shader_source_path, char *error,
     return gpu;
 }
 
+/* Page-locking runs at roughly 1.5 GB/s, so one h3_gpu's four 128 MiB slots
+ * cost about a third of a second, and a generation builds four contexts in
+ * sequence — text encoder, DiT, audio VAE, video VAE — paying it every time.
+ * cudaFreeHost is not free either, at ~28 ms a slot. The slots are all the same
+ * size and no two contexts hold them at once, so a retired one goes back to a
+ * process-wide pool and the next context takes it as-is. Only the first context
+ * of a run pays the pinning cost. */
+static struct {
+    void *slots[H3_STAGE_SLOTS];
+    size_t bytes;
+    unsigned count;
+    pthread_mutex_t lock;
+} h3_stage_pool = {{NULL}, 0, 0, PTHREAD_MUTEX_INITIALIZER};
+
+static void *h3_stage_pool_take(size_t bytes) {
+    void *slot = NULL;
+    pthread_mutex_lock(&h3_stage_pool.lock);
+    if (h3_stage_pool.bytes == bytes && h3_stage_pool.count)
+        slot = h3_stage_pool.slots[--h3_stage_pool.count];
+    pthread_mutex_unlock(&h3_stage_pool.lock);
+    return slot;
+}
+
+/* Returns whether the pool took it; if not, the caller still owns the slot. */
+static int h3_stage_pool_give(void *slot, size_t bytes) {
+    int kept = 0;
+    pthread_mutex_lock(&h3_stage_pool.lock);
+    if (!h3_stage_pool.count) h3_stage_pool.bytes = bytes;
+    if (h3_stage_pool.bytes == bytes && h3_stage_pool.count < H3_STAGE_SLOTS) {
+        h3_stage_pool.slots[h3_stage_pool.count++] = slot;
+        kept = 1;
+    }
+    pthread_mutex_unlock(&h3_stage_pool.lock);
+    return kept;
+}
+
 void h3_gpu_free(h3_gpu *gpu) {
     if (!gpu) return;
     h3_gpu_profile_emit(gpu, "total", &gpu->profile_start_stats,
@@ -451,8 +487,11 @@ void h3_gpu_free(h3_gpu *gpu) {
         if (gpu->stage_event_recorded[i] && gpu->stage_copied[i])
             cudaEventSynchronize(gpu->stage_copied[i]);
         if (gpu->stage_host[i]) {
-            if (gpu->stage_host_pinned) cudaFreeHost(gpu->stage_host[i]);
-            else free(gpu->stage_host[i]);
+            if (!gpu->stage_host_pinned)
+                free(gpu->stage_host[i]);
+            else if (!h3_stage_pool_give(gpu->stage_host[i],
+                                         gpu->stage_host_bytes))
+                cudaFreeHost(gpu->stage_host[i]);
         }
         if (gpu->stage_copied[i]) cudaEventDestroy(gpu->stage_copied[i]);
     }
@@ -745,6 +784,8 @@ static int h3_gpu_ensure_stage(h3_gpu *gpu) {
     double pin_start = h3_gpu_now();
     int pinned = 1;
     for (int i = 0; i < H3_STAGE_SLOTS; i++) {
+        gpu->stage_host[i] = h3_stage_pool_take(bytes);
+        if (gpu->stage_host[i]) continue;
         if (cudaMallocHost(&gpu->stage_host[i], bytes) != cudaSuccess) {
             gpu->stage_host[i] = NULL;
             pinned = 0;

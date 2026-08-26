@@ -2315,3 +2315,40 @@ e2e is **18.2 s**, 3.1× off the 56.3 s this started at.
 Logs: `/tmp/h3_perf_day14/q8_{cold,warm1,warm2}.log`, `q8ab/`.
 ---
 
+## KEEP pooling the pinned staging slots across `h3_gpu` contexts
+
+With the DiT's weights cached, the remaining phases were re-profiled against the
+CUDA API trace rather than the kernel trace, and the largest single entry in the
+run was not a kernel at all:
+
+| CUDA API | total | calls | per call |
+|---|----:|----:|----:|
+| `cudaStreamSynchronize` | 4900 ms | 77 | — |
+| `cudaEventSynchronize` | 3343 ms | 2488 | — |
+| **`cudaMallocHost`** | **940 ms** | **16** | **58.8 ms** |
+| `cudaMallocAsync` | 810 ms | 2526 | — |
+| **`cudaFreeHost`** | **441 ms** | **16** | **27.6 ms** |
+
+The two synchronize rows are the pipeline waiting for work it asked for. The
+`cudaMallocHost` and `cudaFreeHost` rows are not: they are 1.38 s of page-locking
+and unlocking, and the sixteen calls are four staging slots times four `h3_gpu`
+contexts. A generation builds those contexts in sequence — text encoder, DiT,
+audio VAE, video VAE — and each one page-locks 4 × 128 MiB at the ~1.5 GB/s the
+kernel manages, then hands it back. The same half gigabyte gets pinned four
+times and freed four times, and the phase profile had been reporting it all
+along as an innocuous `pin=0.2s` on every line.
+
+The slots are all `h3_stage_chunk_bytes()` and no two contexts hold them at
+once, so a retired slot goes to a process-wide pool instead of `cudaFreeHost`,
+and the next context takes it as-is. Only the first context of a run pays:
+
+| | e2e | TE | DiT load | denoise | audio VAE | video VAE |
+|---|----:|---:|---------:|--------:|----------:|----------:|
+| per-context pinning | 17.98 s | 2.190 s | 1.469 s | 8.453 s | 0.853 s | 3.310 s |
+| pooled slots | 16.76 s | 2.175 s | 1.330 s | 8.468 s | 0.611 s | 2.905 s |
+
+`pin=` goes from five charges of ~0.25 s to one, denoise does not move (it never
+loads anything), and the win lands where the loading is. Output md5 is
+`f5282774d3a4` — the same bytes as before, because nothing about the data
+changed, only who owns the buffer it lands in.
+
