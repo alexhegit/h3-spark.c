@@ -2359,8 +2359,10 @@ used it. Asking the same call for `CUBLAS_COMPUTE_32F_FAST_16BF` instead of
 `..._FAST_TF32` exposed the problem: cuBLAS returned *TF32* kernels either way —
 still `s1688gemm`, the m16n8k8 instruction — but under the BF16 request it chose
 128x256 and 128x128x32 tiles instead of 256x128 and 256x64, and ran 0.18 s
-faster for identical output bits. Identical is expected: these GEMMs do not
-split K, so tile shape cannot change the order a dot product accumulates in.
+faster for identical output bits. The bits looked identical on this shape, and
+the reasoning offered for it — that these GEMMs do not split K, so tile shape
+cannot change the order a dot product accumulates in — was wrong; see the
+correction below, which enforces the property instead of assuming it.
 
 So the ranking, not the math, was wrong. The plan cache is per shape and the
 video VAE uses each of its four shapes 144 times per decode, so timing six
@@ -2754,3 +2756,68 @@ two fusions above are worth 0.19 s between them at the phase level, and the e2e
 mean moved from 15.91 s to 15.72 s — the same 0.19 s. Run-to-run spread is now
 wider than either individual change, which is why both were accepted on paired
 phase measurements rather than on wall time.
+---
+
+## 2026-08-26 — FIX the cuBLASLt autotune, which made the output non-deterministic
+
+Everything above was accepted on one shape: 512×512, 22 frames, md5
+`f5282774d3a4`. Running the other shapes the CLI accepts is what found this.
+
+| shape | base `577cf4e` | tuned series | |
+|---|---|---|---|
+| 384×384, 22f | `01d863363a91` | `01d863363a91` | ok |
+| 512×512, 45f | `c8343329e238` | `c8343329e238` | ok |
+| 768×768, 22f | `3402f085f9e4` | `ac3510f99ff4` | **differs** |
+| 640×384, 33f | `f755a6b9da3d` | `9faa280a5c25` | **differs** |
+
+The useful move was to check whether 768×768 was even deterministic before
+blaming a commit. It was not: three runs of *one* binary gave
+`ac3510f99ff4`, `3402f085f9e4`, `ac3510f99ff4`. So this was never a wrong
+kernel, it was a coin flip, and `H3_DISABLE_LT_AUTOTUNE=1` landed on the base
+value every time.
+
+The cause is the candidate search offering a 32 MiB workspace, which lets
+`cublasLtMatmulAlgoGetHeuristic` rank **split-K** algorithms next to single-pass
+ones. Split-K sums K in pieces and reduces, so it does not agree bit for bit
+with a single-pass candidate or with a different split factor. Timing then picks
+by wall clock, and on a shape where two candidates sit within noise of each
+other the decode's output follows whichever won that run.
+
+Restricting the search to `CUBLASLT_REDUCTION_SCHEME_NONE` fixes the
+determinism — four runs, one md5 — but *not* the regression: it still gave
+`ac3510f99ff4`, because the base commit's own top-ranked pick at this shape is
+split-K, and matching base means keeping that. Rejecting the wrong half of the
+problem is worth noting, since the arithmetic reason to prefer one-pass sums is
+appealing and irrelevant here.
+
+What works is to stop assuming candidates agree and check it: candidate 0 is
+what the untuned path would have run, so its product is copied aside and every
+other candidate must reproduce it element for element to stay eligible. Tuning
+becomes a pure speed decision. Both shapes return to base, deterministically —
+768×768 three for three, 640×384 exact — and 512×512 stays `f5282774d3a4`.
+
+The win survives the check, because the candidate that was winning on the
+measured shapes was never the split-K one:
+
+| 512×512 | video VAE linear | phase |
+|---|---:|---:|
+| `H3_DISABLE_LT_AUTOTUNE=1` | 1.543 / 1.537 s | 2.874 / 2.663 s |
+| verified autotune | 1.481 / 1.381 s | 2.608 / 2.495 s |
+
+The cost is one output-sized device buffer and one compare kernel per shape, at
+plan-build time, four times in a decode.
+
+Two things worth keeping from how this was found. **A bit-identity claim proven
+on one shape is not proven** — four of the six configs tested had never been run
+against the base commit, and two of them disagreed. And **check determinism
+before bisecting**: the commit-by-commit bisect this was headed for would have
+produced whichever answer the coin gave and pointed at the wrong change.
+
+Also recorded while testing the weight cache: the header carries magic, version,
+block index, key and per-section dimensions, so truncation and whole-file
+garbage both fall back to the checkpoint (verified). The payload itself is not
+checksummed, so flipping 4096 bytes *inside* one file is consumed silently and
+changes the output (`5f9e815ef982`). Hashing 18 GiB on every read would cost
+more than the cache saves, so this stays as it is — but the fallback is only
+against truncation, not bit rot, and `H3_DIT_INT8_CACHE=off` or deleting the
+directory is the recovery.

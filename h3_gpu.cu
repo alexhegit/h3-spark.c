@@ -1607,25 +1607,58 @@ static int h3_lt_ensure(h3_gpu *gpu) {
  * visible. */
 #define H3_LT_CANDIDATES 6
 
-/* Times each candidate on the real operands and returns the fastest. The
- * output is left holding a garbage product, so the caller must run the winner
- * afterwards — which it does anyway. */
+/* Counts elements where two products differ, so a candidate can be rejected for
+ * disagreeing with the untuned one rather than trusted to agree. */
+__global__ static void h3_f32_mismatch_kernel(const float *left,
+                                              const float *right, size_t count,
+                                              uint32_t *mismatches) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    uint32_t a, b;
+    memcpy(&a, left + index, sizeof(a));
+    memcpy(&b, right + index, sizeof(b));
+    if (a != b) atomicAdd(mismatches, 1u);
+}
+
+/* Times each candidate on the real operands and returns the fastest one that
+ * reproduces candidate 0's output exactly. The output is left holding a garbage
+ * product, so the caller must run the winner afterwards — which it does anyway.
+ *
+ * The bit check is the whole point. cuBLASLt ranks split-K algorithms alongside
+ * single-pass ones when a workspace is offered, and those sum K in pieces, so
+ * candidates do not all produce the same bits. Timing alone then makes the
+ * output depend on which candidate happened to measure fastest: 768x768 flipped
+ * between two md5s across repeats of one binary before this check existed.
+ * Candidate 0 is what the untuned path would have used, so matching it keeps
+ * tuning a pure speed decision. */
 static int h3_lt_time_candidates(h3_gpu *gpu, cublasLtMatmulDesc_t desc,
                                  cublasLtMatrixLayout_t la,
                                  cublasLtMatrixLayout_t lb,
                                  cublasLtMatrixLayout_t lc, const void *a,
-                                 const void *b, void *d,
+                                 const void *b, void *d, size_t output_bytes,
                                  cublasLtMatmulHeuristicResult_t *results,
                                  int count) {
     if (count <= 1 || h3_env_on("H3_DISABLE_LT_AUTOTUNE")) return 0;
     float alpha = 1.0f;
     float beta = 0.0f;
-    cudaEvent_t start, stop;
-    if (cudaEventCreate(&start) != cudaSuccess) return 0;
-    if (cudaEventCreate(&stop) != cudaSuccess) {
-        cudaEventDestroy(start);
+    /* Reference copy of candidate 0's product, plus a mismatch counter. */
+    void *reference = NULL;
+    uint32_t *mismatches = NULL;
+    if (cudaMalloc(&reference, output_bytes) != cudaSuccess) return 0;
+    if (cudaMalloc((void **)&mismatches, sizeof(uint32_t)) != cudaSuccess) {
+        cudaFree(reference);
         return 0;
     }
+    cudaEvent_t start, stop;
+    if (cudaEventCreate(&start) != cudaSuccess ||
+        cudaEventCreate(&stop) != cudaSuccess) {
+        cudaFree(reference);
+        cudaFree(mismatches);
+        return 0;
+    }
+    size_t elements = output_bytes / sizeof(float);
+    unsigned threads = 256;
+    unsigned blocks = (unsigned)((elements + threads - 1) / threads);
     int best = 0;
     float best_ms = 0.0f;
     for (int index = 0; index < count; index++) {
@@ -1636,24 +1669,45 @@ static int h3_lt_time_candidates(h3_gpu *gpu, cublasLtMatmulDesc_t desc,
             if (cublasLtMatmul(gpu->lt, desc, &alpha, a, la, b, lb, &beta, d,
                                lc, d, lc, &results[index].algo,
                                gpu->lt_workspace, gpu->lt_workspace_bytes,
-                               gpu->stream) != CUBLAS_STATUS_SUCCESS) {
-                best_ms = best_ms > 0.0f ? best_ms : 0.0f;
+                               gpu->stream) != CUBLAS_STATUS_SUCCESS)
                 goto next;
-            }
         }
         cudaEventRecord(stop, gpu->stream);
-        if (cudaEventSynchronize(stop) == cudaSuccess) {
-            float elapsed = 0.0f;
-            if (cudaEventElapsedTime(&elapsed, start, stop) == cudaSuccess &&
-                elapsed > 0.0f && (best_ms == 0.0f || elapsed < best_ms)) {
-                best_ms = elapsed;
-                best = index;
-            }
+        if (cudaEventSynchronize(stop) != cudaSuccess) goto next;
+        if (index == 0) {
+            if (cudaMemcpyAsync(reference, d, output_bytes,
+                                cudaMemcpyDeviceToDevice,
+                                gpu->stream) != cudaSuccess ||
+                cudaStreamSynchronize(gpu->stream) != cudaSuccess)
+                goto done;
+        } else {
+            uint32_t differing = 1;
+            if (cudaMemsetAsync(mismatches, 0, sizeof(uint32_t),
+                                gpu->stream) != cudaSuccess)
+                goto next;
+            h3_f32_mismatch_kernel<<<blocks, threads, 0, gpu->stream>>>(
+                (const float *)d, (const float *)reference, elements,
+                mismatches);
+            if (cudaMemcpyAsync(&differing, mismatches, sizeof(uint32_t),
+                                cudaMemcpyDeviceToHost,
+                                gpu->stream) != cudaSuccess ||
+                cudaStreamSynchronize(gpu->stream) != cudaSuccess || differing)
+                goto next;
+        }
+        float elapsed;
+        elapsed = 0.0f;
+        if (cudaEventElapsedTime(&elapsed, start, stop) == cudaSuccess &&
+            elapsed > 0.0f && (best_ms == 0.0f || elapsed < best_ms)) {
+            best_ms = elapsed;
+            best = index;
         }
     next:;
     }
+done:
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
+    cudaFree(reference);
+    cudaFree(mismatches);
     return best;
 }
 
@@ -1726,7 +1780,9 @@ static int h3_linear_f32_bias_fused(h3_gpu *gpu, h3_gpu_tensor *output,
                      * cheap against getting the order wrong 144 times. */
                     int best = h3_lt_time_candidates(
                         gpu, desc, la, lb, lc, weight->device, input->device,
-                        output->device, results, found);
+                        output->device,
+                        (size_t)rows * output_dim * sizeof(float), results,
+                        found);
                     plan->algo = results[best].algo;
                     plan->rows = (int)rows;
                     plan->input_dim = (int)input_dim;
