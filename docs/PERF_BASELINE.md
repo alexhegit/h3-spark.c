@@ -2377,3 +2377,30 @@ overlap, and the arm with the slower VAE measured the faster wall. The gpu-op
 accumulators separate cleanly and repeatably (1.614/1.616/1.622 s against
 1.559/1.371/1.391 s).
 
+## REJECT BF16 operands for the video VAE's GEMM
+
+TF32 is m16n8k8 where BF16 is m16n8k16, so feeding BF16 operands into the F32
+accumulator should double the rate of the VAE's 1.45 s of GEMM. Casting the
+weight once per buffer and the activation per call, it does, almost exactly:
+
+| video VAE, nsys | GPU kernels |
+|---|----:|
+| TF32 | 2439 ms |
+| BF16 operands (incl. 172 ms of casts) | 1900 ms |
+
+And the phase got **slower**: 2.835 → 3.183 s, for output that is no longer
+`f5282774d3a4`. Trading 539 ms of GPU time for 348 ms of extra wall is only
+possible because the decode was never GPU-bound — the same reason the staging
+pool was worth four times what any of this was. The BF16 weight copies also want
+4.5 GiB that the phase did not previously need, taking its peak from 9.45 to
+14.0 GiB, and a run that allocates them leaves the page cache poisoned enough
+that the *next* run cost 28.9 s.
+
+Getting the tensor cores' other half would mean the VAE holding BF16 weights
+from the start, not casting F32 ones at the call site. That is a real change and
+the numbers above say to price the decode's non-GPU 0.45 s first, because there
+is no point halving 1.45 s of GEMM inside a phase that only yields 15 % of what
+is taken off its GPU.
+
+e2e is **16.7 s**, 3.4× off the 56.3 s this started at.
+
