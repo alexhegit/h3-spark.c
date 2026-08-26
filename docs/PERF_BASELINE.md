@@ -2092,3 +2092,76 @@ the largest single unclaimed gap left in the pipeline.
 
 Logs: `/tmp/h3_perf_day14/tf32/`.
 ---
+
+## 2026-08-26 — KEEP fusing the QKV rescale into RoPE (denoise −0.35 s), REJECT vectorizing the row quantizer
+
+The denoise's INT8 linear path spends time on nothing but changing
+representation: the GEMM cannot read BF16 or write BF16, so each one is wrapped
+in a quantize before and an `int32 → scale → BF16` rescale after. nsys on a
+4-step run put `h3_int8_apply_scales_bf16_kernel` at 405 instances / 210.9 ms,
+which is three per layer — QKV, the attention output and FC2. Only FC1's is
+already fused, into `h3_int8_swiglu_quant`.
+
+QKV is the one worth taking. Its projection is `rows × 3*inner`, four times
+wider than the other two, so it alone is 69% of that time (145 ms of 210.9,
+against 66.7% predicted from the width ratio).
+
+`h3_qkv_rope_coop_kernel` is now templated over where it reads the projection
+from: a materialized BF16 tensor, or the INT8 accumulator plus the two scale
+vectors. The fused source rounds each value to BF16 before returning it, exactly
+where the split path's store did, so the fusion is **bit-identical** rather than
+merely close — same trick as the SwiGLU fusion. Per element this drops a 2-byte
+write and a 2-byte read and turns the RoPE kernel's read from 2 bytes into 4:
+8 bytes of traffic becomes 4.
+
+Interleaved, `H3_SPLIT_INT8_QKV_ROPE=1` for the split arm:
+
+| Run | **Fused** | Split |
+|-----|----------:|------:|
+| ab1 | **8.330 s** | 8.702 s |
+| ab2 | **8.386 s** | 8.717 s |
+
+−0.35 s of denoise, output md5 `f5282774d3a4` on all four runs. nsys confirms
+the mechanism rather than just the wall: `apply_scales` drops to 270 instances /
+65.9 ms, and the new `h3_qkv_rope_coop_kernel<h3_qkv_int8_source>` costs 142.9 ms
+against the old pair's 145 + 101 ms.
+
+### REJECT the vectorized row quantizer
+
+`h3_quantize_bf16_int8_rows_kernel` looked like the bigger fish: 250.9 ms at
+~1.3 ms per call, which for ~40 MB of traffic is about 31 GB/s on a machine with
+roughly 270. It issues scalar 2-byte loads and 1-byte stores, so the obvious
+read is latency-bound with 2 bytes in flight per thread. A `uint4`-load,
+`uint2`-store variant, bit-identical and with a scalar fallback for unaligned or
+non-multiple-of-8 rows, measured:
+
+| Arm | Kernel total | Denoise |
+|-----|-------------:|--------:|
+| vector | 239.1 ms | 8.347 / 8.386 s |
+| scalar | 250.9 ms | 8.367 / 8.331 s |
+
+5% on the kernel and nothing on the wall, so it is not latency-bound and the
+premise was wrong. Two things were also wrong about the attribution: those 192
+instances are mostly the **text encoder**, not the denoise, and the denoise's
+attention-output quantize goes through `h3_quantize_bf16_int8_head_major_kernel`
+(24.2 ms), which this change does not touch. Reverted rather than kept for 0.2%
+of e2e worth of extra branch.
+
+### What is left of the glue
+
+Scaled to a full run, after the fusion:
+
+| Kernel | Full run | Fusable into |
+|--------|---------:|--------------|
+| `h3_int8_swiglu_quant` | 0.53 s | already fused |
+| `h3_qkv_rope_coop` | 0.52 s | already fused |
+| `h3_gate_adaln_quantize_int8` | 0.36 s | already fused |
+| `h3_int8_apply_scales_bf16` | 0.24 s | attention out, FC2 |
+| `h3_quantize_bf16_int8_head_major` | 0.09 s | the SDPA epilogue |
+
+The remaining rescales are 0.24 s for two kernels' worth of work, so the
+"fuse the glue" seam is close to exhausted — the estimate of 0.8–1.0 s for this
+line of work was too high, and 0.35 s is what was there. e2e is **19.4 s**.
+
+Logs: `/tmp/h3_perf_day14/qkv*.log`, `q-{vec,scalar}-*.log`, `vec.nsys-rep`.
+---

@@ -2099,10 +2099,37 @@ __global__ static void h3_qkv_rope_bf16_kernel(
     value[output_index] = qkv[v_base + dimension];
 }
 
+} /* extern "C" — the QKV/RoPE sources below are templated */
+
+/* A materialized BF16 projection, and the INT8 GEMM's accumulator read in its
+ * place. The accumulator source rounds to BF16 on the way out so that fusing
+ * the rescale into this kernel is bit-identical to writing the BF16 projection
+ * and reading it back. */
+struct h3_qkv_bf16_source {
+    const uint16_t *qkv;
+    uint32_t output_dim;
+    __device__ uint16_t operator()(uint32_t row, uint32_t column) const {
+        return qkv[(size_t)row * output_dim + column];
+    }
+};
+
+struct h3_qkv_int8_source {
+    const int32_t *accum;
+    const float *input_scales;
+    const float *weight_scales;
+    uint32_t output_dim;
+    __device__ uint16_t operator()(uint32_t row, uint32_t column) const {
+        float value = (float)accum[(size_t)row * output_dim + column] *
+                      input_scales[row] * weight_scales[column];
+        return h3_f32_to_bf16_bits(value);
+    }
+};
+
 /* Cooperative RMS: one load per thread, warp+block reduce, then RoPE.
  * Default. Opt out with H3_QKV_ROPE_SERIAL_RMS=1. */
-__global__ static void h3_qkv_rope_bf16_coop_kernel(
-    const uint16_t *qkv, const uint16_t *q_weight, const uint16_t *k_weight,
+template <typename Source>
+__global__ static void h3_qkv_rope_coop_kernel(
+    Source source, const uint16_t *q_weight, const uint16_t *k_weight,
     const uint16_t *rope_cos, const uint16_t *rope_sin, uint16_t *query,
     uint16_t *key, uint16_t *value, h3_qkv_rope_args args) {
     uint32_t dimension = (uint32_t)threadIdx.x;
@@ -2110,22 +2137,21 @@ __global__ static void h3_qkv_rope_bf16_coop_kernel(
     uint32_t row = (uint32_t)blockIdx.z;
     if (head >= args.heads || row >= args.sequence) return;
     uint32_t inner = args.heads * args.head_dim;
-    uint32_t row_base = row * inner * 3u;
-    uint32_t q_base = row_base + head * args.head_dim;
-    uint32_t k_base = q_base + inner;
-    uint32_t v_base = q_base + inner * 2u;
+    uint32_t q_column = head * args.head_dim;
+    uint32_t k_column = q_column + inner;
+    uint32_t v_column = q_column + inner * 2u;
     if (args.grouped) {
-        q_base = row_base + head * args.head_dim * 3u;
-        k_base = q_base + args.head_dim;
-        v_base = k_base + args.head_dim;
+        q_column = head * args.head_dim * 3u;
+        k_column = q_column + args.head_dim;
+        v_column = k_column + args.head_dim;
     }
     float q = 0.0f;
     float k = 0.0f;
     uint16_t v_bits = 0;
     if (dimension < args.head_dim) {
-        q = h3_bf16_bits_to_f32(qkv[q_base + dimension]);
-        k = h3_bf16_bits_to_f32(qkv[k_base + dimension]);
-        v_bits = qkv[v_base + dimension];
+        q = h3_bf16_bits_to_f32(source(row, q_column + dimension));
+        k = h3_bf16_bits_to_f32(source(row, k_column + dimension));
+        v_bits = source(row, v_column + dimension);
     }
     float q_sum = q * q;
     float k_sum = k * k;
@@ -2195,6 +2221,33 @@ __global__ static void h3_qkv_rope_bf16_coop_kernel(
     value[output_index] = v_bits;
 }
 
+/* Shared launch geometry for both sources: one block per (head, row), one
+ * thread per head dimension, shared memory for the RoPE pair exchange. */
+template <typename Source>
+static int h3_qkv_rope_coop_launch(h3_gpu *gpu, Source source,
+                                   h3_gpu_tensor *query, h3_gpu_tensor *key,
+                                   h3_gpu_tensor *value,
+                                   const h3_gpu_tensor *q_norm,
+                                   const h3_gpu_tensor *k_norm,
+                                   const h3_gpu_tensor *rope_cos,
+                                   const h3_gpu_tensor *rope_sin,
+                                   h3_qkv_rope_args args) {
+    uint32_t threads_x = (args.head_dim + 31u) & ~31u;
+    if (threads_x < 32u) threads_x = 32u;
+    dim3 blocks(1, args.heads, args.sequence);
+    dim3 threads(threads_x, 1, 1);
+    size_t smem = (size_t)args.head_dim * 2u * sizeof(float);
+    h3_qkv_rope_coop_kernel<<<blocks, threads, smem, gpu->stream>>>(
+        source, (const uint16_t *)q_norm->device,
+        (const uint16_t *)k_norm->device, (const uint16_t *)rope_cos->device,
+        (const uint16_t *)rope_sin->device, (uint16_t *)query->device,
+        (uint16_t *)key->device, (uint16_t *)value->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_qkv_rope_coop");
+}
+
+extern "C" {
+
 static int h3_gpu_qkv_rope_bf16_layout(
     h3_gpu *gpu, h3_gpu_tensor *query, h3_gpu_tensor *key,
     h3_gpu_tensor *value, const h3_gpu_tensor *qkv,
@@ -2222,17 +2275,10 @@ static int h3_gpu_qkv_rope_bf16_layout(
     dim3 blocks(1, heads, sequence);
     int serial_rms = force_serial_rms || h3_env_on("H3_QKV_ROPE_SERIAL_RMS");
     if (!serial_rms) {
-        uint32_t threads_x = (head_dim + 31u) & ~31u;
-        if (threads_x < 32u) threads_x = 32u;
-        dim3 threads(threads_x, 1, 1);
-        size_t smem = (size_t)head_dim * 2u * sizeof(float);
-        h3_qkv_rope_bf16_coop_kernel<<<blocks, threads, smem, gpu->stream>>>(
-            (const uint16_t *)qkv->device, (const uint16_t *)q_norm->device,
-            (const uint16_t *)k_norm->device, (const uint16_t *)rope_cos->device,
-            (const uint16_t *)rope_sin->device, (uint16_t *)query->device,
-            (uint16_t *)key->device, (uint16_t *)value->device, args);
-        gpu->stats.direct_dispatches++;
-        return h3_cuda_check(gpu, cudaGetLastError(), "h3_qkv_rope_bf16_coop");
+        h3_qkv_bf16_source source = {(const uint16_t *)qkv->device,
+                                     heads * head_dim * 3u};
+        return h3_qkv_rope_coop_launch(gpu, source, query, key, value, q_norm,
+                                       k_norm, rope_cos, rope_sin, args);
     }
     dim3 threads(head_dim, 1, 1);
     h3_qkv_rope_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
@@ -7868,6 +7914,33 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                         input, rows, padded_rows, input_dim,
                                         1.0f))
         return 0;
+
+    /* The projection is rows x 3*inner, the widest intermediate in the block.
+     * Reading the accumulator straight into the RoPE kernel keeps it out of
+     * memory entirely, which is worth more here than anywhere else in the
+     * layer. Opt out with H3_SPLIT_INT8_QKV_ROPE=1. */
+    int serial_rms =
+        use_slower_scalar_qkv_rms || h3_env_on("H3_QKV_ROPE_SERIAL_RMS");
+    if (!serial_rms && !h3_env_on("H3_SPLIT_INT8_QKV_ROPE")) {
+        h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
+        int32_t *accum =
+            h3_int8_gemm_accum(gpu, weight->device, quantized_input->device,
+                               rows, input_dim, inner * 3u);
+        int fused_ok = 0;
+        if (accum) {
+            h3_qkv_int8_source source = {accum,
+                                         (const float *)input_scales->device,
+                                         (const float *)weight_scales->device,
+                                         inner * 3u};
+            h3_qkv_rope_args args = {rows,      heads, head_dim,
+                                     rope_half, 1u,    epsilon};
+            fused_ok = h3_qkv_rope_coop_launch(gpu, source, query, key, value,
+                                               q_norm, k_norm, rope_cos,
+                                               rope_sin, args);
+        }
+        h3_gpu_op_end(gpu);
+        if (fused_ok) return 1;
+    }
 
     h3_gpu_tensor *qkv = h3_gpu_workspace_bf16(
         gpu, &gpu->ws_qkv, (size_t)rows * inner * 3u);
