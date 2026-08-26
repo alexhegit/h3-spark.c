@@ -1623,13 +1623,16 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     float beta = 0.0f;
     /* TF32 keeps FP32 range with a 10-bit mantissa and runs on the tensor
      * cores. It is worth its precision only where the GEMM is big enough to be
-     * MMA-bound, so the small shapes stay exact FP32. BF16x9 emulation
-     * (CUBLAS_COMPUTE_32F_EMULATED_16BFX9) was measured here and is a wash:
-     * nine BF16 products at 98 TFLOP/s is no faster than FP32's own 31, so
-     * cuBLAS declines the emulation and the wall time does not move. */
+     * MMA-bound, so the small shapes stay exact FP32. The video VAE decodes a
+     * latent the DiT has already fixed, so this cannot move the sample, only
+     * add numerical noise to the decode: 45.3 dB against exact FP32, and
+     * bit-reproducible run to run. H3_DISABLE_F32_TF32=1 forces exact FP32.
+     * BF16x9 emulation (CUBLAS_COMPUTE_32F_EMULATED_16BFX9) was measured here
+     * and is a wash: nine BF16 products at 98 TFLOP/s is no faster than FP32's
+     * own 31, so cuBLAS declines the emulation and the wall does not move. */
     cublasComputeType_t compute =
         (input_dim >= 512u && output_dim >= 512u && rows >= 512u &&
-         h3_env_on("H3_F32_TF32"))
+         !h3_env_on("H3_DISABLE_F32_TF32"))
             ? CUBLAS_COMPUTE_32F_FAST_TF32
             : CUBLAS_COMPUTE_32F;
     if (bias && h3_linear_f32_bias_fused(gpu, output, input, weight, bias, rows,

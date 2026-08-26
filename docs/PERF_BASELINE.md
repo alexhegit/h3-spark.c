@@ -1240,6 +1240,14 @@ allocates both rows, which also makes the row map meaningful.
 
 ## 2026-08-25 — TF32 F32 GEMM: 2.1× on the video VAE, kept opt-in
 
+> **Reversed 2026-08-26.** Every PSNR figure below was taken while the staging
+> buffer race was corrupting weights nondeterministically, which is what the
+> "FP32 run vs FP32 run 32.65 dB" line was actually measuring. With that race
+> fixed both arms are bit-reproducible and TF32 sits 45.3 dB from exact FP32, so
+> the reasoning here does not survive its own premise. TF32 is now the default —
+> see "TF32 on the video VAE, on the second look".
+
+
 `h3_gpu_linear_f32` ran `CUBLAS_COMPUTE_32F`, i.e. no tensor cores at all.
 `H3_F32_TF32=1` switches the large shapes (all of `input_dim`, `output_dim` and
 `rows` at least 512, so the op gate's small cases stay exact) to
@@ -2021,4 +2029,66 @@ fastest thing on the chip by a wide margin, but at 7.4× the weight error it is
 past the 13-level frame, not short of it.
 
 Logs: `/tmp/h3_perf_day14/bench_gemm_precision.log`, `/tmp/h3_levels/`.
+---
+
+## 2026-08-26 — KEEP TF32 on the video VAE, on the second look (e2e 21.9 s → 19.8 s)
+
+An nsys pass taken for an unrelated reason put the largest single kernel in the
+run at `cutlass_80_simt_sgemm_128x256_8x4_tn_align1`, 27.1% of GPU time. `simt`
+means it is on the FP32 CUDA cores with the tensor cores idle — the video VAE's
+F32 GEMM, which already had a measured 2.1× TF32 path sitting behind an opt-in
+flag since 2026-08-25.
+
+That flag was off for a documented reason, and the reason was wrong. The
+rejection rested on TF32 raising the decode's noise floor, evidenced by an FP32
+run differing from another FP32 run by only 32.65 dB. But that measurement
+predates the staging-buffer race fix: what looked like a noisy decoder was
+weights being corrupted differently on each run. Re-taken now, two runs per arm,
+interleaved (`/tmp/h3_perf_day14/tf32_ab.sh`):
+
+| PSNR pair | 2026-08-25 | **Now** |
+|-----------|-----------:|--------:|
+| FP32 vs FP32 | 32.65 dB | **identical** (`a90568fa7ec1`) |
+| TF32 vs TF32 | 22.24 dB | **identical** (`f5282774d3a4`) |
+| TF32 vs FP32 | 23.24 dB | **45.27 dB** |
+
+Both arms are bit-reproducible, and the gap between them is 22 dB better than
+the old measurement claimed. The frames are indistinguishable: same composition,
+same fur detail, same background.
+
+There is a structural reason to trust PSNR here, having just argued it is the
+wrong gate for DiT quantization. The video VAE decodes a latent the denoise has
+already finalised, so a change inside it cannot move the trajectory to a
+different sample the way an FP8 MLP does — it can only perturb the decode of a
+fixed one. Same composition means same sample, so the dB figure is measuring
+what it looks like it is measuring.
+
+| Arm | video VAE | e2e |
+|-----|----------:|----:|
+| exact FP32 (`H3_DISABLE_F32_TF32=1`) | 5.41 / 5.68 / 5.27 s | 24.3 / 22.1 / 21.9 s |
+| **TF32 (default)** | **3.34 / 3.27 / 3.29 s** | **19.8 / 20.7 / 19.8 s** |
+
+−2.0 s on the VAE and −2.1 s e2e. The flag inverted to
+`H3_DISABLE_F32_TF32=1`, which still reproduces the historical reference md5
+`a90568fa7ec1` exactly — the exact path is intact, not merely nearby.
+
+### Where fox-fast stands now
+
+| Phase | Wall | Share |
+|-------|-----:|------:|
+| GPU Euler denoise | 8.8 s | 44% |
+| video VAE decode | 3.3 s | 17% |
+| DiT load | ~3.1 s | 16% |
+| Qwen text encoder | ~2.5 s | 13% |
+| audio VAE + mux | ~1.5 s | 8% |
+| **e2e wall** | **19.8 s** | |
+
+2.8× off the 56.3 s this started at. Denoise is now 44% of the run and the only
+block above 4 s. Its own split is 5.2 s of INT8 linear — where the narrow-format
+work above says the next 0.5 s is the three unfused `int32 → scale → BF16`
+passes, and the rest needs a format the quality does not currently allow — and
+1.5 s of attention still at 31 TFLOP/s against a ~98 TFLOP/s BF16 peak, which is
+the largest single unclaimed gap left in the pipeline.
+
+Logs: `/tmp/h3_perf_day14/tf32/`.
 ---
