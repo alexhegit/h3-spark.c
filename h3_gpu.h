@@ -197,6 +197,17 @@ int h3_gpu_scale_add_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *branch,
                          const h3_gpu_tensor *scale, uint32_t rows,
                          uint32_t width);
+/* residual + branch * scale[col], write hidden, then RMSNorm into norm.
+ * Same fmaf association as the two kernels in sequence. Falls back if
+ * H3_DISABLE_FUSED_SCALE_ADD_RMS=1 or width is too wide for the register tile. */
+int h3_gpu_scale_add_rms_norm_f32(h3_gpu *gpu, h3_gpu_tensor *hidden,
+                                  h3_gpu_tensor *norm,
+                                  const h3_gpu_tensor *residual,
+                                  const h3_gpu_tensor *branch,
+                                  const h3_gpu_tensor *scale,
+                                  const h3_gpu_tensor *norm_weight,
+                                  uint32_t rows, uint32_t width,
+                                  float epsilon);
 int h3_gpu_layer_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                           const h3_gpu_tensor *input,
                           const h3_gpu_tensor *weight,

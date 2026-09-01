@@ -3103,3 +3103,89 @@ reduction association or sit on the same HBM roof.
 Fox-fast GEMM/MMA is not the long-video wall. A 15 s T2VA is still ~92% denoise,
 and ~86% of that denoise is DiT SDPA (N²). Do not chase 98 TFLOP/s MMA at seq
 1874; the pipes are already hidden there.
+
+---
+
+## 2026-09-01 — KEEP coalesced V in video-VAE QKV RoPE smem
+
+The cooperative kernel already staged Q and K, then thread 0 walked them, then
+RoPE wrote Q/K and **re-read V from global**. V is a copy. Staging it in the
+same coalesced load (third `head_dim` of dynamic smem) drops that second
+pointer chase:
+
+| | ms / call (seq 2273, 32 heads, d=64) |
+|---|---:|
+| Q/K smem, V from global (A/B) | 0.481 / 0.485 |
+| **Q/K/V smem** | **0.472 / 0.474 / 0.475** |
+
+~2 % on the kernel, ~1 ms across 144 fox-fast calls — not an e2e claim.
+`h3_cuda_ops` still matches `video_qkv_rope_f32`; fox-fast md5 `f5282774d3a4`.
+Opt-out remains `H3_VIDEO_QKV_SERIAL_RMS=1` (the original two-block kernel).
+
+### REJECT float4 staging in video-VAE QKV RoPE
+
+Q/K/V were already coalesced scalar loads into smem. Packing them as `float4`
+on 16 of 64 lanes:
+
+| | ms / call |
+|---|---:|
+| scalar (KEEP) | **0.472–0.475** |
+| float4 | 0.486–0.488 |
+
+~3 % slower. Reverted.
+
+### KEEP fused video-VAE attention residual + MLP RMSNorm
+
+`scale_add` writes `hidden`, then `rms_norm` reads it back. One kernel does the
+add into registers, the same 256-thread `fmaf` + tree as `h3_rms_norm_f32`, then
+writes `hidden` and `norm`. Split vs fused: **0 mismatches** on 2273×2048.
+Microbench 0.36–0.40 ms either way (inside noise). Fox-fast 2×2 tiles drop 144
+launches (`direct` 1468→1324). md5 `f5282774d3a4`. Opt out
+`H3_DISABLE_FUSED_SCALE_ADD_RMS=1`.
+
+### REJECT deferring the MLP residual into the next block's attention RMS
+
+Streaming VAE frees `scale2` before the next block, so the residual would need
+an 8 KB stash copy. That copy is another launch: fox-fast `direct` 1324→1328
+(one extra `scale_add` per tile after the last layer). md5 still
+`f5282774d3a4`. Reverted. Keep applying `scale2` in-block.
+
+### REJECT register-cached F32 RMSNorm second pass
+
+Stashing the 8 per-thread values so the epilogue does not reload `hidden`
+is bit-identical (0 mismatches on 2273×2048) and **slower**:
+
+| | ms |
+|---|---:|
+| reload (shipping) | **0.167 / 0.174** |
+| register tile | 0.179 / 0.182 |
+
+Reverted. The extra registers cost more than the second 18 MB read.
+
+### REJECT paired float2 Q/K/V stores in video-VAE RoPE
+
+`shfl_xor` + even-lane `float2` stores were reverted before shipping: they were
+not microbenched in isolation, and rebuilding `h3_cuda_ops` with `-Wpedantic`
+wedged the compile. Scalar stores stay.
+
+---
+
+## 2026-09-01 — 5h Spark session closed (14:30 +0800)
+
+Window ended (written after 14:30). Uncommitted on top of `d791c50`. Fox-fast md5
+still `f5282774d3a4`. Do not use e2e wall for claims under ~0.2 s.
+
+### KEEP (this window)
+
+- Coalesced V into video-VAE QKV RoPE smem (~0.483→0.473 ms).
+- Fused attention residual + MLP RMSNorm (144 fewer fox-fast 2×2 launches;
+  kernel time a wash). Opt-out `H3_DISABLE_FUSED_SCALE_ADD_RMS=1`.
+
+### REJECT (this window; do not retry)
+
+- float4 QKV RoPE staging.
+- Deferring MLP residual into the next attention RMS (stash copy).
+- Register-cached F32 RMSNorm second pass.
+- Paired float2 RoPE stores (unmeasured; ops rebuild wedged).
+
+Overnight REJECTs remain closed. Long video is still DiT SDPA N².

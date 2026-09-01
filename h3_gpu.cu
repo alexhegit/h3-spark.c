@@ -5219,6 +5219,83 @@ int h3_gpu_rms_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_rms_norm_f32");
 }
 
+#define H3_SCALE_ADD_RMS_TILE 8u
+
+__global__ static void h3_scale_add_rms_norm_f32_kernel(
+    const float *residual, const float *branch, const float *scale,
+    const float *weight, float *hidden, float *norm, h3_rms_norm_args args) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (row >= args.rows) return;
+
+    extern __shared__ float reductions[];
+    const float *row_residual = residual + (size_t)row * args.width;
+    const float *row_branch = branch + (size_t)row * args.width;
+    float *row_hidden = hidden + (size_t)row * args.width;
+    float *row_norm = norm + (size_t)row * args.width;
+    float vals[H3_SCALE_ADD_RMS_TILE];
+    uint32_t n = 0;
+    float local_sum = 0.0f;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float value = row_residual[column] + row_branch[column] * scale[column];
+        vals[n++] = value;
+        local_sum = fmaf(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        __syncthreads();
+    }
+    float inverse =
+        rsqrtf(reductions[0] / (float)args.width + args.epsilon);
+    n = 0;
+    for (uint32_t column = tid; column < args.width; column += threads) {
+        float value = vals[n++];
+        row_hidden[column] = value;
+        row_norm[column] = value * inverse * weight[column];
+    }
+}
+
+int h3_gpu_scale_add_rms_norm_f32(h3_gpu *gpu, h3_gpu_tensor *hidden,
+                                  h3_gpu_tensor *norm,
+                                  const h3_gpu_tensor *residual,
+                                  const h3_gpu_tensor *branch,
+                                  const h3_gpu_tensor *scale,
+                                  const h3_gpu_tensor *norm_weight,
+                                  uint32_t rows, uint32_t width,
+                                  float epsilon) {
+    size_t count = (size_t)rows * width;
+    if (!gpu || !hidden || !norm || !residual || !branch || !scale ||
+        !norm_weight || hidden->dtype != H3_GPU_F32 ||
+        norm->dtype != H3_GPU_F32 || residual->dtype != H3_GPU_F32 ||
+        branch->dtype != H3_GPU_F32 || scale->dtype != H3_GPU_F32 ||
+        norm_weight->dtype != H3_GPU_F32 || hidden->elements < count ||
+        norm->elements < count || residual->elements < count ||
+        branch->elements < count || scale->elements < width ||
+        norm_weight->elements < width || !rows || !width)
+        return h3_gpu_fail(gpu, "invalid fused scale-add RMSNorm request");
+    unsigned threads = 256;
+    if (h3_env_on("H3_DISABLE_FUSED_SCALE_ADD_RMS") ||
+        width > threads * H3_SCALE_ADD_RMS_TILE) {
+        if (!h3_gpu_scale_add_f32(gpu, hidden, residual, branch, scale, rows,
+                                  width))
+            return 0;
+        return h3_gpu_rms_norm_f32(gpu, norm, hidden, norm_weight, rows, width,
+                                   epsilon);
+    }
+    h3_rms_norm_args args = {rows, width, epsilon};
+    h3_scale_add_rms_norm_f32_kernel<<<rows, threads, threads * sizeof(float),
+                                       gpu->stream>>>(
+        (const float *)residual->device, (const float *)branch->device,
+        (const float *)scale->device, (const float *)norm_weight->device,
+        (float *)hidden->device, (float *)norm->device, args);
+    gpu->stats.direct_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(),
+                         "h3_scale_add_rms_norm_f32");
+}
+
 struct h3_video_qkv_rope_args {
     uint32_t sequence;
     uint32_t heads;
@@ -5290,9 +5367,11 @@ __global__ static void h3_video_qkv_rope_f32_coop_kernel(
     extern __shared__ float pair_smem[];
     float *q_sh = pair_smem;
     float *k_sh = pair_smem + args.head_dim;
+    float *v_sh = pair_smem + args.head_dim * 2u;
     if (dimension < args.head_dim) {
         q_sh[dimension] = qkv[base + dimension];
         k_sh[dimension] = qkv[base + args.head_dim + dimension];
+        v_sh[dimension] = qkv[base + args.head_dim * 2u + dimension];
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -5336,7 +5415,7 @@ __global__ static void h3_video_qkv_rope_f32_coop_kernel(
         ((size_t)row * args.heads + head) * args.head_dim + dimension;
     query[output_index] = q0;
     key[output_index] = k0;
-    value[output_index] = qkv[base + args.head_dim * 2u + dimension];
+    value[output_index] = v_sh[dimension];
 }
 
 int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
@@ -5367,7 +5446,7 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
         if (threads_x < 32u) threads_x = 32u;
         dim3 blocks(1, heads, sequence);
         dim3 threads(threads_x, 1, 1);
-        size_t smem = (size_t)head_dim * 2u * sizeof(float);
+        size_t smem = (size_t)head_dim * 3u * sizeof(float);
         h3_video_qkv_rope_f32_coop_kernel<<<blocks, threads, smem,
                                             gpu->stream>>>(
             (const float *)qkv->device, (const float *)rope_cos->device,
