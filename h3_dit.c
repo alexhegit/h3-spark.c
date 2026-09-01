@@ -2198,19 +2198,20 @@ static int run_block(h3_dit *dit, unsigned index, int step,
      * projection can skip writing a BF16 branch the gate would immediately read
      * back. Only when the fused gate kernel is the one that runs, and only when
      * the projection went through the INT8 path that leaves an accumulator. */
-    /* One switch for both ends: deferring on the producer without consuming on
-     * the consumer leaves the gate reading a BF16 branch nobody wrote. */
-    int fuse_branch_rescale = fused_int8_mlp_input &&
-        !getenv("H3_SPLIT_ADALN_QUANT") &&
-        !getenv("H3_DISABLE_FUSED_BRANCH_RESCALE");
-    int defer_attention_output = fuse_branch_rescale && int8_attention_output;
+    /* One switch for both ends: deferring on the producer without consuming
+     * on the consumer leaves the gate reading a BF16 branch nobody wrote.
+     * Last-block gate_bf16 / non-quantizing gate_adaln_bf16 now consume the
+     * accumulator too. SPLIT_ADALN_QUANT still needs a written BF16 branch. */
+    int defer_attention_output = int8_attention_output &&
+        !getenv("H3_DISABLE_FUSED_BRANCH_RESCALE") &&
+        !(fused_int8_mlp_input && getenv("H3_SPLIT_ADALN_QUANT"));
     int fuse_int8_qkv_input = fuse_next_attention && dit->int8_qkv &&
         !dit->use_slower_unfused_int8_inputs &&
         !getenv("H3_DISABLE_INT8_QKV") &&
         !getenv("H3_DISABLE_FUSED_INT8_QKV_INPUT");
-    int defer_mlp_output = fuse_int8_qkv_input &&
-        !getenv("H3_SPLIT_ADALN_QUANT") &&
-        !getenv("H3_DISABLE_FUSED_BRANCH_RESCALE");
+    int defer_mlp_output = dit->int8_mlp &&
+        !getenv("H3_DISABLE_FUSED_BRANCH_RESCALE") &&
+        !(fuse_int8_qkv_input && getenv("H3_SPLIT_ADALN_QUANT"));
     if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(

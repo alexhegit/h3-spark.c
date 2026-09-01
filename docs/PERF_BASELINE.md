@@ -2845,3 +2845,261 @@ changes the output (`5f9e815ef982`). Hashing 18 GiB on every read would cost
 more than the cache saves, so this stays as it is — but the fallback is only
 against truncation, not bit rot, and `H3_DIT_INT8_CACHE=off` or deleting the
 directory is the recovery.
+
+---
+
+## 2026-08-31 — 10h Spark session: SDPA sequence sweep; REJECT wider MMA tiles
+
+Autonomous pass against fox-fast bit-identity (`f5282774d3a4`). GB10 opt-in
+shared memory is 101376 B/block (static 49152). Machine e2e still drifts
+±0.5 s; microbenches and paired phases are the scoreboard.
+
+### SDPA vs sequence (`./h3_sdpa_bench`, default MMA d128, 56 heads)
+
+| seq | ms | TFLOP/s |
+|---:|---:|--------:|
+| 512 | 0.30 | 25 |
+| 1024 | 1.09 | 28 |
+| **1874 (fox-fast)** | **3.05** | **33** |
+| 2273 | 4.69 | 32 |
+| 4096 | 13.7 | 35 |
+| 8192 | 49.2 | 39 |
+| 16384 | 189 | 41 |
+
+Wall ~N²; efficiency rises with N. Wave vs MMA at 1874: **23.3 ms vs 3.08 ms**.
+Keep MMA. Ablating both MMAs at 1874 saved 0.11 ms of 3.06, so the pipes are
+already hidden on fox-fast; the 15 s clip is where N² shows up (sdpa 920 s of
+1067 s denoise).
+
+### REJECT DiT MMA 8 warps + Q from global
+
+Shipping kernel: 4 warps, M=64, 128 threads, Q staged in the V tile.
+Tried `H3_MMA_WARPS=8` (M=128, 256 threads) with Q fragments from global so Q
+does not need 128-row smem.
+
+| seq | 8-warp Q-global | 4-warp Q-global | original smem 4-warp |
+|---:|---:|---:|---:|
+| 1874 | **4.97 ms (worse)** | 3.22 | **3.05** |
+| 8192 | 78.7 | 49.3 | ~50 |
+| 16384 | 268 | 188 | ~189 |
+
+Reverted. Extra warps hurt occupancy on this path; Q-from-global alone is ~6 %
+slower at 4 warps. Widening the DiT row tile is priced and closed.
+
+### REJECT VAE F32 16-warp + Q from global
+
+Open end from the 8-warp KEEP: 12/16 warps failed to *build* because Q halves
+exceeded 48 KB static smem. Q-from-global makes smem K/V only (`4 * N * LD`)
+and 16 warps **compile**. Microbench VAE shape seq=2273 heads=32 dim=64:
+
+| | ms |
+|---|---:|
+| orig smem Q, 8 warp | **2.20** |
+| Q-global 8 warp | 2.21 |
+| Q-global 16 warp | **2.36 (worse)** |
+
+Reverted. 16 warps is not a free traffic win. Eight warps stays the ceiling.
+
+### KEEP last-block INT8 rescale in `gate_bf16` / `gate_adaln_bf16`
+
+The twelve leftover `apply_scales` launches in a four-step run were the last
+block of each pass, whose gate is not the quantizing one. Same rounding as the
+quantize fusion (`bf16(accum * row_scale * col_scale)`). The CUDA gates now
+consume a matching defer record automatically, so Metal's API is unchanged.
+
+| | md5 |
+|---|---|
+| fox-fast 512² 22f | `f5282774d3a4` (unchanged) |
+| 384² 22f fused vs `H3_DISABLE_FUSED_BRANCH_RESCALE=1` | both `67f35f6e0ece` |
+
+Denoise 8.325 s / e2e 15.69 s on a warm machine — inside ±0.5 s drift, so this
+is accepted on bit-identity and on closing the leftover launches, not on wall.
+Expected kernel-time save is tens of milliseconds at fox-fast (the previous
+fusion's last 12 calls were 3 ms in four steps).
+
+### REJECT DiT MMA `cp.async` K prefetch
+
+After QK the K tile is dead, so the next 64-key tile can copy into it while
+softmax and P·V run. V still needs a BF16→FP16 convert, so it stayed a
+synchronous fill after the wait. Extra `__syncthreads` after QK (so a warp
+cannot overwrite K another warp still reads) is required for correctness.
+
+| seq | baseline | K prefetch |
+|---:|---:|---:|
+| 1874 | **3.062 ms** | 3.314 ms |
+| 8192 | **49.072 ms** | 52.292 ms |
+
+~8 % slower at both lengths. The extra barriers and the still-exposed V convert
+cost more than the hidden K copy. Reverted. Double-buffering V in opt-in smem
+is the same idea with more traffic still on the V convert, so it is not next.
+
+### REJECT dropping the MMA shared-memory pad (`H3_MMA_LD=128`)
+
+The +8 halves exist so A- and B-fragment rows hit distinct banks. Removing them:
+
+| seq | LD=136 | LD=128 |
+|---:|---:|---:|
+| 1874 | **3.153 ms** | 4.354 ms |
+| 8192 | **49.151 ms** | 74.392 ms |
+
+~1.4× / 1.5× worse. Keep 136. The `#ifndef H3_MMA_LD` override stays so this
+does not have to be re-derived.
+
+### KEEP packed BF16→FP16 V convert in DiT MMA fill
+
+The tile fill converted each V pair as two scalar `bf16→f32→f16` RN rounds.
+One `float2→half2` is the same rounding on finite values and issues half the
+converts:
+
+| seq | scalar | packed |
+|---:|---:|---:|
+| 1874 | 3.153 ms | **2.944 / 3.000 ms** |
+| 8192 | 49.151 ms | **47.225 / 47.012 ms** |
+
+~4–6 % on the kernel. Fox-fast md5 `f5282774d3a4`, 384² `67f35f6e0ece`, ops
+mma relL2 still 0.00239. Denoise sdpa 1.526 s → 1.479 s on a paired warm run.
+
+### KEEP packed hi/lo FP16 split in VAE F32 MMA fill
+
+The decoder attention splits each F32 into hi and lo FP16. The lo convert was
+re-doing the hi RN rounds to form the residual. One `float2→half2` for hi,
+reconstruct, then one for the residual (still saturating like `h3_f16_bits`):
+
+| | scalar hi+lo | split_pair |
+|---|---:|---:|
+| seq 2273 heads 32 | 2.221 ms | **2.181 ms** |
+
+~2 % on the kernel, ~6 ms across 144 fox-fast calls. md5 `f5282774d3a4`, F32
+sdpa relL2 vs f64 still 0.000020. Video VAE sdpa 0.317 s → 0.310 s. Keep it
+as the same transform as the DiT packed V convert, not as an e2e claim.
+
+### REJECT float4 video-VAE SwiGLU
+
+`h3_swiglu_f32` at the decoder shape (2273 × 8192) is already ~251 GB/s on
+223 MB of traffic — the HBM roof, not `expf`. Vectorizing to `float4` with
+the same per-element `expf` made it worse:
+
+| | ms |
+|---|---:|
+| scalar | **0.888** |
+| float4 | 0.929 / 0.933 |
+
+144 calls would have moved ~6 ms the wrong way. Reverted. Residual
+`scale_add` is the same bandwidth story. The remaining VAE elementwise lever
+is QK RMS inside `h3_video_qkv_rope_f32`, which still recomputes the sum on
+every lane the way DiT QKV used to.
+
+### Video VAE linear: no new bit-identical lever
+
+Fox-fast VAE is ~1.58 s linear of ~2.69 s. That path already uses cuBLASLt
+with candidate-0 bit check (no split-K) and TF32 only on GEMMs with
+M,N,K ≥ 512 (`H3_DISABLE_F32_TF32=1` forces exact FP32). BF16x9 emulation
+was already a wash. Not touching it.
+
+### REJECT half2 `h3_pack_f16_pair` for DiT P fragments
+
+P is packed from registers, not HBM, so the same float2 convert that helped
+the V fill does not apply. MMA at 1874 is already hidden:
+
+| seq | scalar pack | half2 pack |
+|---:|---:|---:|
+| 1874 | **2.967 ms** | 2.977 ms |
+| 8192 | **47.123 ms** | 47.743 ms |
+
+Reverted. Ops relL2 unchanged; the 8192 arm is slightly slower.
+
+### REJECT split_pair for VAE F32 P fragments
+
+The fill-path `h3_pack_f16_split_pair` reuse of the hi half2 does not carry
+over to packing softmax P in registers. Same 2273×32 microbench:
+
+| | ms |
+|---|---:|
+| hi_pair + lo_pair | **2.181** |
+| split_pair | 3.335 / 3.288 |
+
+~1.5× slower. Reverted. Do not reuse the fill helper in the P·V inner loop.
+
+### KEEP cooperative video-VAE QKV RMS (serial sum on thread 0)
+
+`h3_video_qkv_rope_f32` launched two 32-thread blocks per head of 64, and
+every lane squared the whole head (`O(d²)` fmafs). DiT already paid that
+once. The decoder now uses one block per (head, row): thread 0 still runs
+the same `fmaf` loop over `d = 0 … head_dim-1`, then the block applies
+RoPE. Tree reduces would be faster and would change the inverse, so they
+are not used. Opt out `H3_VIDEO_QKV_SERIAL_RMS=1`.
+
+| | ms / call (seq 2273, 32 heads, d=64) |
+|---|---:|
+| serial (every lane) | 0.692 |
+| **coop, serial sum on thread 0** | **0.536** |
+
+~22 % on the kernel, ~22 ms across 144 fox-fast calls. Ops `video_qkv_rope_f32`
+still matches the reference; fox-fast md5 `f5282774d3a4`.
+
+A follow-up: thread 0's serial walk was loading Q/K from global. The block now
+coalesces those loads into the RoPE smem first, then thread 0 fmafs in the
+same `d` order from smem (and no padded lane returns before a barrier):
+
+| | ms / call |
+|---|---:|
+| coop, thread 0 from global | 0.536 |
+| **coop, coalesced smem then serial fmaf** | **0.479 / 0.482** |
+
+Same md5. The extra barrier is paid for by not pointer-chasing 128 scalars
+from HBM on one thread.
+
+### REJECT split_pair for VAE F32 P fragments
+
+The fill-path `h3_pack_f16_split_pair` reuse of the hi half2 does not carry
+over to packing softmax P in registers. Same 2273×32 microbench:
+
+| | ms |
+|---|---:|
+| hi_pair + lo_pair | **2.181** |
+| split_pair | 3.335 / 3.288 |
+
+~1.5× slower. Reverted. Do not reuse the fill helper in the P·V inner loop.
+
+---
+
+## 2026-09-01 — 10h Spark session closed (06:28 +0800)
+
+Window ended with no remaining cheap bit-identical lever that is not already on
+the REJECT list below. Fox-fast md5 still `f5282774d3a4`; second shape 384² 22f
+still `67f35f6e0ece`. Do not use e2e wall for claims under ~0.2 s.
+
+### KEEP (this session)
+
+- Last-block INT8 rescale into `gate_bf16` / `gate_adaln_bf16` (CUDA consumes
+  the defer record; kill switch `H3_DISABLE_FUSED_BRANCH_RESCALE`).
+- Packed BF16→FP16 V convert in DiT MMA fill (~4–6% kernel: 1874 ~3.15→~2.94–3.00
+  ms; denoise sdpa 1.526→1.479 s).
+- Packed hi/lo FP16 split in VAE F32 MMA *fill* (2273×32: 2.221→2.181 ms).
+- Video VAE QKV RMS: one block per (head, row), serial `fmaf` on thread 0, then
+  coalesced Q/K into RoPE smem (0.692→0.536→~0.48 ms). Opt-out
+  `H3_VIDEO_QKV_SERIAL_RMS=1`.
+
+`H3_MMA_LD` stays 136.
+
+### REJECT (this session; do not retry)
+
+- DiT MMA 8-warp + Q from global; 4-warp Q-from-global.
+- VAE F32 16-warp + Q from global (8-warp stays ceiling).
+- DiT MMA `cp.async` K prefetch.
+- `H3_MMA_LD=128`.
+- half2 `h3_pack_f16_pair` for DiT P fragments.
+- VAE F32 P-fragment `split_pair` (2.181→~3.3 ms); keep `hi_pair`/`lo_pair` in
+  the P·V inner loop.
+- float4 VAE SwiGLU (already ~251 GB/s).
+- VAE linear split-K / extra bit-identical GEMM tricks (already Lt + candidate-0
+  check; TF32 only if M,N,K ≥ 512).
+
+RMSNorm float4 and `scale_add` float4 were not implemented: they would change
+reduction association or sit on the same HBM roof.
+
+### What is still slow
+
+Fox-fast GEMM/MMA is not the long-video wall. A 15 s T2VA is still ~92% denoise,
+and ~86% of that denoise is DiT SDPA (N²). Do not chase 98 TFLOP/s MMA at seq
+1874; the pipes are already hidden there.

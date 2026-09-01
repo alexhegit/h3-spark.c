@@ -364,9 +364,10 @@ int h3_gpu_mlp_fp8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                         uint32_t output_dim);
 /* defer_scales leaves the INT8 GEMM's int32 accumulator unscaled for a
  * following consumer to fold the rescale into its own first read, skipping a
- * full BF16 round trip through memory. Only h3_gpu_gate_adaln_quantize_int8
- * consumes it today, and only when called immediately afterwards: the next
- * INT8 GEMM reuses the same accumulator. Output is bit-identical either way. */
+ * full BF16 round trip through memory. Consumers are
+ * h3_gpu_gate_adaln_quantize_int8, h3_gpu_gate_adaln_bf16, and
+ * h3_gpu_gate_bf16 when called immediately afterwards: the next INT8 GEMM
+ * reuses the same accumulator. Output is bit-identical either way. */
 int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,

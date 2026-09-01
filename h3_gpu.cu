@@ -7,6 +7,8 @@ extern "C" {
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <cuda_fp8.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -2042,10 +2044,22 @@ struct h3_gate_args {
     uint32_t gate_slot;
 };
 
+__device__ __forceinline__ static float h3_branch_value_bf16(
+    const uint16_t *branch, const int32_t *branch_accum,
+    float branch_row_scale, const float *branch_weight_scales, size_t index,
+    uint32_t column) {
+    if (branch_accum)
+        return h3_bf16_bits_to_f32(h3_f32_to_bf16_bits(
+            (float)branch_accum[index] * branch_row_scale *
+            branch_weight_scales[column]));
+    return h3_bf16_bits_to_f32(branch[index]);
+}
+
 __global__ static void h3_gate_bf16_kernel(
     const uint16_t *residual, const uint16_t *branch,
     const uint16_t *modulation, const uint32_t *row_map, uint16_t *output,
-    h3_gate_args args) {
+    h3_gate_args args, const int32_t *branch_accum,
+    const float *branch_input_scales, const float *branch_weight_scales) {
     uint32_t column = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t row = (uint32_t)blockIdx.y;
     if (row >= args.rows || column >= args.width) return;
@@ -2053,9 +2067,30 @@ __global__ static void h3_gate_bf16_kernel(
     float gate = h3_bf16_bits_to_f32(
         modulation[base + args.gate_slot * args.width + column]);
     size_t index = (size_t)row * args.width + column;
+    float branch_row_scale = branch_accum ? branch_input_scales[row] : 0.0f;
     float value = h3_bf16_bits_to_f32(residual[index]) +
-                  h3_bf16_bits_to_f32(branch[index]) * gate;
+                  h3_branch_value_bf16(branch, branch_accum, branch_row_scale,
+                                       branch_weight_scales, index, column) *
+                      gate;
     output[index] = h3_f32_to_bf16_bits(value);
+}
+
+static int h3_take_int8_defer(h3_gpu *gpu, uint32_t rows, uint32_t width,
+                              const int32_t **accum, const float **input_scales,
+                              const float **weight_scales) {
+    if (gpu->int8_defer_rows == rows && gpu->int8_defer_columns == width &&
+        gpu->int8_accum) {
+        *accum = gpu->int8_accum;
+        *input_scales = gpu->int8_defer_input_scales;
+        *weight_scales = gpu->int8_defer_weight_scales;
+        gpu->int8_defer_rows = 0;
+        gpu->int8_defer_columns = 0;
+        return 1;
+    }
+    *accum = NULL;
+    *input_scales = NULL;
+    *weight_scales = NULL;
+    return 0;
 }
 
 int h3_gpu_gate_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -2072,13 +2107,19 @@ int h3_gpu_gate_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         residual->elements < count || branch->elements < count ||
         row_map->elements < rows || gate_slot >= slots || !rows || !width)
         return h3_gpu_fail(gpu, "invalid gate request");
+    const int32_t *branch_accum = NULL;
+    const float *branch_input_scales = NULL;
+    const float *branch_weight_scales = NULL;
+    h3_take_int8_defer(gpu, rows, width, &branch_accum, &branch_input_scales,
+                       &branch_weight_scales);
     h3_gate_args args = {rows, width, slots, gate_slot};
     dim3 threads(256, 1, 1);
     dim3 blocks((width + threads.x - 1) / threads.x, rows, 1);
     h3_gate_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
         (const uint16_t *)residual->device, (const uint16_t *)branch->device,
         (const uint16_t *)modulation->device,
-        (const uint32_t *)row_map->device, (uint16_t *)output->device, args);
+        (const uint32_t *)row_map->device, (uint16_t *)output->device, args,
+        branch_accum, branch_input_scales, branch_weight_scales);
     gpu->stats.direct_dispatches++;
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_gate_bf16");
 }
@@ -3233,8 +3274,11 @@ h3_sdpa_bf16_wave_d128_q8_kernel(const uint16_t *query, const uint16_t *key,
 #define H3_MMA_M 64u
 #define H3_MMA_N 64u
 /* 128 + 8 halves: makes the shared-memory rows land on distinct banks for
- * both the A-fragment and the B-fragment access patterns. */
+ * both the A-fragment and the B-fragment access patterns. Override with
+ * -DH3_MMA_LD=128u to price the pad. */
+#ifndef H3_MMA_LD
 #define H3_MMA_LD 136u
+#endif
 
 __device__ __forceinline__ static void h3_mma_m16n8k16_bf16(
     float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
@@ -3276,6 +3320,17 @@ __device__ __forceinline__ static uint32_t h3_f16_bits(float value) {
 __device__ __forceinline__ static uint32_t h3_pack_f16_pair(float low,
                                                             float high) {
     return h3_f16_bits(low) | (h3_f16_bits(high) << 16);
+}
+
+/* Two BF16→FP16 converts as one float2→half2. Same RN rounding as
+ * h3_pack_f16_pair on finite V (the MMA path saturates elsewhere). */
+__device__ __forceinline__ static uint32_t h3_bf16_pair_to_f16(uint32_t raw) {
+    nv_bfloat162 in;
+    memcpy(&in, &raw, sizeof(in));
+    half2 out = __float22half2_rn(__bfloat1622float2(in));
+    uint32_t packed;
+    memcpy(&packed, &out, sizeof(packed));
+    return packed;
 }
 
 __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
@@ -3346,9 +3401,7 @@ __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
                 size_t base = ((size_t)source * heads + head) * 128u + column;
                 packed_k = *(const uint32_t *)(key + base);
                 uint32_t raw_v = *(const uint32_t *)(value + base);
-                packed_v = h3_pack_f16_pair(
-                    h3_bf16_bits_to_f32((uint16_t)(raw_v & 0xffffu)),
-                    h3_bf16_bits_to_f32((uint16_t)(raw_v >> 16u)));
+                packed_v = h3_bf16_pair_to_f16(raw_v);
             }
             *(uint32_t *)&k_tile[row * H3_MMA_LD + column] = packed_k;
             *(uint32_t *)&v_tile[row * H3_MMA_LD + column] = packed_v;
@@ -4558,7 +4611,9 @@ __global__ static void h3_gate_adaln_bf16_kernel(
     const uint16_t *residual, const uint16_t *branch,
     const uint16_t *gate_modulation, const uint32_t *row_map,
     const uint16_t *weight, const uint16_t *norm_modulation,
-    uint16_t *gated_residual, uint16_t *output, h3_gate_adaln_args args) {
+    uint16_t *gated_residual, uint16_t *output, h3_gate_adaln_args args,
+    const int32_t *branch_accum, const float *branch_input_scales,
+    const float *branch_weight_scales) {
     uint32_t row = (uint32_t)blockIdx.x;
     uint32_t tid = threadIdx.x;
     uint32_t threads = blockDim.x;
@@ -4569,13 +4624,16 @@ __global__ static void h3_gate_adaln_bf16_kernel(
         (uint16_t *)(shared_raw + threads * sizeof(float));
     size_t base = (size_t)row_map[row] * args.slots * args.width;
     float local_sum = 0.0f;
+    float branch_row_scale = branch_accum ? branch_input_scales[row] : 0.0f;
     for (uint32_t column = tid; column < args.width; column += threads) {
         size_t index = (size_t)row * args.width + column;
         float gate = h3_bf16_bits_to_f32(
             gate_modulation[base + args.gate_slot * args.width + column]);
         uint16_t gated = h3_f32_to_bf16_bits(
             h3_bf16_bits_to_f32(residual[index]) +
-            h3_bf16_bits_to_f32(branch[index]) * gate);
+            h3_branch_value_bf16(branch, branch_accum, branch_row_scale,
+                                 branch_weight_scales, index, column) *
+                gate);
         gated_residual[index] = gated;
         gated_values[column] = gated;
         float value = h3_bf16_bits_to_f32(gated);
@@ -4623,6 +4681,11 @@ int h3_gpu_gate_adaln_bf16(
         branch->elements < elements || norm_weight->elements < width ||
         row_map->elements < rows)
         return h3_gpu_fail(gpu, "invalid fused gate AdaLN request");
+    const int32_t *branch_accum = NULL;
+    const float *branch_input_scales = NULL;
+    const float *branch_weight_scales = NULL;
+    h3_take_int8_defer(gpu, rows, width, &branch_accum, &branch_input_scales,
+                       &branch_weight_scales);
     h3_gate_adaln_args args = {rows, width, slots, gate_slot, shift_slot,
                                scale_slot, epsilon};
     unsigned threads = 256;
@@ -4633,7 +4696,8 @@ int h3_gpu_gate_adaln_bf16(
         (const uint16_t *)gate_modulation->device,
         (const uint32_t *)row_map->device, (const uint16_t *)norm_weight->device,
         (const uint16_t *)norm_modulation->device,
-        (uint16_t *)gated_residual->device, (uint16_t *)output->device, args);
+        (uint16_t *)gated_residual->device, (uint16_t *)output->device, args,
+        branch_accum, branch_input_scales, branch_weight_scales);
     gpu->stats.direct_dispatches++;
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_gate_adaln_bf16");
 }
@@ -5209,6 +5273,72 @@ __global__ static void h3_video_qkv_rope_f32_kernel(
     value[output_index] = qkv[base + args.head_dim * 2u + dimension];
 }
 
+/* One block per (head, row): thread 0 still does the serial fmaf sum so the
+ * inverse matches the kernel above bit for bit, then every lane applies RoPE.
+ * Opt out H3_VIDEO_QKV_SERIAL_RMS=1. */
+__global__ static void h3_video_qkv_rope_f32_coop_kernel(
+    const float *qkv, const float *rope_cos, const float *rope_sin,
+    float *query, float *key, float *value, h3_video_qkv_rope_args args) {
+    uint32_t dimension = (uint32_t)threadIdx.x;
+    uint32_t head = (uint32_t)blockIdx.y;
+    uint32_t row = (uint32_t)blockIdx.z;
+    if (head >= args.heads || row >= args.sequence) return;
+    size_t base =
+        ((size_t)row * args.heads + head) * args.head_dim * 3u;
+    __shared__ float q_inv;
+    __shared__ float k_inv;
+    extern __shared__ float pair_smem[];
+    float *q_sh = pair_smem;
+    float *k_sh = pair_smem + args.head_dim;
+    if (dimension < args.head_dim) {
+        q_sh[dimension] = qkv[base + dimension];
+        k_sh[dimension] = qkv[base + args.head_dim + dimension];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float q_sum = 0.0f;
+        float k_sum = 0.0f;
+        for (uint32_t d = 0; d < args.head_dim; d++) {
+            q_sum = fmaf(q_sh[d], q_sh[d], q_sum);
+            k_sum = fmaf(k_sh[d], k_sh[d], k_sum);
+        }
+        q_inv = rsqrtf(q_sum / (float)args.head_dim + args.epsilon);
+        k_inv = rsqrtf(k_sum / (float)args.head_dim + args.epsilon);
+    }
+    __syncthreads();
+    float q0 = 0.0f;
+    float k0 = 0.0f;
+    if (dimension < args.head_dim) {
+        q0 = q_sh[dimension] * q_inv;
+        k0 = k_sh[dimension] * k_inv;
+        q_sh[dimension] = q0;
+        k_sh[dimension] = k0;
+    }
+    __syncthreads();
+    if (dimension >= args.head_dim) return;
+    if (dimension < args.rope_half) {
+        float q1 = q_sh[dimension + args.rope_half];
+        float k1 = k_sh[dimension + args.rope_half];
+        float c = rope_cos[row * args.rope_half + dimension];
+        float s = rope_sin[row * args.rope_half + dimension];
+        q0 = q0 * c - q1 * s;
+        k0 = k0 * c - k1 * s;
+    } else if (dimension < args.rope_half * 2u) {
+        uint32_t pair = dimension - args.rope_half;
+        float q1 = q_sh[pair];
+        float k1 = k_sh[pair];
+        float c = rope_cos[row * args.rope_half + pair];
+        float s = rope_sin[row * args.rope_half + pair];
+        q0 = q0 * c + q1 * s;
+        k0 = k0 * c + k1 * s;
+    }
+    size_t output_index =
+        ((size_t)row * args.heads + head) * args.head_dim + dimension;
+    query[output_index] = q0;
+    key[output_index] = k0;
+    value[output_index] = qkv[base + args.head_dim * 2u + dimension];
+}
+
 int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
                               h3_gpu_tensor *key, h3_gpu_tensor *value,
                               const h3_gpu_tensor *qkv,
@@ -5232,12 +5362,25 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
         return h3_gpu_fail(gpu, "invalid video QKV/RoPE request");
     h3_video_qkv_rope_args args = {sequence, heads, head_dim, rope_half,
                                    epsilon};
-    dim3 threads(32, 1, 1);
-    dim3 blocks((head_dim + threads.x - 1) / threads.x, heads, sequence);
-    h3_video_qkv_rope_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
-        (const float *)qkv->device, (const float *)rope_cos->device,
-        (const float *)rope_sin->device, (float *)query->device,
-        (float *)key->device, (float *)value->device, args);
+    if (!h3_env_on("H3_VIDEO_QKV_SERIAL_RMS")) {
+        uint32_t threads_x = (head_dim + 31u) & ~31u;
+        if (threads_x < 32u) threads_x = 32u;
+        dim3 blocks(1, heads, sequence);
+        dim3 threads(threads_x, 1, 1);
+        size_t smem = (size_t)head_dim * 2u * sizeof(float);
+        h3_video_qkv_rope_f32_coop_kernel<<<blocks, threads, smem,
+                                            gpu->stream>>>(
+            (const float *)qkv->device, (const float *)rope_cos->device,
+            (const float *)rope_sin->device, (float *)query->device,
+            (float *)key->device, (float *)value->device, args);
+    } else {
+        dim3 threads(32, 1, 1);
+        dim3 blocks((head_dim + threads.x - 1) / threads.x, heads, sequence);
+        h3_video_qkv_rope_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+            (const float *)qkv->device, (const float *)rope_cos->device,
+            (const float *)rope_sin->device, (float *)query->device,
+            (float *)key->device, (float *)value->device, args);
+    }
     gpu->stats.direct_dispatches++;
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_video_qkv_rope_f32");
 }
@@ -5519,6 +5662,23 @@ __device__ __forceinline__ static uint32_t h3_pack_f16_lo_pair(float low,
     return h3_pack_f16_pair(low_residual, high_residual);
 }
 
+/* hi then lo of two F32s, reusing the hi half2 so the residual convert does
+ * not redo the same two RN rounds. Saturate like h3_f16_bits so infs cannot
+ * leak into the MMA. */
+__device__ __forceinline__ static void h3_pack_f16_split_pair(
+    float low, float high, uint32_t *hi_out, uint32_t *lo_out) {
+    float2 sat = make_float2(fminf(fmaxf(low, -65504.0f), 65504.0f),
+                             fminf(fmaxf(high, -65504.0f), 65504.0f));
+    half2 hi = __float22half2_rn(sat);
+    memcpy(hi_out, &hi, sizeof(*hi_out));
+    float2 back = __half22float2(hi);
+    float2 resid = make_float2(
+        fminf(fmaxf(low - back.x, -65504.0f), 65504.0f),
+        fminf(fmaxf(high - back.y, -65504.0f), 65504.0f));
+    half2 lo = __float22half2_rn(resid);
+    memcpy(lo_out, &lo, sizeof(*lo_out));
+}
+
 __global__ __launch_bounds__(H3_MMA_F32_THREADS) static void
 h3_sdpa_f32_mma_d64_kernel(
     const float *__restrict__ query, const float *__restrict__ key,
@@ -5559,8 +5719,7 @@ h3_sdpa_f32_mma_d64_kernel(
         if (source < sequence) {
             const float *base =
                 query + ((size_t)source * heads + head) * 64u + column;
-            packed = h3_pack_f16_hi_pair(base[0], base[1]);
-            packed_low = h3_pack_f16_lo_pair(base[0], base[1]);
+            h3_pack_f16_split_pair(base[0], base[1], &packed, &packed_low);
         }
         *(uint32_t *)&q_tile[row * H3_MMA_F32_LD + column] = packed;
         *(uint32_t *)&q_low_tile[row * H3_MMA_F32_LD + column] = packed_low;
@@ -5611,11 +5770,10 @@ h3_sdpa_f32_mma_d64_kernel(
             uint32_t source = n0 + row;
             if (source < sequence) {
                 size_t base = ((size_t)source * heads + head) * 64u + column;
-                packed_k = h3_pack_f16_hi_pair(key[base], key[base + 1]);
-                packed_k_low = h3_pack_f16_lo_pair(key[base], key[base + 1]);
-                packed_v = h3_pack_f16_hi_pair(value[base], value[base + 1]);
-                packed_v_low =
-                    h3_pack_f16_lo_pair(value[base], value[base + 1]);
+                h3_pack_f16_split_pair(key[base], key[base + 1], &packed_k,
+                                       &packed_k_low);
+                h3_pack_f16_split_pair(value[base], value[base + 1], &packed_v,
+                                       &packed_v_low);
             }
             *(uint32_t *)&k_tile[row * H3_MMA_F32_LD + column] = packed_k;
             *(uint32_t *)&k_low_tile[row * H3_MMA_F32_LD + column] =
