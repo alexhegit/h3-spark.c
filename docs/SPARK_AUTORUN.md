@@ -1,6 +1,7 @@
 # Spark autoloop progress log
 
-Automated **h3-cuda** port on DGX Spark (`spark` branch).
+Automated **h3-cuda** port on DGX Spark. Shipping tag: **v0.2.0**
+(`perf/dit-denoise-opt`).
 
 ## Plan (revised 2026-08-17)
 
@@ -68,9 +69,8 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 ### Planned later (D)
 
 - Implement real `h3_gpu_profile_mark` on CUDA (wall / encode / kernel buckets) — **done** (`483ffdf`)
-- **Baseline recorded:** [`PERF_BASELINE.md`](PERF_BASELINE.md) — fox-fast 512² DiT denoise **1471.7 s** vs Metal **~16.7 s** (~88×)
-- Hotspot: SDPA, GEMM/MLP fusion, VAE decode tiling (DiT first; VAE second)
-- Target: close the gap vs Metal fox-fast wall times on GB10
+- **v0.1 baseline (2026-08-17):** fox-fast DiT denoise **1471.7 s** vs Metal **~16.7 s** (~88×) — keep as history in [`PERF_BASELINE.md`](PERF_BASELINE.md)
+- **v0.2.0 shipping (2026-09-02, `03adb33`):** HIP-page knobs on GB10 — fox-s2 **~8.0 s** / fox-fast **~15.5 s** / 15 s cinematic **18 min 17 s** (TR **11 min 22 s**). Fox-fast denoise **~8.2 s**, md5 `f5282774d3a4`.
 
 ### Pending (E)
 
@@ -79,4 +79,4 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 
 ---
 
-*Last updated: 2026-08-17 — UX gates + backlog decisions*
+*Last updated: 2026-09-02 — v0.2.0 shipping snapshot*

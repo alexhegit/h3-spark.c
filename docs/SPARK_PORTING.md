@@ -1,5 +1,10 @@
 # h3-cuda: DGX Spark Porting Plan
 
+**Status (v0.2.0, 2026-09-02):** The CUDA `./h3` path on GB10 is shipping.
+Phases 0–3c are done. Unchecked boxes in [Implementation phases](#implementation-phases)
+are leftover plan text, not open work. Current speed:
+[`README.md`](../README.md) and [`PERF_BASELINE.md`](PERF_BASELINE.md).
+
 This document describes how to port **h3-metal** to **NVIDIA DGX Spark** while
 preserving the two properties that define the project:
 
@@ -456,6 +461,9 @@ Keep **`make test`** structure; add CUDA parity runners alongside Metal names:
 
 ## Implementation phases
 
+Historical plan. **v0.2.0:** Phases 0–3c are done (`SPARK_AUTORUN.md`). The
+checkboxes below are not a current TODO list.
+
 ### Phase 0 — Scaffold ✅
 
 - [x] `Makefile.linux`, `h3_cuda.c` probe, `h3_device.c`, `h3_tokenizer.c`
@@ -521,7 +529,9 @@ a GEMM or attention tile, then reimplement as static CUDA in `h3_kernels.cu`.
 1. `./h3` is a **standalone Linux AArch64 binary** with dependencies in
    [Dependency budget](#dependency-budget) only.
 2. Prompt-to-video/audio at 512×512 with README default presets.
-3. `--profile` DiT denoise within a reasonable factor of M5 Max (TBD after Phase 2).
+3. `--profile` DiT denoise on fox-fast is **~8.2 s** on GB10 (v0.2.0); Metal M5
+   Max docs quote **16.69 s** denoise on the same knobs. 15 s cinematic is still
+   long-N SDPA (~16.8 min denoise).
 4. `make test` passes host + parity + real-weight tests when fixtures installed.
 5. No Python or PyTorch at runtime.
 6. All existing CLI flags and `H3_DISABLE_*` diagnostics behave consistently.

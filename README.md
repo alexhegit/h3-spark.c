@@ -1,12 +1,12 @@
 # h3-spark.c
 
-CUDA port of [antirez/h3.c](https://github.com/antirez/h3.c) for **NVIDIA DGX
-Spark** (GB10). The original project is a native MiniMax-H3 inference engine
-(Apple Metal / macOS); this repository reimplements the GPU backend for CUDA so
-the same CLI and model stack run on Spark.
+**v0.2.0** — NVIDIA DGX Spark (GB10) CUDA port of
+[antirez/h3.c](https://github.com/antirez/h3.c). MiniMax-H3 inference with the
+same CLI and model stack; the GPU backend is CUDA.
 
 **Original project:** [antirez/h3.c](https://github.com/antirez/h3.c)  
-**Official weights:** [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3)
+**Official weights:** [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3)  
+**Changelog:** [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Showcase (DGX Spark)
 
@@ -48,7 +48,7 @@ COMMON=(--width 512 --height 512 --frames 22 --steps 20 --layers 45 --reuse 2)
 Reference stills under `assets/showcase/refs/` were taken from the official
 MiniMax-H3 demo assets (`ref2va.mp4` / `fl2va.mp4`).
 
-## Status (2026-08-17)
+## Status (v0.2.0, 2026-09-02)
 
 | Capability | Status |
 |------------|--------|
@@ -57,7 +57,7 @@ MiniMax-H3 demo assets (`ref2va.mp4` / `fl2va.mp4`).
 | Ref2VA (`--ref-image`, `--ref-video`, …) | ✅ |
 | Runtime INT8 MLP (opt-in `H3_INT8_MLP=1`; BF16 MLP is faster on GB10) | ✅ |
 | `--ref-audio` + preview UX (`--frames-dir`, `--show`) | ✅ |
-| Performance vs Metal / CUDA `--profile` phases | 📋 baseline — [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) |
+| fox-s2 / fox-fast / 15 s cinematic | GB10 scoreboard below — [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) |
 
 Progress log: [`docs/SPARK_AUTORUN.md`](docs/SPARK_AUTORUN.md) · Known gaps:
 [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) · Porting notes:
@@ -95,7 +95,46 @@ Same fox-fast preset as the T2VA showcase clip:
 ```
 
 First run pays model load + filesystem cache; repeat runs for timing.
-For Ref2VA / FL2VA reproduction commands, see [Showcase](#showcase-dgx-spark).
+On DGX Spark (GB10) at `03adb33`, **warm** repeats of this command are about
+**15.5 s** wall (**8.2 s** GPU Euler denoise); output md5 prefix
+`f5282774d3a4`. Dated tables:
+[`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md).
+
+## HIP-page presets (GB10, v0.2.0)
+
+Same CLI knobs as the [h3-hip.c](https://alexhegit.github.io/h3-hip.c/)
+reproduce section (`03adb33`, `--seed 42`, `--profile`). These are Spark
+measurements of those commands, not a vendor bake-off.
+
+| Preset | knobs | GB10 E2E | denoise (sdpa / linear) | md5 prefix |
+|---|---|---:|---|---|
+| **fox-s2** | 512² 22f, steps 2, L35 R1 | **8.0 s** warm | **1.19 s** (0.20 / 0.76) | `aeb5ae10e105` |
+| **fox-fast** | 512² 22f, steps 20, L45 R2 | **15.5 s** warm | **8.20 s** (1.43 / 5.19) | `f5282774d3a4` |
+| **15 s cinematic** | 864×480, `--seconds 15`, L45 R2 | **18 min 17 s** | **16 min 51 s** (866 / 110) | `60fd70cc309c` |
+| same + `--token-reduction` | opt-in; quality trade | **11 min 22 s** | **9 min 53 s** (486 / 82) | `19c109ebb0cb` |
+
+fox-s2 wall is mostly video VAE (~2.5 s) + Qwen (~2.1 s), not DiT. 15 s wall
+is still long-N SDPA. Logs: `/tmp/h3_perf/hip-examples-20260902/`.
+
+```bash
+# fox-s2 — short A/B smoke
+./h3 --profile -d /path/to/MiniMax-H3 \
+  -p "A red fox walks through fresh snow." \
+  --width 512 --height 512 --frames 22 \
+  --steps 2 --layers 35 --reuse 1 --seed 42 \
+  -o outputs/fox-s2.mp4
+
+# 15 s cinematic — same knobs as the HIP page (paste that office prompt)
+./h3 --profile -d /path/to/MiniMax-H3 \
+  -p "$PROMPT_15S" \
+  --width 864 --height 480 --seconds 15 \
+  --steps 20 --layers 45 --reuse 2 --seed 42 \
+  -o outputs/long-15s-cinematic.mp4
+# optional: append --token-reduction  (11 min 22 s on this box; not bit-identical)
+```
+
+The 15 s prompt is the HIP-page office/cinematic text. For Ref2VA / FL2VA
+reproduction, see [Showcase](#showcase-dgx-spark).
 
 ## `--token-reduction` (faster, worse picture)
 
@@ -117,9 +156,9 @@ reuse 2), decoded pixels vs the same run without the flag:
 | Output md5 | `f5282774d3a4` → `4d1d250e5ab9` |
 | Audio | also not identical |
 
-The speed is real (15 s T2VA 1124 s → 695 s on one cinematic A/B) and so is
-the quality hit (fur, edges). Do not use this flag when you need the
-bit-identical fox-fast reference. Details:
+The speed is real (15 s cinematic **1097 s → 682 s** on the HIP-page 864×480
+A/B at `03adb33`) and so is the quality hit (fur, edges). Do not use this
+flag when you need the bit-identical fox-fast reference. Details:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md).
 
 ## Conditional paths

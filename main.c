@@ -128,7 +128,7 @@ static void print_component(const char *label, const h3_component_info *item) {
 static void print_info(const h3_ctx *ctx) {
     const h3_device_info *device = h3_device(ctx);
     const h3_model_info *model = h3_model(ctx);
-    printf("h3-metal %s\n", H3_VERSION);
+    printf("h3-spark %s\n", H3_VERSION);
     printf("Device: %s (%s)\n", device->name, device->architecture);
     printf("  physical memory       %.1f GiB\n", gib(device->physical_memory));
     printf("  recommended GPU set   %.1f GiB\n", gib(device->recommended_working_set));

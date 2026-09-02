@@ -29,13 +29,13 @@ DiT helpers is skipped.
 
 Apple M5 NAX MLP fusion. `h3_gpu_has_nax_mlp()` returns false on CUDA; leave
 unimplemented. CUDA performance work should use its own fused MLP / INT8 path
-(see backlog **D** in [`SPARK_AUTORUN.md`](SPARK_AUTORUN.md)).
+(see [`SPARK_AUTORUN.md`](SPARK_AUTORUN.md)).
 
 ## Related backlog
 
 | ID | Topic | Status |
 |----|-------|--------|
-| D | Perf + CUDA `--profile` marks | Baseline recorded — see [`PERF_BASELINE.md`](PERF_BASELINE.md); optimize next |
+| D | Perf + CUDA `--profile` | **v0.2.0 snapshot** — fox-fast ~15.5 s e2e / ~8.2 s denoise. Remaining: fox-fast INT8 linear; 15 s long-N SDPA. No wider dense-BF16 MMA on `sm_121`. [`PERF_BASELINE.md`](PERF_BASELINE.md) |
 | E | MLX fixture numerical parity | Pending (no Mac / fixtures) |
 
 Progress log: [`docs/SPARK_AUTORUN.md`](SPARK_AUTORUN.md) · Porting:

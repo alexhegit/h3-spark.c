@@ -1,8 +1,91 @@
-# Spark performance baseline (v0.1.x)
+# Spark performance baseline
 
-Recorded on **NVIDIA DGX Spark (GB10)** for optimization work. Do not treat
-these as Metal-parity targets yet — they are the **pre-optimization CUDA**
-baseline after functional completeness (`v0.1.0` + CUDA `--profile`).
+Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.0** shipping
+numbers are in the snapshots below. The 2026-08-17 tables after them are the
+**pre-optimization** CUDA baseline (`483ffdf` / `v0.1.0`), not shipping speed.
+
+## Current shipping fox-fast (v0.2.0, 2026-09-02)
+
+**Binary / tree:** `perf/dit-denoise-opt` @ `03adb33` (QK `mma.m16n8k16` + `ldmatrix.x2`)  
+**Logs:** `/tmp/h3_perf/shipping-20260902/fox-{cold,w1,w2,w3}.log`  
+**Identity:** mp4 md5 `f5282774d3a4670fec24a22d4e38274d` (prefix `f5282774d3a4`)
+
+Same README example: 512², 22 frames, steps 20, layers 45, reuse 2, seed 42.
+`--profile` + `/usr/bin/time`. First run is cold (FS cache + GPU); quote **warm**.
+
+| | WALL_SEC | denoise | sdpa | linear | video VAE | DiT load | Qwen text | md5 prefix |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| cold | 19.01 | 8.185 | 1.442 | 5.174 | 2.569 | 2.275 | 4.522 | `f5282774d3a4` |
+| warm 1 | 15.47 | 8.152 | 1.414 | 5.170 | 2.666 | 1.121 | 2.065 | `f5282774d3a4` |
+| warm 2 | 15.54 | 8.216 | 1.442 | 5.183 | 2.538 | 1.221 | 2.084 | `f5282774d3a4` |
+| warm 3 | 15.54 | 8.224 | 1.430 | 5.222 | 2.510 | 1.205 | 2.129 | `f5282774d3a4` |
+| **warm n=3** | **15.52** | **8.20** | **1.43** | **5.19** | **2.57** | **1.18** | **2.09** | `f5282774d3a4` |
+
+Warm RSS ~1.45 GiB. Denoise is ~53% of warm wall (linear ~5.2 s, sdpa ~1.4 s);
+video VAE ~17%; Qwen ~13%; DiT load ~8%. All four mp4s matched bit-for-bit.
+
+Upstream Metal M5 Max docs quote **16.69 s denoise** on this preset. Spark
+denoise is now **~8.2 s** on that same segment — the original v0.1 **~88×**
+gap is gone here. Metal full e2e was never tabulated the same way; do not
+turn this into a process-wall claim.
+
+Do not edit the 2026-08-17 tables below; they document where the port started.
+
+## HIP-page examples on GB10 (v0.2.0, 2026-09-02)
+
+Same knobs as [h3-hip.c v0.10.1](https://alexhegit.github.io/h3-hip.c/)
+reproduce commands. Spark @ `03adb33`. Logs/mp4s:
+`/tmp/h3_perf/hip-examples-20260902/`. HIP published E2E is listed only as
+orientation; that site is explicit that its numbers are not a cross-vendor
+benchmark, and this table is not one either.
+
+| Preset | GB10 E2E | GB10 denoise | HIP page gfx1151 E2E | HIP page gfx90a E2E |
+|---|---:|---:|---:|---:|
+| fox-s2 | **8.0 s** warm | **1.19 s** | 83–87 s | ~10.5 s |
+| fox-fast | **15.5 s** warm | **8.20 s** | ~95 s | ~18 s |
+| 15 s cinematic | **1097 s** (18 min 17 s) | **1011 s** | 45.0 min | 12 min 33 s |
+| 15 s + `--token-reduction` | **682 s** (11 min 22 s) | **593 s** | 28.2 min | 8 min 21 s |
+
+### fox-s2 (512², 22f, steps 2, L35, reuse 1, seed 42)
+
+Prompt: `A red fox walks through fresh snow.` mp4 md5
+`aeb5ae10e105bd81e4e041e3cfa67765`. Cache was already hot (s2-cold DiT load
+0.87 s).
+
+| | WALL | denoise | sdpa | linear | video VAE | DiT load | Qwen |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| s2-cold | 8.05 | 1.177 | 0.205 | 0.749 | 2.566 | 0.874 | 2.044 |
+| s2-w1 | 7.98 | 1.174 | 0.202 | 0.747 | 2.488 | 0.830 | 2.100 |
+| s2-w2 | 7.97 | 1.198 | 0.206 | 0.766 | 2.574 | 0.821 | 2.068 |
+| s2-w3 | 7.97 | 1.185 | 0.201 | 0.757 | 2.551 | 0.779 | 2.055 |
+| **warm n=3** | **7.97** | **1.19** | **0.20** | **0.76** | **2.54** | **0.81** | **2.07** |
+
+Wall is VAE + text, not attention. Same-session fox-fast confirm `fast-w1`:
+WALL 15.40 s, denoise 8.173 s, md5 `f5282774d3a4` (matches the n=3 snapshot).
+
+### 15 s cinematic (864×480, `--seconds 15`, L45 R2, seed 42)
+
+HIP-page office prompt. 362 FFmpeg frames. Quality path is the bit-stable
+knob set (no token reduction).
+
+| | WALL_SEC | denoise | sdpa | linear | video VAE | md5 |
+|---|---:|---:|---:|---:|---:|---|
+| quality (2026-09-01, `6c95331`) | 1124.44 | 1037.05 | 890.69 | 110.61 | 78.52 | (not recorded) |
+| **quality (this run)** | **1097.46** | **1011.24** | **866.17** | 110.23 | 77.24 | `60fd70cc309c` |
+| TR (2026-09-01) | 694.83 | 604.90 | 497.10 | 81.25 | 80.97 | (not recorded) |
+| **TR (this run)** | **681.54** | **593.37** | **485.96** | 81.51 | 79.27 | `19c109ebb0cb` |
+
+vs the 1124 s / 695 s pair: denoise **−2.5 % / −1.9 %**, in line with
+defaulting QK B loads to `ldmatrix.x2` (~3 % at seq 44800). VAE unchanged.
+TR still **−38 %** E2E vs quality on this box (1097 → 682). Quality-path
+denoise remains **92 %** of wall and **86 %** of that is SDPA.
+
+---
+
+# Historical baseline (v0.1.x, 2026-08-17)
+
+Recorded on **NVIDIA DGX Spark (GB10)** after functional completeness
+(`v0.1.0` + CUDA `--profile`). **Not current speed.**
 
 **Run date:** 2026-08-17  
 **Binary / tree:** `h3-spark.c` `main` @ `483ffdf` (CUDA `h3_gpu_profile_mark`)  
