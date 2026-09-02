@@ -3333,6 +3333,10 @@ __device__ __forceinline__ static uint32_t h3_bf16_pair_to_f16(uint32_t raw) {
     return packed;
 }
 
+} /* extern "C" — MMA SDPA is templated for H3_SDPA_HALF */
+
+/* HalfMode: 0 full, 1 drop P·V, 2 drop QK, 3 loads only. */
+template <int HalfMode>
 __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
     const uint16_t *__restrict__ query, const uint16_t *__restrict__ key,
     const uint16_t *__restrict__ value, uint16_t *__restrict__ output,
@@ -3414,16 +3418,18 @@ __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
         for (uint32_t j = 0; j < 8u; j++)
 #pragma unroll
             for (uint32_t e = 0; e < 4u; e++) score[j][e] = 0.0f;
+        if constexpr (HalfMode != 2 && HalfMode != 3) {
 #pragma unroll
-        for (uint32_t kk = 0; kk < 8u; kk++) {
-            uint32_t k0 = kk * 16u + tig * 2u;
+            for (uint32_t kk = 0; kk < 8u; kk++) {
+                uint32_t k0 = kk * 16u + tig * 2u;
 #pragma unroll
-            for (uint32_t j = 0; j < 8u; j++) {
-                uint32_t row = (j * 8u + group) * H3_MMA_LD;
-                uint32_t b_frag[2] = {
-                    *(const uint32_t *)&k_tile[row + k0],
-                    *(const uint32_t *)&k_tile[row + k0 + 8u]};
-                h3_mma_m16n8k16_bf16(score[j], q_frag[kk], b_frag);
+                for (uint32_t j = 0; j < 8u; j++) {
+                    uint32_t row = (j * 8u + group) * H3_MMA_LD;
+                    uint32_t b_frag[2] = {
+                        *(const uint32_t *)&k_tile[row + k0],
+                        *(const uint32_t *)&k_tile[row + k0 + 8u]};
+                    h3_mma_m16n8k16_bf16(score[j], q_frag[kk], b_frag);
+                }
             }
         }
 
@@ -3499,26 +3505,28 @@ __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
         }
 
         /* O += P V. P is already in A-fragment order. */
+        if constexpr (HalfMode != 1 && HalfMode != 3) {
 #pragma unroll
-        for (uint32_t kk = 0; kk < 4u; kk++) {
-            uint32_t p_frag[4] = {
-                h3_pack_f16_pair(score[kk * 2u][0], score[kk * 2u][1]),
-                h3_pack_f16_pair(score[kk * 2u][2], score[kk * 2u][3]),
-                h3_pack_f16_pair(score[kk * 2u + 1u][0],
-                                 score[kk * 2u + 1u][1]),
-                h3_pack_f16_pair(score[kk * 2u + 1u][2],
-                                 score[kk * 2u + 1u][3])};
-            uint32_t n_low = (kk * 16u + tig * 2u) * H3_MMA_LD;
-            uint32_t n_high = n_low + 8u * H3_MMA_LD;
+            for (uint32_t kk = 0; kk < 4u; kk++) {
+                uint32_t p_frag[4] = {
+                    h3_pack_f16_pair(score[kk * 2u][0], score[kk * 2u][1]),
+                    h3_pack_f16_pair(score[kk * 2u][2], score[kk * 2u][3]),
+                    h3_pack_f16_pair(score[kk * 2u + 1u][0],
+                                     score[kk * 2u + 1u][1]),
+                    h3_pack_f16_pair(score[kk * 2u + 1u][2],
+                                     score[kk * 2u + 1u][3])};
+                uint32_t n_low = (kk * 16u + tig * 2u) * H3_MMA_LD;
+                uint32_t n_high = n_low + 8u * H3_MMA_LD;
 #pragma unroll
-            for (uint32_t dt = 0; dt < 16u; dt++) {
-                uint32_t column = dt * 8u + group;
-                uint32_t b_frag[2] = {
-                    (uint32_t)v_tile[n_low + column] |
-                        ((uint32_t)v_tile[n_low + H3_MMA_LD + column] << 16u),
-                    (uint32_t)v_tile[n_high + column] |
-                        ((uint32_t)v_tile[n_high + H3_MMA_LD + column] << 16u)};
-                h3_mma_m16n8k16_f16(out_acc[dt], p_frag, b_frag);
+                for (uint32_t dt = 0; dt < 16u; dt++) {
+                    uint32_t column = dt * 8u + group;
+                    uint32_t b_frag[2] = {
+                        (uint32_t)v_tile[n_low + column] |
+                            ((uint32_t)v_tile[n_low + H3_MMA_LD + column] << 16u),
+                        (uint32_t)v_tile[n_high + column] |
+                            ((uint32_t)v_tile[n_high + H3_MMA_LD + column] << 16u)};
+                    h3_mma_m16n8k16_f16(out_acc[dt], p_frag, b_frag);
+                }
             }
         }
     }
@@ -3553,12 +3561,28 @@ static int h3_gpu_sdpa_bf16_mma(h3_gpu *gpu, h3_gpu_tensor *output,
                          head_major_output ? 1u : 0u, 0u};
     dim3 blocks((sequence + H3_MMA_M - 1u) / H3_MMA_M, heads, 1);
     dim3 threads(128, 1, 1);
-    h3_sdpa_bf16_mma_d128_kernel<<<blocks, threads, 0, gpu->stream>>>(
-        (const uint16_t *)query->device, (const uint16_t *)key->device,
-        (const uint16_t *)value->device, (uint16_t *)output->device, args);
+    const char *half = getenv("H3_SDPA_HALF");
+    const uint16_t *q = (const uint16_t *)query->device;
+    const uint16_t *k = (const uint16_t *)key->device;
+    const uint16_t *v = (const uint16_t *)value->device;
+    uint16_t *o = (uint16_t *)output->device;
+    if (half && !strcmp(half, "qk"))
+        h3_sdpa_bf16_mma_d128_kernel<1>
+            <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
+    else if (half && !strcmp(half, "pv"))
+        h3_sdpa_bf16_mma_d128_kernel<2>
+            <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
+    else if (half && !strcmp(half, "load"))
+        h3_sdpa_bf16_mma_d128_kernel<3>
+            <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
+    else
+        h3_sdpa_bf16_mma_d128_kernel<0>
+            <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
     gpu->stats.mps_sdpa_dispatches++;
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_bf16_mma_d128");
 }
+
+extern "C" {
 
 static int h3_gpu_sdpa_bf16_wave(h3_gpu *gpu, h3_gpu_tensor *output,
                                  const h3_gpu_tensor *query,

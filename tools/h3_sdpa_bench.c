@@ -103,8 +103,11 @@ int main(int argc, char **argv) {
 
     /* Q·Kᵀ and P·V, two flops per multiply-accumulate. */
     double flops = 4.0 * (double)sequence * sequence * head_dim * heads;
-    printf("seq %u heads %u dim %u: %.3f ms  %.1f TFLOP/s\n", sequence, heads,
+    printf("seq %u heads %u dim %u: %.3f ms  %.1f TFLOP/s", sequence, heads,
            head_dim, seconds * 1e3, flops / seconds * 1e-12);
+    const char *half = getenv("H3_SDPA_HALF");
+    if (half && *half) printf("  HALF=%s", half);
+    printf("\n");
 
     h3_gpu_tensor_free(query);
     h3_gpu_tensor_free(key);

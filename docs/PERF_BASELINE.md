@@ -3189,3 +3189,203 @@ still `f5282774d3a4`. Do not use e2e wall for claims under ~0.2 s.
 - Paired float2 RoPE stores (unmeasured; ops rebuild wedged).
 
 Overnight REJECTs remain closed. Long video is still DiT SDPA N².
+
+---
+
+## 2026-09-01 — 15 s cinematic T2VA timed E2E (864×480)
+
+Measured on the tree after the 5 h KEEP (coalesced V in video-VAE RoPE smem +
+fused VAE `scale_add`+RMSNorm). Not a kernel experiment: one `--profile` run to
+replace the earlier ~1067 s denoise / ~920 s sdpa sketch with a wall-clock
+number. Commit at the time of the run was `6c95331` on `perf/dit-denoise-opt`.
+
+Command (`/tmp/h3_opt/run-long-15s.sh`):
+
+```
+./h3 --profile -d /home/alex/HF-MODELS/MiniMax-H3 \
+  -p "<15s cinematic prompt>" \
+  --width 864 --height 480 --seconds 15 \
+  --steps 20 --layers 45 --reuse 2 --seed 42 \
+  -o /tmp/h3_opt/long-15s-cinematic.mp4
+```
+
+Log: `/tmp/h3_opt/long-15s.log`. Output: 362 FFmpeg frames, same path as `-o`.
+`/usr/bin/time` **WALL_SEC 1124.44** (~18 min 44 s). This is faster than the
+~20 min recollection, not a hang; denoise progress stays on `20/20` while the
+GPU Euler work runs.
+
+### Wall clock
+
+| Stage | wall | share of E2E |
+|---|---:|---:|
+| Qwen text encoder | 3.132 s | 0.3 % |
+| DiT load | 1.413 s | 0.1 % |
+| GPU Euler denoise | **1037.054 s** | **92.2 %** |
+| ├ gpu-op sdpa | **890.689 s** | **79.2 %** |
+| └ gpu-op linear | 110.610 s | 9.8 % |
+| audio VAE decoder | 1.149 s | 0.1 % |
+| video VAE decoder (4×2 tiles @ 272 px) | 78.521 s | 7.0 % |
+| **E2E** | **1124.44 s** | |
+
+DiT total (load + denoise) 1038.467 s. Denoise: 11 sampler evaluations, 495
+attention dispatches, 1980 int8-cublas, 4680 direct. Gate-ranked DiT skips
+layers 4, 14, 16, 17, 13. Video VAE prefetch finished in 0.425 s (9933 MiB)
+during denoise enqueue; joined after DiT.
+
+vs the overnight note (sdpa ~920 s of ~1067 s denoise): denoise **1037 s**,
+sdpa **891 s**. Same shape, slightly better; not a regression.
+
+### Memory (`--profile` `peak` = live GPU tensors, `alloc` = cumulative)
+
+| Stage | peak live | alloc |
+|---|---:|---:|
+| Qwen text encoder | 3.679 GiB | 46.906 GiB (streamed weights) |
+| DiT load | 23.258 GiB | 24.854 GiB |
+| GPU Euler denoise | **23.266 GiB** | 0.008 GiB |
+| DiT total | 23.266 GiB | 24.862 GiB |
+| audio VAE | 0.286 GiB | 1.450 GiB |
+| video VAE decoder | 9.408 GiB | 9.440 GiB |
+
+h3's high-water mark is **23.266 GiB** in denoise (8 MiB above DiT load).
+nvitop during denoise: `./h3` **28.25 GiB GPU-MEM**, ~96 % SM; the extra ~5 GiB
+is CUDA context / cuBLAS workspace, not in `peak_live_bytes`. Host: ~33 GiB of
+121 GiB used while running, ~4 GiB after exit. No RSS time series.
+
+VAE prefetch 9933 MiB did not add to DiT live (denoise peak ≈ load peak), so
+that 9.9 GiB is host/cache, not a second GPU resident set stacked on 23 GiB.
+
+### Implication
+
+Do not spend the next pass on fox-fast GEMM/elementwise. 79 % of this wall is
+DiT SDPA at long sequence. Price bandwidth vs math on the real N with
+`h3_sdpa_bench` / `H3_SDPA_HALF` before changing the MMA kernel. The fox-fast
+`cp.async` K-prefetch REJECT was at seq 1874; it is not priced here.
+
+### Derived sequence (no extra generate)
+
+`--seconds 15` is 360 requested frames → `h3_temporal` **362 / video_t 107 /
+audio_t 603** (same as the 362 FFmpeg frames). Canvas 864×480 → latent 54×30 →
+2×2 packed spatial **15×27 = 405** tokens/frame.
+
+| piece | rows |
+|---|---:|
+| video | 107 × 405 = **43335** |
+| audio | 603 × 2 = **1206** |
+| text | tokenizer-dependent (few hundred) |
+| **DiT sequence** | **text + 44541** ≈ **4.48e4** |
+
+495 attention dispatches / 890.689 s → **1.80 s/call**. Isolated MMA at 16384
+was 189 ms; N² scale to 44800 predicts ~1.41 s, so the e2e call is ~27 % above
+the microbench (GEMM traffic between layers, head-major path). Still N².
+
+K/V bytes per call ≈ `2 × N² × d × 2 × H / 64` ≈ 0.84 TB streamed through 64-key
+tiles. Arithmetic intensity ~70 FLOP/byte vs BF16 ridge ~100–350 (depending on
+GB10 HBM). Long-N is the first place `cp.async` / double-buffer can matter;
+fox-fast 1874 was not.
+
+`H3_SDPA_HALF=qk|pv|load` now instantiates the MMA kernel with one or both MMAs
+dropped (`if constexpr`, default path is the original). Measure:
+
+Measured (`h3_sdpa_bench`, 56 heads, d=128):
+
+| seq | full | HALF=qk (no P·V) | HALF=pv (no QK) | HALF=load |
+|---:|---:|---:|---:|---:|
+| 1874 | 2.956 ms (34.1) | 2.443 (41.2) | 1.655 (60.8) | 0.179 (n/a) |
+| 8192 | 47.425 ms (40.6) | | | |
+| 16384 | 180.197 ms (42.7) | | | |
+| **44800** | **1771.6 ms (32.5)** | **1429.6 (40.3)** | **734.2 (78.4)** | **84.2** |
+
+TFLOP/s in parentheses use the full 4 N² d H flop count even when a MMA is
+dropped. **Loads are 84 ms of 1772 ms (4.7 %).** Long-N is not an HBM-fill
+problem; `cp.async` K prefetch stays REJECT. QK BF16 MMA is the exposed pipe
+(~1.3 s vs ~0.65 s for the F16 P·V pipe at 44800).
+
+`H3_SDPA_HALF=qk|pv|load` instantiates the MMA kernel with `if constexpr`
+(templates live outside `extern "C"`). Default path is HalfMode 0.
+
+### REJECT F16 QK MMA (`H3_SDPA_F16_QK`)
+
+Same QK loop, fragments converted BF16→F16, `mma.f16` instead of `mma.bf16`.
+Accuracy (`h3_cuda_ops` MMA gates) unchanged at printed precision (worst abs
+0.00037, seq 1874 relL2 0.00239). Speed is not:
+
+| seq | BF16 QK | F16 QK |
+|---:|---:|---:|
+| 1874 | **3.017 ms (33.4)** | 3.061 (32.9) |
+| 44800 | **1788 ms (32.2)** | 1800 (32.0) |
+| 44800 HALF=qk | 1430 | 1454 |
+| 44800 HALF=pv | 734 | 734 |
+
+The QK/P·V gap is the loop and K smem access, not the MMA dtype. Reverted
+(no `H3_SDPA_F16_QK` flag left).
+
+### REJECT preloading all 8 QK B fragments
+
+Load 8 `b_frag`s then MMA. Bit-identical. fox-fast 1874 unchanged (2.95/3.00 ms).
+44800 **1812 ms vs 1772–1788**, HALF=qk 1478 vs 1430. Extra registers hurt the
+long-N QK pipe. Reverted.
+
+### REJECT `__launch_bounds__(128, 2)`
+
+Min 2 blocks/SM: 1874 **2.935/2.966 ms**, 44800 **1771 ms** — same as
+`__launch_bounds__(128)`. Reverted to max-threads-only.
+
+### Token reduction (not default; not bit-identical)
+
+`--token-reduction` on fox-fast (512² 22f, steps 20, L45, reuse 2, seed 42):
+
+| | denoise | gpu-op sdpa | gpu-op linear | e2e |
+|---|---:|---:|---:|---:|
+| off | 8.252 s | 1.466 s | 5.170 s | 15.76 s |
+| **on** | **6.102 s** | **0.928 s** | **3.928 s** | **13.65 s** |
+
+SDPA −37 %, linear −24 %, e2e −2.1 s. VAE unchanged (~2.73 s). This is the
+only measured lever that moves 15 s-class N² without a new MMA shape. It
+changes tokens in middle blocks, so fox-fast md5 will not match
+`f5282774d3a4`. Leave CLI opt-in.
+
+### 15 s cinematic + `--token-reduction` (same prompt/seed as the 1124 s run)
+
+864×480, 15 s, steps 20, L45, reuse 2, seed 42, plus `--token-reduction`.
+Output `/tmp/h3_opt/long-15s-tr.mp4`. Fox-fast md5 with the flag is
+`4d1d250e5ab9` vs `f5282774d3a4` off.
+
+| | off (earlier tonight) | **--token-reduction** |
+|---|---:|---:|
+| E2E WALL_SEC | 1124.44 s | **694.83 s** |
+| GPU Euler denoise | 1037.05 s | **604.90 s** |
+| denoise sdpa | 890.69 s | **497.10 s** |
+| denoise linear | 110.61 s | **81.25 s** |
+| video VAE | 78.52 s | 80.97 s |
+| denoise peak live | 23.266 GiB | 23.272 GiB |
+
+E2E **−38 %** (−7.2 min), SDPA **−44 %**. VAE and live memory unchanged. This
+is the long-video wall-clock win; the MMA kernel is still 32.5 TFLOP/s at
+N≈44800 on the unreduced layers.
+
+---
+
+## 2026-09-01/02 — overnight long-N SDPA (to ~07:48 +0800)
+
+Instrument `H3_SDPA_HALF`, price 15 s sequence (~44800), do not chase HBM.
+
+### KEEP
+
+- HALF diagnostic templates (compile-only cost; shipping is HalfMode 0).
+- Diagnosis: 15 s SDPA is QK MMA bound, not K/V fill.
+- `--token-reduction` as the long-T2VA speed knob (15 s 1124 s → **695 s**).
+  Not default; fox-fast md5 becomes `4d1d250e5ab9`.
+
+### REJECT (do not retry)
+
+- F16 QK MMA.
+- QK B-fragment preload.
+- `launch_bounds(128, 2)`.
+- `cp.async` at long N (loads 5 % of 44800).
+
+### Open
+
+- Architecture MMA (ldmatrix layout rewrite / tcgen05) for the remaining
+  unreduced QK pipe.
+- Whether long `./h3 --seconds` should default token reduction on.
+
