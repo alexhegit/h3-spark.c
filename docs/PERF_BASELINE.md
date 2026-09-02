@@ -3387,10 +3387,50 @@ Instrument `H3_SDPA_HALF`, price 15 s sequence (~44800), do not chase HBM.
 - `launch_bounds(128, 2)`.
 - `cp.async` at long N (loads 5 % of 44800).
 
-### Open
+### Closed architecture-MMA routes on GB10 / `sm_121` (2026-09-02)
 
-- Architecture MMA / tcgen05 for the remaining unreduced QK pipe.
-- Whether long `./h3 --seconds` should default token reduction on.
+CUDA 13.0.88 / driver 580.159.03. The QK arithmetic bottleneck is real, but
+GB10 does not expose a wider architecture MMA for dense BF16:
+
+- **tcgen05 / TMEM: unavailable.** Raw PTX 8.8/9.0
+  `tcgen05.alloc` and `tcgen05.mma` assemble for `sm_100a` (also the
+  100/103/110 a/f family), but `ptxas` rejects them for
+  `sm_120{,a,f}` and `sm_121{,a,f}`. CUDA CCCL guards the wrappers with
+  `SM100_ALL` / `SM101_ALL`; CUTLASS reports zero TMEM capacity for sm_12x.
+- **WGMMA: unavailable.** BF16 `wgmma.mma_async` assembles for Hopper
+  `sm_90a`; `ptxas` rejects it for all sm_121 targets.
+- **WMMA m16n16 is not a wider native op.** On sm_121,
+  `wmma.mma.sync.m16n16k16.bf16` lowers to two
+  `HMMA.16816.F32.BF16`, while the shipping
+  `mma.sync.m16n8k16.bf16` lowers to one. A 64x64x128 QK microkernel:
+
+| path | registers | ns / tile | note |
+|---|---:|---:|---|
+| shipping `mma.m16n8` + `ldmatrix.x2` | 90 | **451.69** | baseline |
+| `wmma.m16n16` + two `ldmatrix.x2` | 92 | 452.95 | same HMMA count |
+| C++ WMMA API | 202 | 456.67 | generic loads |
+| `wmma.m16n16` + `wmma.load` | 194 | 740.31 | **~64% slower** |
+
+All four microkernels matched each other bit-for-bit. The WMMA fragment is
+exactly two concatenated m16n8 fragments on this target, so it neither reduces
+HMMA count nor opens a different pipe.
+
+Also tried one `ldmatrix.x4` feeding each pair of shipping m16n8 HMMAs. It
+halves static QK LDSM instructions (64 x `.M88.2` -> 32 x `.M88.4`) and passes
+the full CUDA ops bit gates, but the larger packing instruction is slower:
+
+| seq / diagnostic | x2 ms | x4 ms | x4 delta |
+|---|---:|---:|---:|
+| 1874 full (5-pair avg) | 2.888 | 2.901 | +0.4% (noise) |
+| **44800 full (5-pair avg)** | **1728.72** | **1792.48** | **+3.69%** |
+| 44800 HALF=qk (3-pair avg) | **1424.18** | **1461.63** | **+2.63%** |
+| 44800 HALF=pv control | 748.26 | 748.63 | +0.05% |
+
+The x4 code was reverted. **Do not retry tcgen05, WGMMA, WMMA m16n16, or
+ldmatrix.x4 on GB10.** For bit-identical dense BF16 QK, the current
+`mma.sync.m16n8k16` + `ldmatrix.x2` path is the available architecture path.
+Further large wall-clock gains require changing the computation, not selecting
+a hidden GB10 MMA instruction.
 
 ### KEEP QK `ldmatrix.x2` as default (2026-09-02)
 
@@ -3408,4 +3448,57 @@ stale build), not from this map.
 | scalar `H3_SDPA_LDMATRIX=0` | — | `f5282774d3a4` | 1778 / 1783 / 1783 (avg **1781**) |
 | **ldmatrix.x2 (default)** | **0 / 76800** (seq 200) and **0 / 239872** (seq 1874 head-major) | **`f5282774d3a4`** | 1715 / 1719 / 1728 (avg **1720**, ~3 %) |
 
+### Fox-fast preset matrix (2026-09-02)
+
+Same prompt/seed as the bit gate: 512², 22f, steps 20, seed 42. Reference is
+L45 R2 (`f5282774d3a4`). PSNR/SSIM are ffmpeg lavfi vs that clip (decoded
+yuv420p). Denoise is GPU Euler. Clips in `/tmp/h3_opt/preset-matrix/`.
+
+| cell | md5 | denoise s | WALL s | PSNR avg | Y | SSIM All | min frame |
+|---|---|---:|---:|---:|---:|---:|---:|
+| L45 R2 (ref) | `f5282774d3a4` | ~8.23 | ~15.6 | — | — | — | — |
+| **L45 R3** | `9233c190058d` | **5.97** | 13.26 | **20.94** | 19.25 | **0.754** | **20.58** |
+| L40 R2 | `0eb70431d48f` | 7.27 | 14.50 | 16.86 | 15.14 | 0.693 | 16.43 |
+| L40 R3 | `70930fdceb96` | **5.31** | 12.56 | 18.47 | 16.76 | 0.717 | 17.62 |
+| TR 4:30 early 10:40 | `4d1d250e5ab9` | 6.10 | 13.57 | 17.75 | 16.05 | 0.718 | **15.25** |
+| TR EARLY=0 | `2bd50279ad80` | 6.50 | 13.95 | 18.16 | 16.45 | 0.721 | 16.52 |
+| TR 8:24 EARLY=0 | `6b09b3c88e71` | 7.29 | 14.65 | 18.52 | 16.81 | 0.724 | 16.71 |
+| TR 16:32 EARLY=0 | `56d660315d5b` | 7.09 | 14.47 | 18.14 | 16.45 | 0.735 | 16.80 |
+
+On this short clip, **`--reuse 3` (keep 45 layers)** is the fast cell: same
+eval count as the aggressive layer drop (8 steps), ~21 dB and a 20.6 dB floor,
+versus TR’s 17.8 dB and 15.2 dB worst frame. Milder TR never reached 19 dB and
+was slower than L45 R3. L40 R2 is strictly worse than L45 R3 on both quality
+and time.
+
+15 s T2VA is still a different bet: TR cut SDPA 891 s → 497 s there; R3 only
+drops 11→8 evals (~27 % denoise) and does not shrink N. Do not default TR.
+A short-clip `--faster` would be `--layers 45 --reuse 3`, not token reduction.
+
+### 15 s L45 R3 (2026-09-02)
+
+Same prompt/seed/size as the 1124 s L45 R2 cinematic. Output
+`/tmp/h3_opt/long-15s-L45R3.mp4` (362 frames, md5 `d9c4482a551a`).
+Log `/tmp/h3_opt/long-15s-L45R3.log`. Schedule is correct: **8 evaluations**,
+360 denoise attention (45×8) vs R2's 11 / 495.
+
+| | L45 R2 (earlier) | **L45 R3 (this run)** | TR (earlier) |
+|---|---:|---:|---:|
+| WALL_SEC | 1124.44 | **1295.57** | 694.83 |
+| GPU Euler denoise | 1037.05 | 1185.88 | 604.90 |
+| denoise sdpa | 890.69 | 1017.95 | 497.10 |
+| denoise linear | 110.61 | 127.05 | 81.25 |
+| video VAE | 78.52 | 80.82 | 80.97 |
+| evals | 11 | **8** | 11 |
+| PSNR / SSIM vs R2 cinematic | — | **18.83 / 0.70** | (TR vs R2 was fox-only) |
+
+This R3 wall is **not** a fair speed A/B against the 1124 s R2: text encoder
+was 15.4 s vs 3.1 s, DiT load 6.8 s vs 1.4 s, and sdpa per attention
+**2.83 s vs 1.80 s**. Same 8/11 evals at the old per-step rate would be
+~754 s denoise / ~14 min e2e. Re-run R2 and R3 back-to-back before treating
+15 s reuse-3 as slower. Quality vs the R2 cinematic is **worse than fox-fast
+L45 R3** (20.9 dB): interpolating 12 skipped steps on 362 frames moves the
+picture more.
+
+15 s wall-clock winner remains `--token-reduction` (~695 s), not reuse 3.
 
