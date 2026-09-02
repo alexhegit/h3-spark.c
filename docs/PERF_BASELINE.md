@@ -3339,10 +3339,13 @@ Min 2 blocks/SM: 1874 **2.935/2.966 ms**, 44800 **1771 ms** — same as
 | off | 8.252 s | 1.466 s | 5.170 s | 15.76 s |
 | **on** | **6.102 s** | **0.928 s** | **3.928 s** | **13.65 s** |
 
-SDPA −37 %, linear −24 %, e2e −2.1 s. VAE unchanged (~2.73 s). This is the
-only measured lever that moves 15 s-class N² without a new MMA shape. It
-changes tokens in middle blocks, so fox-fast md5 will not match
-`f5282774d3a4`. Leave CLI opt-in.
+SDPA −37 %, linear −24 %, e2e −2.1 s. VAE unchanged (~2.73 s). Leave CLI
+opt-in. **Quality is not close to off:** decoded fox-fast (same seed) vs off
+is **17.75 dB PSNR** (min 15.25, max 21.20; Y 16.05) and **SSIM 0.72**.
+Luma/detail takes the hit; chroma is ~31–33 dB. Audio decode hashes also
+differ. md5 `f5282774d3a4` → `4d1d250e5ab9`. MMA vs wave on this clip was
+~25.6 dB, so token reduction is a bigger visual change than that kernel swap.
+CLI `--help`, README, and a stderr line on generate warn about this.
 
 ### 15 s cinematic + `--token-reduction` (same prompt/seed as the 1124 s run)
 
@@ -3374,7 +3377,8 @@ Instrument `H3_SDPA_HALF`, price 15 s sequence (~44800), do not chase HBM.
 - HALF diagnostic templates (compile-only cost; shipping is HalfMode 0).
 - Diagnosis: 15 s SDPA is QK MMA bound, not K/V fill.
 - `--token-reduction` as the long-T2VA speed knob (15 s 1124 s → **695 s**).
-  Not default; fox-fast md5 becomes `4d1d250e5ab9`.
+  Not default; fox-fast md5 `4d1d250e5ab9`; **~17.8 dB PSNR / 0.72 SSIM** vs
+  off. README + `--help` + generate stderr warn.
 
 ### REJECT (do not retry)
 

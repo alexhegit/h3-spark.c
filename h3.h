@@ -85,7 +85,8 @@ typedef struct {
     int core_reuse;
     /* Pair adjacent horizontal video tokens through middle DiT blocks while
      * preserving their full-resolution residual. Early noisy evaluations use
-     * a deeper reduced interval. This is a validated aggressive speed mode. */
+     * a deeper reduced interval. Aggressive speed mode: visible quality loss
+     * (fox-fast ~17.8 dB PSNR vs off). Off by default. */
     int token_reduction;
     /* Use one int8 activation scale per FC2 row and the M5 full-K kernel.
      * Faster, but more numerically aggressive than grouped int8. */

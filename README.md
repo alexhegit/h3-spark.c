@@ -97,6 +97,30 @@ Same fox-fast preset as the T2VA showcase clip:
 First run pays model load + filesystem cache; repeat runs for timing.
 For Ref2VA / FL2VA reproduction commands, see [Showcase](#showcase-dgx-spark).
 
+## `--token-reduction` (speed, not lossless)
+
+Opt-in. **Off by default.** Middle DiT blocks (4–30; deeper on early denoise
+steps) pair adjacent **horizontal video tokens** and keep a full-resolution
+residual. Text/audio tokens are unchanged.
+
+It is a real quality trade, not a near-lossless shortcut. On the fox-fast
+showcase preset (512², 22 frames, seed 42, steps 20 / L45 / reuse 2), decoded
+pixels vs the same run without the flag:
+
+| | `--token-reduction` vs off |
+|---|---:|
+| Average PSNR | **17.8 dB** (Y 16.0, U 31.2, V 32.8) |
+| Worst / best frame | 15.2 / 21.2 dB |
+| SSIM All | **0.72** (Y 0.63) |
+| Output md5 | `f5282774d3a4` → `4d1d250e5ab9` |
+| Audio | also not identical |
+
+That is a visible hit on spatial detail (fur, edges), larger than swapping the
+attention kernel (MMA vs wave was ~25.6 dB on the same clip). 15 s T2VA wall
+dropped 1124 s → 695 s on one cinematic A/B; do not use this flag when you
+need the bit-identical fox-fast reference. Details:
+[`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md).
+
 ## Conditional paths
 
 Ordered references (`--ref-image`, `--ref-video`, `--ref-audio`, …) and

@@ -929,6 +929,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     if (!h3_valid_params(ctx, params)) return NULL;
+    if (params->token_reduction)
+        fprintf(stderr,
+            "h3: --token-reduction is on: middle DiT blocks pool adjacent "
+            "horizontal video tokens. Faster, but not bit-identical; "
+            "fox-fast vs off is ~17.8 dB PSNR / 0.72 SSIM (luma ~16 dB). "
+            "See README and docs/PERF_BASELINE.md.\n");
     int render_width = params->render_width ? params->render_width :
                                                params->width;
     int render_height = params->render_height ? params->render_height :
