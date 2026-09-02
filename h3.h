@@ -83,10 +83,9 @@ typedef struct {
     /* Recompute the transformer core every N denoiser steps while refreshing
      * the timestep head each step. 1 is exact, 4 fast, and 6 aggressive. */
     int core_reuse;
-    /* Pair adjacent horizontal video tokens through middle DiT blocks while
-     * preserving their full-resolution residual. Early noisy evaluations use
-     * a deeper reduced interval. Aggressive speed mode: visible quality loss
-     * (fox-fast ~17.8 dB PSNR vs off). Off by default. */
+    /* Off by default. Pools adjacent horizontal video tokens in middle DiT
+     * blocks (full-res residual). Faster long-video wall clock, with a
+     * visible quality drop (fox-fast ~17.8 dB PSNR / 0.72 SSIM vs off). */
     int token_reduction;
     /* Use one int8 activation scale per FC2 row and the M5 full-K kernel.
      * Faster, but more numerically aggressive than grouped int8. */

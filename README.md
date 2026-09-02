@@ -97,15 +97,17 @@ Same fox-fast preset as the T2VA showcase clip:
 First run pays model load + filesystem cache; repeat runs for timing.
 For Ref2VA / FL2VA reproduction commands, see [Showcase](#showcase-dgx-spark).
 
-## `--token-reduction` (speed, not lossless)
+## `--token-reduction` (faster, worse picture)
 
-Opt-in. **Off by default.** Middle DiT blocks (4–30; deeper on early denoise
-steps) pair adjacent **horizontal video tokens** and keep a full-resolution
-residual. Text/audio tokens are unchanged.
+Opt-in. **Off by default.** The wall-clock win is paid in quality: it is not
+a lossless shortcut.
 
-It is a real quality trade, not a near-lossless shortcut. On the fox-fast
-showcase preset (512², 22 frames, seed 42, steps 20 / L45 / reuse 2), decoded
-pixels vs the same run without the flag:
+Middle DiT blocks (4–30; deeper on early denoise steps) pair adjacent
+**horizontal video tokens** and keep a full-resolution residual. Text/audio
+tokens are unchanged.
+
+On the fox-fast showcase preset (512², 22 frames, seed 42, steps 20 / L45 /
+reuse 2), decoded pixels vs the same run without the flag:
 
 | | `--token-reduction` vs off |
 |---|---:|
@@ -115,10 +117,9 @@ pixels vs the same run without the flag:
 | Output md5 | `f5282774d3a4` → `4d1d250e5ab9` |
 | Audio | also not identical |
 
-That is a visible hit on spatial detail (fur, edges), larger than swapping the
-attention kernel (MMA vs wave was ~25.6 dB on the same clip). 15 s T2VA wall
-dropped 1124 s → 695 s on one cinematic A/B; do not use this flag when you
-need the bit-identical fox-fast reference. Details:
+The speed is real (15 s T2VA 1124 s → 695 s on one cinematic A/B) and so is
+the quality hit (fur, edges). Do not use this flag when you need the
+bit-identical fox-fast reference. Details:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md).
 
 ## Conditional paths

@@ -358,7 +358,7 @@ track; does not replace INT8 parity work.
 |---------------|----------------------|
 | QKV + RMSNorm + RoPE (grouped layout) | `H3_DISABLE_FUSED_*` / `--use-slower-unfused-qkv-rope` |
 | AdaLN + gate + int8 quantize | `--use-slower-unfused-int8-inputs` |
-| Token pool / expand | `--token-reduction` |
+| Token pool / expand | `--token-reduction` (opt-in; quality loss) |
 | Patch linear 16×16 tiles | `H3_SCALAR_PATCH`, `H3_DISABLE_FUSED_PATCH_*` |
 | Fused final AdaLN + head | `H3_DISABLE_FUSED_FINAL_*` |
 | Gate + cross-block AdaLN | `H3_DISABLE_FUSED_GATE_ADALN`, `H3_DISABLE_FUSED_CROSS_BLOCK_ADALN` |
