@@ -107,6 +107,13 @@ int main(int argc, char **argv) {
            head_dim, seconds * 1e3, flops / seconds * 1e-12);
     const char *half = getenv("H3_SDPA_HALF");
     if (half && *half) printf("  HALF=%s", half);
+    {
+        const char *ldm = getenv("H3_SDPA_LDMATRIX");
+        if (ldm && !strcmp(ldm, "0"))
+            printf("  SCALAR");
+        else
+            printf("  LDMATRIX");
+    }
     printf("\n");
 
     h3_gpu_tensor_free(query);

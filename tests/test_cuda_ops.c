@@ -2300,6 +2300,46 @@ int main(void) {
                     }
                 }
                 unsetenv("H3_SDPA_MMA");
+                /* ldmatrix.x2 (no .trans) already matches the scalar B map
+                 * per lane. This checks whether the two kernel specializations
+                 * still agree bit-for-bit on a partial 64-tile sequence. */
+                {
+                    uint16_t *mout_ldm =
+                        (uint16_t *)malloc(mma_count * sizeof(uint16_t));
+                    check(mout_ldm, "ldmatrix bitwise alloc");
+                    if (mout_ldm) {
+                        setenv("H3_SDPA_MMA", "1", 1);
+                        setenv("H3_SDPA_LDMATRIX", "0", 1);
+                        check(h3_gpu_sdpa_bf16(gpu, to, tq, tk, tv, mma_seq,
+                                               mma_heads, mma_dim, mma_scale),
+                              "mma scalar bitwise");
+                        check(h3_gpu_submit(gpu), "submit mma scalar bitwise");
+                        check(h3_gpu_tensor_read_bf16(to, mout, mma_count),
+                              "read mma scalar bitwise");
+                        setenv("H3_SDPA_LDMATRIX", "1", 1);
+                        check(h3_gpu_sdpa_bf16(gpu, to, tq, tk, tv, mma_seq,
+                                               mma_heads, mma_dim, mma_scale),
+                              "mma ldmatrix bitwise");
+                        check(h3_gpu_submit(gpu), "submit mma ldmatrix bitwise");
+                        check(h3_gpu_tensor_read_bf16(to, mout_ldm, mma_count),
+                              "read mma ldmatrix bitwise");
+                        size_t ndiff = 0;
+                        for (size_t i = 0; i < mma_count; i++)
+                            if (mout[i] != mout_ldm[i]) ndiff++;
+                        fprintf(stderr,
+                                "mma vs ldmatrix bitwise diffs %zu / %zu\n",
+                                ndiff, mma_count);
+                        if (ndiff != 0) {
+                            fprintf(stderr,
+                                    "FAIL: ldmatrix MMA is not bit-identical "
+                                    "to scalar MMA\n");
+                            failures++;
+                        }
+                        unsetenv("H3_SDPA_LDMATRIX");
+                        unsetenv("H3_SDPA_MMA");
+                        free(mout_ldm);
+                    }
+                }
             }
             h3_gpu_tensor_free(tq);
             h3_gpu_tensor_free(tk);
@@ -2418,6 +2458,39 @@ int main(void) {
                             "FAIL: mma sdpa is much less accurate than wave "
                             "sdpa\n");
                     failures++;
+                }
+                {
+                    uint16_t *b_ldm =
+                        (uint16_t *)malloc(big_count * sizeof(uint16_t));
+                    check(b_ldm, "big ldmatrix bitwise alloc");
+                    if (b_ldm) {
+                        setenv("H3_SDPA_MMA", "1", 1);
+                        setenv("H3_SDPA_LDMATRIX", "0", 1);
+                        check(h3_gpu_sdpa_bf16_head_major_output(
+                                  gpu, to, tq, tk, tv, big_seq, big_heads,
+                                  big_dim, big_scale),
+                              "big sdpa scalar");
+                        check(h3_gpu_submit(gpu), "submit big sdpa scalar");
+                        check(h3_gpu_tensor_read_bf16(to, b_ldm, big_count),
+                              "read big sdpa scalar");
+                        size_t ndiff = 0;
+                        for (size_t i = 0; i < big_count; i++)
+                            if (b_mma[i] != b_ldm[i]) ndiff++;
+                        fprintf(stderr,
+                                "seq %u head-major mma vs ldmatrix bitwise "
+                                "diffs %zu / %zu\n",
+                                big_seq, ndiff, big_count);
+                        if (ndiff != 0) {
+                            fprintf(stderr,
+                                    "FAIL: ldmatrix MMA is not bit-identical "
+                                    "to scalar MMA at seq %u\n",
+                                    big_seq);
+                            failures++;
+                        }
+                        unsetenv("H3_SDPA_LDMATRIX");
+                        unsetenv("H3_SDPA_MMA");
+                        free(b_ldm);
+                    }
                 }
             }
             h3_gpu_tensor_free(tq);

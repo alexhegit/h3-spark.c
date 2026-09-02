@@ -3389,7 +3389,23 @@ Instrument `H3_SDPA_HALF`, price 15 s sequence (~44800), do not chase HBM.
 
 ### Open
 
-- Architecture MMA (ldmatrix layout rewrite / tcgen05) for the remaining
-  unreduced QK pipe.
+- Architecture MMA / tcgen05 for the remaining unreduced QK pipe.
 - Whether long `./h3 --seconds` should default token reduction on.
+
+### KEEP QK `ldmatrix.x2` as default (2026-09-02)
+
+`k_tile` is `[N][K]` row-major, which is already `mma.m16n8k16.row.col` B.
+`ldmatrix.sync.aligned.m8n8.x2` (no `.trans`) at keys `j*8+(lane%8)` and
+dims `kk*16+((lane/8)%2)*8` deposits the same two `uint32` B fragments as
+the scalar loads. `.x2.trans` with that address map is still REJECT
+(relL2 2.29). Opt out with `H3_SDPA_LDMATRIX=0`.
+
+Earlier fox md5 `b594fd71d077` was from a non-matching binary (`.trans` /
+stale build), not from this map.
+
+| path | bitwise vs scalar MMA | fox-fast md5 | 44800 ms (n=3) |
+|---|---|---|---:|
+| scalar `H3_SDPA_LDMATRIX=0` | — | `f5282774d3a4` | 1778 / 1783 / 1783 (avg **1781**) |
+| **ldmatrix.x2 (default)** | **0 / 76800** (seq 200) and **0 / 239872** (seq 1874 head-major) | **`f5282774d3a4`** | 1715 / 1719 / 1728 (avg **1720**, ~3 %) |
+
 

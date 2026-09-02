@@ -3335,8 +3335,19 @@ __device__ __forceinline__ static uint32_t h3_bf16_pair_to_f16(uint32_t raw) {
 
 } /* extern "C" — MMA SDPA is templated for H3_SDPA_HALF */
 
-/* HalfMode: 0 full, 1 drop P·V, 2 drop QK, 3 loads only. */
-template <int HalfMode>
+/* No .trans: .x2.trans with this address map fails ops (relL2 2.29). */
+__device__ __forceinline__ static void h3_ldmatrix_b16_x2(
+    uint32_t &lo, uint32_t &hi, const uint16_t *ptr) {
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+        : "=r"(lo), "=r"(hi)
+        : "r"(addr));
+}
+
+/* HalfMode: 0 full, 1 drop P·V, 2 drop QK, 3 loads only.
+ * UseLdm: QK B via ldmatrix.x2 (default). H3_SDPA_LDMATRIX=0 is scalar. */
+template <int HalfMode, int UseLdm>
 __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
     const uint16_t *__restrict__ query, const uint16_t *__restrict__ key,
     const uint16_t *__restrict__ value, uint16_t *__restrict__ output,
@@ -3421,13 +3432,24 @@ __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
         if constexpr (HalfMode != 2 && HalfMode != 3) {
 #pragma unroll
             for (uint32_t kk = 0; kk < 8u; kk++) {
-                uint32_t k0 = kk * 16u + tig * 2u;
 #pragma unroll
                 for (uint32_t j = 0; j < 8u; j++) {
-                    uint32_t row = (j * 8u + group) * H3_MMA_LD;
-                    uint32_t b_frag[2] = {
-                        *(const uint32_t *)&k_tile[row + k0],
-                        *(const uint32_t *)&k_tile[row + k0 + 8u]};
+                    uint32_t b_frag[2];
+                    if constexpr (UseLdm) {
+                        /* 8x16 B tile, k_tile[N][K] row-major. No .trans:
+                         * that is already the m16n8k16.row.col B map. */
+                        uint32_t r = j * 8u + (lane & 7u);
+                        uint32_t c = kk * 16u + ((lane >> 3u) & 1u) * 8u;
+                        h3_ldmatrix_b16_x2(
+                            b_frag[0], b_frag[1],
+                            &k_tile[r * H3_MMA_LD + c]);
+                    } else {
+                        uint32_t k0 = kk * 16u + tig * 2u;
+                        uint32_t row = (j * 8u + group) * H3_MMA_LD;
+                        b_frag[0] = *(const uint32_t *)&k_tile[row + k0];
+                        b_frag[1] =
+                            *(const uint32_t *)&k_tile[row + k0 + 8u];
+                    }
                     h3_mma_m16n8k16_bf16(score[j], q_frag[kk], b_frag);
                 }
             }
@@ -3566,17 +3588,43 @@ static int h3_gpu_sdpa_bf16_mma(h3_gpu *gpu, h3_gpu_tensor *output,
     const uint16_t *k = (const uint16_t *)key->device;
     const uint16_t *v = (const uint16_t *)value->device;
     uint16_t *o = (uint16_t *)output->device;
+    int half_mode = 0;
     if (half && !strcmp(half, "qk"))
-        h3_sdpa_bf16_mma_d128_kernel<1>
-            <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
+        half_mode = 1;
     else if (half && !strcmp(half, "pv"))
-        h3_sdpa_bf16_mma_d128_kernel<2>
-            <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
+        half_mode = 2;
     else if (half && !strcmp(half, "load"))
-        h3_sdpa_bf16_mma_d128_kernel<3>
+        half_mode = 3;
+    int ldm = 1;
+    {
+        const char *ldm_env = getenv("H3_SDPA_LDMATRIX");
+        if (ldm_env && !strcmp(ldm_env, "0"))
+            ldm = 0;
+    }
+    if (ldm) {
+        if (half_mode == 1)
+            h3_sdpa_bf16_mma_d128_kernel<1, 1>
+                <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
+        else if (half_mode == 2)
+            h3_sdpa_bf16_mma_d128_kernel<2, 1>
+                <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
+        else if (half_mode == 3)
+            h3_sdpa_bf16_mma_d128_kernel<3, 1>
+                <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
+        else
+            h3_sdpa_bf16_mma_d128_kernel<0, 1>
+                <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
+    } else if (half_mode == 1)
+        h3_sdpa_bf16_mma_d128_kernel<1, 0>
+            <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
+    else if (half_mode == 2)
+        h3_sdpa_bf16_mma_d128_kernel<2, 0>
+            <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
+    else if (half_mode == 3)
+        h3_sdpa_bf16_mma_d128_kernel<3, 0>
             <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
     else
-        h3_sdpa_bf16_mma_d128_kernel<0>
+        h3_sdpa_bf16_mma_d128_kernel<0, 0>
             <<<blocks, threads, 0, gpu->stream>>>(q, k, v, o, args);
     gpu->stats.mps_sdpa_dispatches++;
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_bf16_mma_d128");
