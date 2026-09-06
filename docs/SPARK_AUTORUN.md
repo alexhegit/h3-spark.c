@@ -58,7 +58,7 @@ Script: `scripts/smoke_conditional.sh`
 | **A** | DiT F32 GPU API surface (KI-001) | **Skip** — BF16/INT8 (+ optional FP8 later) enough for Spark |
 | **B** | Metal NAX MLP (KI-002) | **Ignore** — Apple-only |
 | **C** | `--show` / frames preview UX | **Do now** (this phase) |
-| **D** | Perf + CUDA `--profile` phase marks | **Planned later** — high value, large effort |
+| **D** | Perf + CUDA `--profile` phase marks | **Done** (v0.2.0) — scoreboard in README / PERF_BASELINE |
 | **E** | MLX fixture numerical parity | **Pending** — no Mac / no `misc/fixtures` |
 | **F** | `--ref-audio` hard gate | **Do now** (this phase) |
 
@@ -66,7 +66,7 @@ Script: `scripts/smoke_conditional.sh`
 
 See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spark).
 
-### Planned later (D)
+### D — perf (closed at v0.2.0)
 
 - Implement real `h3_gpu_profile_mark` on CUDA (wall / encode / kernel buckets) — **done** (`483ffdf`)
 - **v0.1 baseline (2026-08-17):** fox-fast DiT denoise **1471.7 s** vs Metal **~16.7 s** (~88×) — keep as history in [`PERF_BASELINE.md`](PERF_BASELINE.md)
