@@ -4,6 +4,60 @@ Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.0** shipping
 numbers are in the snapshots below. The 2026-08-17 tables after them are the
 **pre-optimization** CUDA baseline (`483ffdf` / `v0.1.0`), not shipping speed.
 
+## perf2 autoloop (2026-09-07)
+
+Branch `perf2`. Wall budget **10 h** from 06:49 +0800 (stop ~16:49). Primary
+gate is **fox-fast PSNR vs v0.2.0 ref** `f5282774d3a4`
+(`/tmp/h3_perf2/ref-fox-fast.mp4`). KEEP default if **PSNR ≥ 24.0 dB** and
+**SSIM ≥ 0.85**. Below that is opt-in or REJECT. 15 s cinematic only if a
+microbench predicts **≥15%** e2e.
+
+Harness: `scripts/perf2_fox.sh`.
+
+### REJECT VAE tile scan to 512 px as fox-fast default (2026-09-07)
+
+Opened `configured_tile_pixels` to 512 like HIP v0.11. fox-fast 512²:
+
+| | WALL | denoise | VAE | PSNR | SSIM |
+|---|---:|---:|---:|---:|---:|
+| v0.2.0 ref (tile ≤320) | 15.5 | 8.20 | 2.57 | — | — |
+| **scan 512** (w1) | 15.62 | 8.144 | **2.676** | **26.83** | 0.795 |
+
+No VAE wall win (slightly worse). PSNR 26.8 dB is above the 24 dB floor; SSIM
+0.80 is a visible seam/blend change. Reverted. 15 s not run: HIP's −12% VAE
+would be ~9 s of 1097 s e2e, below the 15% bar.
+
+### REJECT VAE tile scan to 512 px as fox-fast default (2026-09-07)
+
+Opened `configured_tile_pixels` to 512 like HIP v0.11. fox-fast 512²:
+
+| | WALL | denoise | VAE | PSNR | SSIM |
+|---|---:|---:|---:|---:|---:|
+| v0.2.0 ref (tile ≤320) | 15.5 | 8.20 | 2.57 | — | — |
+| **scan 512** (w1) | 15.62 | 8.144 | **2.676** | **26.83** | 0.795 |
+
+No VAE wall win. Reverted. 15 s not run (HIP −12% VAE ≈ 9 s / 1097 s).
+
+### KEEP INT8 MLP default (re-priced 2026-09-07)
+
+| | WALL | denoise | linear | PSNR | SSIM | md5 |
+|---|---:|---:|---:|---:|---|---|
+| **INT8 MLP (default)** | **15.52** | 8.140 | **5.157** | inf | 1.000 | `f5282774d3a4` |
+| `H3_BF16_MLP=1` | 23.23 | 9.902 | 7.682 | 23.59 | 0.839 | `dbbae2120aac` |
+
+BF16 MLP is slower and below the 24 dB PSNR floor. INT8 stays default.
+
+### SDPA microbench baseline (perf2)
+
+`h3_sdpa_bench`: seq 1874 **2.868 ms** (35.1 TFLOP/s); seq 44800 **1721.8 ms** (33.4). 15 s bar is −15% → need ≤1464 ms at 44800.
+
+### REJECT V ldmatrix.x2.trans for P·V (2026-09-07)
+
+Guessed B-map: seq 1874 2.868→2.659 ms, 44800 1722→1614 ms (−6%), but fox-fast
+**PSNR 12.8 / SSIM 0.28**. Reverted. Do not retry this address map.
+
+### Next
+
 ## Current shipping fox-fast (v0.2.0, 2026-09-02)
 
 **Binary / tree:** `perf/dit-denoise-opt` @ `03adb33` (QK `mma.m16n8k16` + `ldmatrix.x2`)  
