@@ -1,6 +1,6 @@
 # Spark performance baseline
 
-Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.0** shipping
+Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.1** shipping
 numbers are in the snapshots below. The 2026-08-17 tables after them are the
 **pre-optimization** CUDA baseline (`483ffdf` / `v0.1.0`), not shipping speed.
 
@@ -99,7 +99,21 @@ Peak −71%. Wall on VAE −0.4 s; fox-fast e2e would not clear 15%. Not default
 P4 VAE tiles 480/512 only for 864×480 stays below the 15% 15 s bar. Long-N
 SDPA algorithm is the remaining 15 s lever.
 
-## Current shipping fox-fast (v0.2.0, 2026-09-02)
+## Current shipping (v0.2.1, 2026-09-07)
+
+**Binary / tree:** `perf2` (transposed-V SDPA + opt-in `H3_INT8_VAE`).  
+**Identity:** fox-fast mp4 md5 `f5282774d3a4670fec24a22d4e38274d`.
+
+| Preset | E2E | Denoise (sdpa / linear) | Notes |
+|---|---:|---|---|
+| fox-s2 | **8.0 s** | **1.19 s** (0.20 / 0.76) | unchanged vs v0.2.0 |
+| fox-fast | **15.5 s** | **8.06 s** (1.38 / 5.13) | warm n=3; same md5 |
+| 15 s cinematic | **18 min 17 s** | **16 min 51 s** (866 / 110) | last full run: v0.2.0 |
+| 15 s + TR | **11 min 22 s** | **9 min 53 s** (486 / 82) | opt-in |
+
+`H3_INT8_VAE=1`: fox-s2 VAE peak 9.45→2.73 GiB, PSNR 43.2 dB vs F32.
+
+## fox-fast v0.2.0 snapshot (2026-09-02)
 
 **Binary / tree:** `perf/dit-denoise-opt` @ `03adb33` (QK `mma.m16n8k16` + `ldmatrix.x2`)  
 **Logs:** `/tmp/h3_perf/shipping-20260902/fox-{cold,w1,w2,w3}.log`  

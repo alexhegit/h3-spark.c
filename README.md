@@ -1,6 +1,6 @@
 # h3-spark.c
 
-**v0.2.0** — NVIDIA DGX Spark (GB10) CUDA port of
+**v0.2.1** — NVIDIA DGX Spark (GB10) CUDA port of
 [antirez/h3.c](https://github.com/antirez/h3.c). MiniMax-H3 inference with the
 same CLI and model stack; the GPU backend is CUDA.
 
@@ -48,14 +48,15 @@ COMMON=(--width 512 --height 512 --frames 22 --steps 20 --layers 45 --reuse 2)
 Reference stills under `assets/showcase/refs/` were taken from the official
 MiniMax-H3 demo assets (`ref2va.mp4` / `fl2va.mp4`).
 
-## Status (v0.2.0, 2026-09-02)
+## Status (v0.2.1, 2026-09-07)
 
 | Capability | Status |
 |------------|--------|
 | T2VA (text → video+audio) | ✅ |
 | FL2VA (`--first-frame` / `--last-frame`) | ✅ |
 | Ref2VA (`--ref-image`, `--ref-video`, …) | ✅ |
-| Runtime INT8 MLP (opt-in `H3_INT8_MLP=1`; BF16 MLP is faster on GB10) | ✅ |
+| Runtime INT8 MLP (default on GB10; `H3_BF16_MLP=1` is slower and fails the PSNR floor) | ✅ |
+| Opt-in `H3_INT8_VAE=1` (VAE VRAM, not default speed) | ✅ |
 | `--ref-audio` + preview UX (`--frames-dir`, `--show`) | ✅ |
 | fox-s2 / fox-fast / 15 s cinematic | GB10 scoreboard below — [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) |
 
@@ -95,26 +96,29 @@ Same fox-fast preset as the T2VA showcase clip:
 ```
 
 First run pays model load + filesystem cache; repeat runs for timing.
-On DGX Spark (GB10) at `03adb33`, **warm** repeats of this command are about
-**15.5 s** wall (**8.2 s** GPU Euler denoise); output md5 prefix
+On DGX Spark (GB10) at v0.2.1, **warm** repeats of this command are about
+**15.5 s** wall (**8.06 s** GPU Euler denoise); output md5 prefix
 `f5282774d3a4`. Dated tables:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md).
 
-## HIP-page presets (GB10, v0.2.0)
+## HIP-page presets (GB10, v0.2.1)
 
 Same CLI knobs as the [h3-hip.c](https://alexhegit.github.io/h3-hip.c/)
-reproduce section (`03adb33`, `--seed 42`, `--profile`). These are Spark
-measurements of those commands, not a vendor bake-off.
+reproduce section (`--seed 42`, `--profile`). These are Spark measurements of
+those commands, not a vendor bake-off. 15 s numbers are still the v0.2.0
+full run; that preset was not re-timed (seq-44800 SDPA −2.4%).
 
 | Preset | knobs | GB10 E2E | denoise (sdpa / linear) | md5 prefix |
 |---|---|---:|---|---|
 | **fox-s2** | 512² 22f, steps 2, L35 R1 | **8.0 s** warm | **1.19 s** (0.20 / 0.76) | `aeb5ae10e105` |
-| **fox-fast** | 512² 22f, steps 20, L45 R2 | **15.5 s** warm | **8.20 s** (1.43 / 5.19) | `f5282774d3a4` |
+| **fox-fast** | 512² 22f, steps 20, L45 R2 | **15.5 s** warm | **8.06 s** (1.38 / 5.13) | `f5282774d3a4` |
 | **15 s cinematic** | 864×480, `--seconds 15`, L45 R2 | **18 min 17 s** | **16 min 51 s** (866 / 110) | `60fd70cc309c` |
 | same + `--token-reduction` | opt-in; quality trade | **11 min 22 s** | **9 min 53 s** (486 / 82) | `19c109ebb0cb` |
 
 fox-s2 wall is mostly video VAE (~2.5 s) + Qwen (~2.1 s), not DiT. 15 s wall
-is still long-N SDPA. Logs: `/tmp/h3_perf/hip-examples-20260902/`.
+is still long-N SDPA. Optional `H3_INT8_VAE=1` drops fox-s2 VAE peak
+9.45→2.73 GiB (PSNR 43 dB vs F32). 15 s logs:
+`/tmp/h3_perf/hip-examples-20260902/`.
 
 ```bash
 # fox-s2 — short A/B smoke

@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.2.1 — 2026-09-07
+
+Smaller SDPA default plus an opt-in VAE VRAM path. Fox-fast pixels still
+`f5282774d3a4`. 15 s cinematic was **not** re-timed (44800 SDPA −2.4% is
+below the 15% bar).
+
+### Speed (warm, `--profile`, seed 42)
+
+| Preset | E2E | Denoise |
+|---|---:|---:|
+| fox-s2 (512², steps 2, L35 R1) | **8.0 s** | **1.19 s** |
+| fox-fast (512², steps 20, L45 R2) | **15.5 s** | **8.06 s** (sdpa 1.38 / linear 5.13) |
+| 15 s cinematic (864×480, L45 R2) | **18 min 17 s** (last measured, v0.2.0) | **16 min 51 s** |
+| 15 s + `--token-reduction` | **11 min 22 s** (last measured) | **9 min 53 s** |
+
+### Changes
+
+- Default DiT SDPA stores V transposed so P·V uses the same `ldmatrix.x2` B
+  map as QK. Fox-fast md5 unchanged; sdpa **1.43 s → 1.38 s**.
+- `H3_INT8_VAE=1` quantizes video-VAE block linears. fox-s2 VAE peak
+  **9.45 → 2.73 GiB**, PSNR **43.2 dB** vs F32. Not default.
+- Quality gate for default opts: fox-fast PSNR ≥ 24 dB vs the v0.2.0 ref.
+- `--info` prints `H3_VERSION` **0.2.1**.
+
 ## v0.2.0 — 2026-09-02
 
 DGX Spark (GB10) shipping snapshot after the DiT / SDPA / VAE optimization

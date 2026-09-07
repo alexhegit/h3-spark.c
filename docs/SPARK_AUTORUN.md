@@ -1,7 +1,7 @@
 # Spark autoloop progress log
 
-Automated **h3-cuda** port on DGX Spark. Shipping tag: **v0.2.0**
-(`perf/dit-denoise-opt`).
+Automated **h3-cuda** port on DGX Spark. Shipping tag: **v0.2.1**
+(`perf2`).
 
 ## Plan (revised 2026-08-17)
 
@@ -58,7 +58,7 @@ Script: `scripts/smoke_conditional.sh`
 | **A** | DiT F32 GPU API surface (KI-001) | **Skip** — BF16/INT8 (+ optional FP8 later) enough for Spark |
 | **B** | Metal NAX MLP (KI-002) | **Ignore** — Apple-only |
 | **C** | `--show` / frames preview UX | **Do now** (this phase) |
-| **D** | Perf + CUDA `--profile` phase marks | **Done** (v0.2.0) — scoreboard in README / PERF_BASELINE |
+| **D** | Perf + CUDA `--profile` phase marks | **Done** (v0.2.1) — scoreboard in README / PERF_BASELINE |
 | **E** | MLX fixture numerical parity | **Pending** — no Mac / no `misc/fixtures` |
 | **F** | `--ref-audio` hard gate | **Do now** (this phase) |
 
@@ -71,6 +71,7 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 - Implement real `h3_gpu_profile_mark` on CUDA (wall / encode / kernel buckets) — **done** (`483ffdf`)
 - **v0.1 baseline (2026-08-17):** fox-fast DiT denoise **1471.7 s** vs Metal **~16.7 s** (~88×) — keep as history in [`PERF_BASELINE.md`](PERF_BASELINE.md)
 - **v0.2.0 shipping (2026-09-02, `03adb33`):** HIP-page knobs on GB10 — fox-s2 **~8.0 s** / fox-fast **~15.5 s** / 15 s cinematic **18 min 17 s** (TR **11 min 22 s**). Fox-fast denoise **~8.2 s**, md5 `f5282774d3a4`.
+- **v0.2.1 (2026-09-07, `perf2`):** fox-fast denoise **~8.06 s** (sdpa 1.38), same md5. Opt-in `H3_INT8_VAE`. 15 s not re-timed.
 
 ### Pending (E)
 
@@ -79,4 +80,4 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 
 ---
 
-*Last updated: 2026-09-02 — v0.2.0 shipping snapshot*
+*Last updated: 2026-09-07 — v0.2.1 shipping snapshot*
