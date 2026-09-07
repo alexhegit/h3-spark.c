@@ -70,7 +70,34 @@ address map as QK B. Guessing `.trans` on `[N][d]` was REJECT (PSNR 12.8).
 15 s not run (−2.4% at 44800 is below the 15% bar). Opt out with
 `H3_SDPA_LDMATRIX=0` (scalar V packing, old layout).
 
+### SKIP leftover `apply_scales` fusion (P1, 2026-09-07)
+
+fox-s2 nsys `/tmp/h3_perf2/p1-foxs2.nsys-rep`: **no**
+`h3_int8_apply_scales_bf16` launches. Attn-out / FC2 already defer into the
+gate. The Aug 26 0.24 s leftover is gone.
+
+### SKIP DiT INT8 workspace (P2, 2026-09-07)
+
+Denoise `alloc=0.000 GiB`; `int8_accum` is already persistent. HIP v0.11's
+workspace win was allocator churn Spark no longer has.
+
+### KEEP `H3_INT8_VAE=1` as opt-in (P3, 2026-09-07)
+
+Video VAE block linears: F32→INT8 weights (free F32 after quantize), dynamic
+row-quantize activations, persistent I8 workspace, INT8 GEMM, F32 epilogue+bias.
+Default path unchanged. fox-s2 vs same-tree F32 VAE:
+
+| | VAE wall | VAE peak | VAE linear | e2e | PSNR vs F32 | SSIM |
+|---|---:|---:|---:|---:|---:|---:|
+| F32 default | 2.463 | **9.454 GiB** | 1.407 | 8.01 | — | — |
+| **`H3_INT8_VAE=1`** | **2.054** | **2.725 GiB** | **0.912** | 7.55 | **43.19** | 0.975 |
+
+Peak −71%. Wall on VAE −0.4 s; fox-fast e2e would not clear 15%. Not default.
+
 ### Next
+
+P4 VAE tiles 480/512 only for 864×480 stays below the 15% 15 s bar. Long-N
+SDPA algorithm is the remaining 15 s lever.
 
 ## Current shipping fox-fast (v0.2.0, 2026-09-02)
 

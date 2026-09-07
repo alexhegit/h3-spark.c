@@ -348,6 +348,17 @@ int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
                                 h3_gpu_tensor *scales,
                                 const h3_gpu_tensor *input, uint32_t rows,
                                 uint32_t columns);
+/* F32 weights, one scale per output row. Used by opt-in H3_INT8_VAE. */
+int h3_gpu_quantize_weight_f32_int8(h3_gpu *gpu, h3_gpu_tensor *output,
+                                    h3_gpu_tensor *scales,
+                                    const h3_gpu_tensor *input, uint32_t rows,
+                                    uint32_t columns);
+int h3_gpu_linear_f32_int8(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *weight_scales,
+                           const h3_gpu_tensor *bias, uint32_t rows,
+                           uint32_t input_dim, uint32_t output_dim);
 /* FP8-E4M3 linear. Weights carry one scale for the whole tensor, which the
  * GEMM folds in; activations keep a scale per token. Faster than the INT8 path
  * and less accurate — see the comment on the implementation. */
