@@ -3279,6 +3279,10 @@ h3_sdpa_bf16_wave_d128_q8_kernel(const uint16_t *query, const uint16_t *key,
 #ifndef H3_MMA_LD
 #define H3_MMA_LD 136u
 #endif
+/* Transposed V tile [d=128][N=64], N padded so ldmatrix B matches QK. */
+#ifndef H3_MMA_VLD
+#define H3_MMA_VLD 72u
+#endif
 
 __device__ __forceinline__ static void h3_mma_m16n8k16_bf16(
     float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
@@ -3353,7 +3357,8 @@ __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
     const uint16_t *__restrict__ value, uint16_t *__restrict__ output,
     h3_sdpa_args args) {
     __shared__ uint16_t k_tile[H3_MMA_N * H3_MMA_LD];
-    __shared__ uint16_t v_tile[H3_MMA_N * H3_MMA_LD];
+    /* Large enough for Q as [64][136] and for transposed V as [128][72]. */
+    __shared__ uint16_t v_tile[128u * H3_MMA_VLD];
     /* Q only lives in shared long enough to be read into fragments, so it
      * borrows the V tile and the loop's leading barrier hands it back. */
     uint16_t *q_tile = v_tile;
@@ -3419,7 +3424,15 @@ __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
                 packed_v = h3_bf16_pair_to_f16(raw_v);
             }
             *(uint32_t *)&k_tile[row * H3_MMA_LD + column] = packed_k;
-            *(uint32_t *)&v_tile[row * H3_MMA_LD + column] = packed_v;
+            if constexpr (UseLdm) {
+                /* [d][N] so P·V B is the same ldmatrix.x2 map as QK B. */
+                v_tile[column * H3_MMA_VLD + row] =
+                    (uint16_t)(packed_v & 0xffffu);
+                v_tile[(column + 1u) * H3_MMA_VLD + row] =
+                    (uint16_t)(packed_v >> 16u);
+            } else {
+                *(uint32_t *)&v_tile[row * H3_MMA_LD + column] = packed_v;
+            }
         }
         __syncthreads();
 
@@ -3541,12 +3554,25 @@ __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
                 uint32_t n_high = n_low + 8u * H3_MMA_LD;
 #pragma unroll
                 for (uint32_t dt = 0; dt < 16u; dt++) {
-                    uint32_t column = dt * 8u + group;
-                    uint32_t b_frag[2] = {
-                        (uint32_t)v_tile[n_low + column] |
-                            ((uint32_t)v_tile[n_low + H3_MMA_LD + column] << 16u),
-                        (uint32_t)v_tile[n_high + column] |
-                            ((uint32_t)v_tile[n_high + H3_MMA_LD + column] << 16u)};
+                    uint32_t b_frag[2];
+                    if constexpr (UseLdm) {
+                        /* Same B map as QK: smem is now [d][N]. */
+                        uint32_t r = dt * 8u + (lane & 7u);
+                        uint32_t c = kk * 16u + ((lane >> 3u) & 1u) * 8u;
+                        h3_ldmatrix_b16_x2(
+                            b_frag[0], b_frag[1],
+                            &v_tile[r * H3_MMA_VLD + c]);
+                    } else {
+                        uint32_t column = dt * 8u + group;
+                        b_frag[0] =
+                            (uint32_t)v_tile[n_low + column] |
+                            ((uint32_t)v_tile[n_low + H3_MMA_LD + column]
+                             << 16u);
+                        b_frag[1] =
+                            (uint32_t)v_tile[n_high + column] |
+                            ((uint32_t)v_tile[n_high + H3_MMA_LD + column]
+                             << 16u);
+                    }
                     h3_mma_m16n8k16_f16(out_acc[dt], p_frag, b_frag);
                 }
             }

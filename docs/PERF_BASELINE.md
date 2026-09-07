@@ -56,6 +56,20 @@ BF16 MLP is slower and below the 24 dB PSNR floor. INT8 stays default.
 Guessed B-map: seq 1874 2.868→2.659 ms, 44800 1722→1614 ms (−6%), but fox-fast
 **PSNR 12.8 / SSIM 0.28**. Reverted. Do not retry this address map.
 
+### KEEP transposed V smem + ldmatrix.x2 for P·V (2026-09-07)
+
+QK B already used `ldmatrix.x2` on `[N][K]`. P·V needs B as `[d][N]`, so the
+V tile is stored transposed (`H3_MMA_VLD=72`) and loaded with the **same**
+address map as QK B. Guessing `.trans` on `[N][d]` was REJECT (PSNR 12.8).
+
+| | 1874 ms | 44800 ms | fox-fast sdpa | fox-fast denoise | md5 |
+|---|---:|---:|---:|---:|---|
+| v0.2.0 | 2.868 | 1721.8 | 1.43 | 8.20 | `f5282774d3a4` |
+| **this** | **2.804** | **1679.6** (−2.4%) | **1.38** (n=3: 1.377/1.396/1.382) | **8.06** | **`f5282774d3a4`** SSIM 1.0 |
+
+15 s not run (−2.4% at 44800 is below the 15% bar). Opt out with
+`H3_SDPA_LDMATRIX=0` (scalar V packing, old layout).
+
 ### Next
 
 ## Current shipping fox-fast (v0.2.0, 2026-09-02)
