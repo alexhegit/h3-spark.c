@@ -24,6 +24,19 @@ below the 15% bar).
 - Quality gate for default opts: fox-fast PSNR ≥ 24 dB vs the v0.2.0 ref.
 - `--info` prints `H3_VERSION` **0.2.1**.
 
+### Retest 2026-09-09 (`7420692`)
+
+Same tree, GB10. Logs `/tmp/h3_rebench/`. Pixels unchanged.
+
+| Preset | E2E | Denoise |
+|---|---:|---:|
+| fox-s2 | **8.2 s** | **1.20 s** |
+| fox-fast | **15.6 s** | **8.17 s** (1.40 / 5.22) |
+| 15 s cinematic | **17 min 56 s** | **16 min 28 s** (845 / 110) |
+
+`make test` **16.2 s**; `test-conditional` **4 min 33 s** (no `--ref-video`).
+`--token-reduction` not re-timed.
+
 ## v0.2.0 — 2026-09-02
 
 DGX Spark (GB10) shipping snapshot after the DiT / SDPA / VAE optimization

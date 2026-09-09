@@ -96,29 +96,28 @@ Same fox-fast preset as the T2VA showcase clip:
 ```
 
 First run pays model load + filesystem cache; repeat runs for timing.
-On DGX Spark (GB10) at v0.2.1, **warm** repeats of this command are about
-**15.5 s** wall (**8.06 s** GPU Euler denoise); output md5 prefix
-`f5282774d3a4`. Dated tables:
+On DGX Spark (GB10) at v0.2.1 (`7420692`, 2026-09-09 retest), **warm** repeats
+of this command are about **15.6 s** wall (**8.17 s** GPU Euler denoise);
+output md5 prefix `f5282774d3a4`. Dated tables:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md).
 
-## HIP-page presets (GB10, v0.2.1)
+## HIP-page presets (GB10, v0.2.1, retest 2026-09-09)
 
 Same CLI knobs as the [h3-hip.c](https://alexhegit.github.io/h3-hip.c/)
 reproduce section (`--seed 42`, `--profile`). These are Spark measurements of
-those commands, not a vendor bake-off. 15 s numbers are still the v0.2.0
-full run; that preset was not re-timed (seq-44800 SDPA −2.4%).
+those commands, not a vendor bake-off.
 
 | Preset | knobs | GB10 E2E | denoise (sdpa / linear) | md5 prefix |
 |---|---|---:|---|---|
-| **fox-s2** | 512² 22f, steps 2, L35 R1 | **8.0 s** warm | **1.19 s** (0.20 / 0.76) | `aeb5ae10e105` |
-| **fox-fast** | 512² 22f, steps 20, L45 R2 | **15.5 s** warm | **8.06 s** (1.38 / 5.13) | `f5282774d3a4` |
-| **15 s cinematic** | 864×480, `--seconds 15`, L45 R2 | **18 min 17 s** | **16 min 51 s** (866 / 110) | `60fd70cc309c` |
+| **fox-s2** | 512² 22f, steps 2, L35 R1 | **8.2 s** warm | **1.20 s** (0.20 / 0.77) | `aeb5ae10e105` |
+| **fox-fast** | 512² 22f, steps 20, L45 R2 | **15.6 s** warm | **8.17 s** (1.40 / 5.22) | `f5282774d3a4` |
+| **15 s cinematic** | 864×480, `--seconds 15`, L45 R2 | **17 min 56 s** | **16 min 28 s** (845 / 110) | `60fd70cc309c` |
 | same + `--token-reduction` | opt-in; quality trade | **11 min 22 s** | **9 min 53 s** (486 / 82) | `19c109ebb0cb` |
 
-fox-s2 wall is mostly video VAE (~2.5 s) + Qwen (~2.1 s), not DiT. 15 s wall
-is still long-N SDPA. Optional `H3_INT8_VAE=1` drops fox-s2 VAE peak
-9.45→2.73 GiB (PSNR 43 dB vs F32). 15 s logs:
-`/tmp/h3_perf/hip-examples-20260902/`.
+fox-s2 wall is mostly video VAE (~2.6 s) + Qwen (~2.1 s), not DiT. 15 s wall
+is still long-N SDPA (same md5 as v0.2.0). Optional `H3_INT8_VAE=1` drops
+fox-s2 VAE peak 9.45→2.73 GiB (PSNR 43 dB vs F32). Retest logs:
+`/tmp/h3_rebench/`.
 
 ```bash
 # fox-s2 — short A/B smoke
@@ -134,7 +133,7 @@ is still long-N SDPA. Optional `H3_INT8_VAE=1` drops fox-s2 VAE peak
   --width 864 --height 480 --seconds 15 \
   --steps 20 --layers 45 --reuse 2 --seed 42 \
   -o outputs/long-15s-cinematic.mp4
-# optional: append --token-reduction  (11 min 22 s on this box; not bit-identical)
+# optional: append --token-reduction  (11 min 22 s on this box, v0.2.0; not bit-identical)
 ```
 
 The 15 s prompt is the HIP-page office/cinematic text. For Ref2VA / FL2VA
@@ -179,6 +178,15 @@ three showcase samples are under [Showcase](#showcase-dgx-spark).
   Default terminal zoom: **1× on Linux**, 2× on macOS.
 
 ## Tests
+
+Timed on DGX Spark (GB10), v0.2.1 `7420692`, 2026-09-09. Full tables:
+[`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) (section *Retest 2026-09-09*).
+
+| Target | Wall |
+|---|---:|
+| `make -f Makefile.linux test` | **16.2 s** |
+| `make -f Makefile.linux test-conditional` | **4 min 33 s** |
+| same + `H3_CONDITIONAL_SKIP_REF_VIDEO=0` | not re-timed (~20 min extra) |
 
 ```bash
 make -f Makefile.linux test

@@ -99,19 +99,84 @@ Peak −71%. Wall on VAE −0.4 s; fox-fast e2e would not clear 15%. Not default
 P4 VAE tiles 480/512 only for 864×480 stays below the 15% 15 s bar. Long-N
 SDPA algorithm is the remaining 15 s lever.
 
-## Current shipping (v0.2.1, 2026-09-07)
+## Retest 2026-09-09 (v0.2.1 `7420692`)
 
-**Binary / tree:** `perf2` (transposed-V SDPA + opt-in `H3_INT8_VAE`).  
-**Identity:** fox-fast mp4 md5 `f5282774d3a4670fec24a22d4e38274d`.
+Same machine (DGX Spark GB10), `--profile`, seed 42. Logs:
+`/tmp/h3_rebench/`. Fox-fast / 15 s md5 **unchanged** vs v0.2.0.
+
+### Tests
+
+`H3_MODEL_ROOT=/home/alex/HF-MODELS/MiniMax-H3`. Tokenizer smoke skipped (no
+`MiniMax-H3/tokenizer` in the build cwd). `--ref-video` not included.
+
+| Target | Wall | Notes |
+|---|---:|---|
+| `make -f Makefile.linux test` | **16.2 s** | first-run compile of some smokes included |
+| `make -f Makefile.linux test-conditional` | **272.9 s** (4 min 33 s) | FL2VA + Ref2VA image/audio/silent |
+
+Already-built smokes, one shot each:
+
+| Binary | Wall |
+|---|---:|
+| `h3_tests` | 0.47 s |
+| `h3_cuda_smoke` | 0.42 s |
+| `h3_cuda_ops` | 3.01 s |
+| `h3_cuda_dit_block_smoke` | 1.50 s |
+| `h3_cuda_text_smoke` | 1.39 s |
+| `h3_cuda_vision_smoke` | 1.20 s |
+| `h3_cuda_video_vae_smoke` | 1.40 s |
+| `h3_cuda_audio_vae_smoke` | 0.97 s |
+| `h3_cuda_video_encoder_smoke` | 1.12 s |
+| `h3_cuda_audio_encoder_smoke` | 1.06 s |
+
+### Generate presets
+
+`h3_sdpa_bench`: seq 1874 **2.841 ms** (35.4 TFLOP/s); seq 44800 **1688 ms** (34.1).
+
+**fox-s2** (512², 22f, steps 2, L35 R1, prompt `A red fox walks through fresh snow.`), md5 `aeb5ae10e105`:
+
+| | WALL | denoise | sdpa | linear | video VAE | Qwen |
+|---|---:|---:|---:|---:|---:|---:|
+| cold | 9.44 | 1.168 | 0.200 | 0.748 | 2.503 | 3.104 |
+| warm 1 | 8.16 | 1.194 | 0.206 | 0.764 | 2.571 | 2.155 |
+| warm 2 | 8.42 | 1.199 | 0.201 | 0.774 | 2.827 | 2.152 |
+| warm 3 | 8.16 | 1.198 | 0.200 | 0.775 | 2.539 | 2.100 |
+| **warm n=3** | **8.25** | **1.20** | **0.20** | **0.77** | **2.65** | **2.14** |
+
+**fox-fast** (showcase prompt, steps 20, L45 R2), md5 `f5282774d3a4`, SSIM 1.0 vs v0.2.0 ref:
+
+| | WALL | denoise | sdpa | linear | video VAE | Qwen |
+|---|---:|---:|---:|---:|---:|---:|
+| cold | 16.75 | 8.127 | 1.397 | 5.196 | 2.606 | — |
+| warm 1 | 15.61 | 8.177 | 1.393 | 5.231 | 2.576 | 2.200 |
+| warm 2 | 15.65 | 8.168 | 1.390 | 5.214 | 2.508 | 2.175 |
+| warm 3 | 15.60 | 8.158 | 1.404 | 5.205 | 2.587 | 2.181 |
+| **warm n=3** | **15.62** | **8.17** | **1.40** | **5.22** | **2.56** | **2.19** |
+
+**15 s cinematic** (864×480, HIP-page office prompt, L45 R2). One run after the
+fox-fast warms (FS/GPU already hot). md5 `60fd70cc309c` (same as v0.2.0).
+
+| | WALL_SEC | denoise | sdpa | linear | video VAE | Qwen |
+|---|---:|---:|---:|---:|---:|---:|
+| **this run** | **1076.0** (17 min 56 s) | **988.2** | **844.5** | 109.6 | 78.6 | 3.20 |
+| v0.2.0 (2026-09-02) | 1097.5 | 1011.2 | 866.2 | 110.2 | 77.2 | — |
+
+E2E **−2.0 %**, SDPA **−2.5 %**, in line with the 44800 microbench (−2.4% vs
+the 1722 ms v0.2.0 bench). `--token-reduction` was **not** re-timed (still the
+v0.2.0 **682 s** figure).
+
+## Current shipping (v0.2.1, retest 2026-09-09)
+
+**Binary / tree:** `perf2` @ `7420692`. Logs: `/tmp/h3_rebench/`.
 
 | Preset | E2E | Denoise (sdpa / linear) | Notes |
 |---|---:|---|---|
-| fox-s2 | **8.0 s** | **1.19 s** (0.20 / 0.76) | unchanged vs v0.2.0 |
-| fox-fast | **15.5 s** | **8.06 s** (1.38 / 5.13) | warm n=3; same md5 |
-| 15 s cinematic | **18 min 17 s** | **16 min 51 s** (866 / 110) | last full run: v0.2.0 |
-| 15 s + TR | **11 min 22 s** | **9 min 53 s** (486 / 82) | opt-in |
+| fox-s2 | **8.2 s** warm | **1.20 s** (0.20 / 0.77) | md5 `aeb5ae10e105` |
+| fox-fast | **15.6 s** warm | **8.17 s** (1.40 / 5.22) | md5 `f5282774d3a4` |
+| 15 s cinematic | **17 min 56 s** | **16 min 28 s** (845 / 110) | md5 `60fd70cc309c` |
+| 15 s + TR | **11 min 22 s** | **9 min 53 s** (486 / 82) | opt-in; not re-timed |
 
-`H3_INT8_VAE=1`: fox-s2 VAE peak 9.45→2.73 GiB, PSNR 43.2 dB vs F32.
+`H3_INT8_VAE=1`: fox-s2 VAE peak 9.45→2.73 GiB, PSNR 43.2 dB vs F32 (2026-09-07).
 
 ## fox-fast v0.2.0 snapshot (2026-09-02)
 
