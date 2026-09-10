@@ -63,7 +63,8 @@ MiniMax-H3 demo assets (`ref2va.mp4` / `fl2va.mp4`).
 Progress log: [`docs/SPARK_AUTORUN.md`](docs/SPARK_AUTORUN.md) · Known gaps:
 [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) · Porting notes:
 [`docs/SPARK_PORTING.md`](docs/SPARK_PORTING.md) · Perf baseline:
-[`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md)
+[`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) · Quality vs speed:
+[`docs/BEST_PRACTICE.md`](docs/BEST_PRACTICE.md)
 
 ## Requirements
 
@@ -139,6 +140,21 @@ fox-s2 VAE peak 9.45→2.73 GiB (PSNR 43 dB vs F32). Retest logs:
 The 15 s prompt is the HIP-page office/cinematic text. For Ref2VA / FL2VA
 reproduction, see [Showcase](#showcase-dgx-spark).
 
+## Quality vs speed (best practice)
+
+Default flags are the **quality path**. Speed knobs are opt-in and never
+bit-identical.
+
+| You want | Use | Do not |
+|---|---|---|
+| Showcase / publish / HIP-page md5 | `--layers 45 --reuse 2`, no TR | `--token-reduction`, `--layers 40` |
+| Short 512² clip, faster | **`--reuse 3`** (~21 dB vs quality) | TR on a 22-frame clip |
+| 15 s, keep more structure | `--reuse 3` (**−25%**, PSNR **18.8**) | expect 24 dB |
+| 15 s, need the minutes | `--token-reduction` (**−37%**, PSNR **17.8**) | treat it as a slight loss |
+
+Full recipes, PSNR meaning, and what not to stack:
+[`docs/BEST_PRACTICE.md`](docs/BEST_PRACTICE.md).
+
 ## `--token-reduction` (faster, worse picture)
 
 Opt-in. **Off by default.** The wall-clock win is paid in quality: it is not
@@ -161,7 +177,9 @@ reuse 2), decoded pixels vs the same run without the flag:
 
 The speed is real (15 s cinematic **1076 s → 674 s** on the HIP-page 864×480
 A/B at `59d307b`, md5 `19c109ebb0cb`) and so is the quality hit (fur, edges). Do
-not use this flag when you need the bit-identical fox-fast reference. Details:
+not use this flag when you need the bit-identical fox-fast reference. How to
+choose this vs `--reuse 3`:
+[`docs/BEST_PRACTICE.md`](docs/BEST_PRACTICE.md). Details:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md).
 
 ## Conditional paths

@@ -14,6 +14,77 @@ microbench predicts **≥15%** e2e.
 
 Harness: `scripts/perf2_fox.sh`.
 
+## 2026-09-10 — 4h autoloop (from 14:19 +0800)
+
+### REJECT serial heads / cooperative one-head SDPA (`H3_SDPA_SERIAL_HEADS`, `H3_SDPA_COOP_HEADS`)
+
+GB10: 48 SMs, 24.0 MiB L2, `cooperativeLaunch=1`. Hypothesis: one head's K+V
+(~23 MB) fits in L2, so doing all Q-tiles of a head before the next would jump
+seq-44800 SDPA from the DRAM diagonal (~34 TFLOP/s) toward the BF16 ridge
+(~98). Two implementations, both opt-in, both reverted:
+
+| seq | baseline | serial launches (56 kernels) | coop grid.sync() one head at a time |
+|---:|---:|---:|---:|
+| 1874 | 2.79–2.83 ms (36 TFLOP/s) | **9.69–9.75 ms (10.4)** | **9.97 ms (10.1)** |
+| 44800 | **1678–1680 ms (34.2–34.3)** | **1863 ms (30.9)** | **1928 ms (29.8)** |
+
+Short seq is occupancy: 30 Q-tiles cannot fill 48 SMs. Long seq has 700
+Q-tiles per head and still **loses 11–15 %**. Head-parallel traffic already
+saturates the 273 GB/s roof; serializing heads spends occupancy/drain without
+raising achieved intensity. Do not retry as a default. Logs:
+`/tmp/h3_perf4h/serial-heads-bench.log`, `/tmp/h3_perf4h/coop-heads-bench.log`.
+
+### SKIP denoise leftover fusion (fox-s2 nsys, 2026-09-10)
+
+`nsys` fox-s2 (`/tmp/h3_perf4h/fox-s2.nsys-rep`): process GPU time is VAE F32
+CUTLASS + DiT INT8 GEMM + MMA SDPA. After those, the next DiT names are
+already fused (`h3_int8_swiglu_quant`, `h3_qkv_rope_coop`,
+`h3_gate_adaln_quantize_int8`, head-major quantize). No leftover kernel above
+~1 ms × launch count that would move fox-fast 15% or 15 s 15%. Same SKIP as
+the 2026-09-07 `apply_scales` note.
+
+### Confirm `--reuse 3` vs TR on v0.2.1 fox-fast (2026-09-10)
+
+Same showcase prompt/size/seed as the quality ref `f5282774d3a4`. Not default
+(PSNR gate is 24 dB / SSIM 0.85).
+
+| | denoise (sdpa / linear) | PSNR / SSIM vs ref | md5 |
+|---|---:|---|---|
+| L45 R2 (default) | 8.17 (1.40 / 5.22) | inf / 1.0 | `f5282774d3a4` |
+| **L45 R3** | **5.87 (1.01 / 3.75)** | **20.94 / 0.754** | `9233c190058d` |
+| TR 4:30 | ~6.1 | 17.8 / 0.72 | `4d1d250e5ab9` |
+| **R3 + TR** | **4.36 (0.63 / 2.87)** | **17.95 / 0.717** | `f000f95609f0` |
+
+R3 is the short-clip faster opt-in (quality strictly above TR). Stacking TR on
+R3 does not recover PSNR; it looks like TR. 15 s remains a different bet (TR
+shrinks N; R3 only drops 11→8 evals). Logs: `/tmp/h3_perf4h/fox-fast-r3.log`,
+`fox-fast-r3-tr.log`.
+
+### 15 s L45 `--reuse 3` hot retest (2026-09-10)
+
+Same HIP-page office prompt/seed as the v0.2.1 quality path (1076 s). 8 DiT
+evals (360 attention vs R2's 11 / 495). Hot FS (Qwen 3.19 s). Output
+`/tmp/h3_perf4h/long-15s-r3.mp4`, md5 **`d9c4482a551a`** (same as the 2026-09-02
+R3 clip). vs quality-path `60fd70cc309c`: **PSNR 18.83 / SSIM 0.70**.
+
+| | WALL_SEC | denoise | sdpa | linear | video VAE | evals |
+|---|---:|---:|---:|---:|---:|---:|
+| quality R2 (2026-09-09) | 1076.0 | 988.2 | 844.5 | 109.6 | 78.6 | 11 |
+| **R3 (this run)** | **804.72** (13 min 25 s) | **719.16** | **614.18** | 80.20 | 76.43 | **8** |
+| TR (2026-09-10) | 673.83 | 588.85 | 482.33 | 81.04 | 76.02 | 11 |
+
+R3 e2e **−25.2 %** vs quality (denoise scales as 8/11). TR remains faster
+(−37 %) because it shrinks N. Same-tree quality vs these clips:
+
+| | e2e vs R2 | PSNR / SSIM vs `60fd70cc309c` |
+|---|---:|---|
+| **R3** | **−25 %** | **18.83 / 0.70** |
+| TR | −37 % | **17.75 / 0.66** |
+
+R3 is the better-looking opt-in on both fox-fast and 15 s; still far below
+the 24 dB default gate. The 2026-09-02 1295 s R3 wall was a cold/unfair A/B,
+not a slowdown.
+
 ### REJECT VAE tile scan to 512 px as fox-fast default (2026-09-07)
 
 Opened `configured_tile_pixels` to 512 like HIP v0.11. fox-fast 512²:
