@@ -35,7 +35,7 @@ unimplemented. CUDA performance work should use its own fused MLP / INT8 path
 
 | ID | Topic | Status |
 |----|-------|--------|
-| D | Perf + CUDA `--profile` | **v0.2.1 retest 2026-09-09** — fox-fast 15.6 s e2e / 8.17 s denoise; 15 s 17 min 56 s. `make test` 16.2 s. Remaining: fox-fast INT8 linear; 15 s long-N SDPA. [`PERF_BASELINE.md`](PERF_BASELINE.md) |
+| D | Perf + CUDA `--profile` | **v0.2.1** — fox-fast 15.6 s e2e / 8.17 s denoise; 15 s 17 min 56 s; 15 s+TR **11 min 14 s** (2026-09-10). Remaining: fox-fast INT8 linear; 15 s long-N SDPA. [`PERF_BASELINE.md`](PERF_BASELINE.md) |
 | E | MLX fixture numerical parity | Pending (no Mac / fixtures) |
 
 Progress log: [`docs/SPARK_AUTORUN.md`](SPARK_AUTORUN.md) · Porting:

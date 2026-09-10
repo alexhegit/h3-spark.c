@@ -33,9 +33,11 @@ Same tree, GB10. Logs `/tmp/h3_rebench/`. Pixels unchanged.
 | fox-s2 | **8.2 s** | **1.20 s** |
 | fox-fast | **15.6 s** | **8.17 s** (1.40 / 5.22) |
 | 15 s cinematic | **17 min 56 s** | **16 min 28 s** (845 / 110) |
+| 15 s + `--token-reduction` | **11 min 14 s** | **9 min 49 s** (482 / 81) |
 
 `make test` **16.2 s**; `test-conditional` **4 min 33 s** (no `--ref-video`).
-`--token-reduction` not re-timed.
+15 s + TR re-timed 2026-09-10 (`59d307b`): **673.83 s**, md5 `19c109ebb0cb`
+(same pixels as v0.2.0 TR). vs quality-path 1076 s: **−37.4 %**.
 
 ## v0.2.0 — 2026-09-02
 

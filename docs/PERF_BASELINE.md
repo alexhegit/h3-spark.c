@@ -162,19 +162,34 @@ fox-fast warms (FS/GPU already hot). md5 `60fd70cc309c` (same as v0.2.0).
 | v0.2.0 (2026-09-02) | 1097.5 | 1011.2 | 866.2 | 110.2 | 77.2 | — |
 
 E2E **−2.0 %**, SDPA **−2.5 %**, in line with the 44800 microbench (−2.4% vs
-the 1722 ms v0.2.0 bench). `--token-reduction` was **not** re-timed (still the
-v0.2.0 **682 s** figure).
+the 1722 ms v0.2.0 bench).
 
-## Current shipping (v0.2.1, retest 2026-09-09)
+**15 s + `--token-reduction`** (same prompt/seed/knobs, 2026-09-10, tree
+`59d307b`, binary still the v0.2.1 kernels). One hot run after a cold-enough
+FS (Qwen 3.20 s). Log `/tmp/h3_rebench/long-15s-tr.log`. md5 **`19c109ebb0cb`**
+(same as v0.2.0 TR).
 
-**Binary / tree:** `perf2` @ `7420692`. Logs: `/tmp/h3_rebench/`.
+| | WALL_SEC | denoise | sdpa | linear | video VAE | Qwen |
+|---|---:|---:|---:|---:|---:|---:|
+| **this run** | **673.83** (11 min 14 s) | **588.85** | **482.33** | 81.04 | 76.02 | 3.20 |
+| v0.2.0 TR (2026-09-02) | 681.54 | 593.37 | 485.96 | 81.51 | 79.27 | — |
+| same-tree quality (2026-09-09) | 1076.0 | 988.2 | 844.5 | 109.6 | 78.6 | 3.20 |
+
+vs quality on this tree: E2E **−37.4 %**, SDPA **−42.9 %**. vs v0.2.0 TR: E2E
+**−1.1 %**, SDPA **−0.7 %** (same order as the quality-path −2 % from
+`ldmatrix.x2` P·V). Still opt-in; pixels are not the quality-path
+`60fd70cc309c`.
+
+## Current shipping (v0.2.1, retest 2026-09-09 / TR 2026-09-10)
+
+**Binary / tree:** `perf2` @ `59d307b` (kernels from `7420692`). Logs: `/tmp/h3_rebench/`.
 
 | Preset | E2E | Denoise (sdpa / linear) | Notes |
 |---|---:|---|---|
 | fox-s2 | **8.2 s** warm | **1.20 s** (0.20 / 0.77) | md5 `aeb5ae10e105` |
 | fox-fast | **15.6 s** warm | **8.17 s** (1.40 / 5.22) | md5 `f5282774d3a4` |
 | 15 s cinematic | **17 min 56 s** | **16 min 28 s** (845 / 110) | md5 `60fd70cc309c` |
-| 15 s + TR | **11 min 22 s** | **9 min 53 s** (486 / 82) | opt-in; not re-timed |
+| 15 s + TR | **11 min 14 s** | **9 min 49 s** (482 / 81) | opt-in; md5 `19c109ebb0cb` |
 
 `H3_INT8_VAE=1`: fox-s2 VAE peak 9.45→2.73 GiB, PSNR 43.2 dB vs F32 (2026-09-07).
 

@@ -101,7 +101,7 @@ of this command are about **15.6 s** wall (**8.17 s** GPU Euler denoise);
 output md5 prefix `f5282774d3a4`. Dated tables:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md).
 
-## HIP-page presets (GB10, v0.2.1, retest 2026-09-09)
+## HIP-page presets (GB10, v0.2.1, retest 2026-09-09 / TR 2026-09-10)
 
 Same CLI knobs as the [h3-hip.c](https://alexhegit.github.io/h3-hip.c/)
 reproduce section (`--seed 42`, `--profile`). These are Spark measurements of
@@ -112,7 +112,7 @@ those commands, not a vendor bake-off.
 | **fox-s2** | 512² 22f, steps 2, L35 R1 | **8.2 s** warm | **1.20 s** (0.20 / 0.77) | `aeb5ae10e105` |
 | **fox-fast** | 512² 22f, steps 20, L45 R2 | **15.6 s** warm | **8.17 s** (1.40 / 5.22) | `f5282774d3a4` |
 | **15 s cinematic** | 864×480, `--seconds 15`, L45 R2 | **17 min 56 s** | **16 min 28 s** (845 / 110) | `60fd70cc309c` |
-| same + `--token-reduction` | opt-in; quality trade | **11 min 22 s** | **9 min 53 s** (486 / 82) | `19c109ebb0cb` |
+| same + `--token-reduction` | opt-in; quality trade | **11 min 14 s** | **9 min 49 s** (482 / 81) | `19c109ebb0cb` |
 
 fox-s2 wall is mostly video VAE (~2.6 s) + Qwen (~2.1 s), not DiT. 15 s wall
 is still long-N SDPA (same md5 as v0.2.0). Optional `H3_INT8_VAE=1` drops
@@ -133,7 +133,7 @@ fox-s2 VAE peak 9.45→2.73 GiB (PSNR 43 dB vs F32). Retest logs:
   --width 864 --height 480 --seconds 15 \
   --steps 20 --layers 45 --reuse 2 --seed 42 \
   -o outputs/long-15s-cinematic.mp4
-# optional: append --token-reduction  (11 min 22 s on this box, v0.2.0; not bit-identical)
+# optional: append --token-reduction  (11 min 14 s on this box, v0.2.1; not bit-identical)
 ```
 
 The 15 s prompt is the HIP-page office/cinematic text. For Ref2VA / FL2VA
@@ -159,9 +159,9 @@ reuse 2), decoded pixels vs the same run without the flag:
 | Output md5 | `f5282774d3a4` → `4d1d250e5ab9` |
 | Audio | also not identical |
 
-The speed is real (15 s cinematic **1097 s → 682 s** on the HIP-page 864×480
-A/B at `03adb33`) and so is the quality hit (fur, edges). Do not use this
-flag when you need the bit-identical fox-fast reference. Details:
+The speed is real (15 s cinematic **1076 s → 674 s** on the HIP-page 864×480
+A/B at `59d307b`, md5 `19c109ebb0cb`) and so is the quality hit (fur, edges). Do
+not use this flag when you need the bit-identical fox-fast reference. Details:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md).
 
 ## Conditional paths
