@@ -1,6 +1,6 @@
 # h3-cuda: DGX Spark Porting Plan
 
-**Status (v0.2.1, 2026-09-07):** The CUDA `./h3` path on GB10 is shipping.
+**Status (v0.2.2, 2026-09-14):** The CUDA `./h3` path on GB10 is shipping.
 Phases 0–3c are done. Unchecked boxes in [Implementation phases](#implementation-phases)
 are leftover plan text, not open work. Current speed:
 [`README.md`](../README.md) and [`PERF_BASELINE.md`](PERF_BASELINE.md).

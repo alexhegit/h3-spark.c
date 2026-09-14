@@ -1,6 +1,6 @@
 # h3-spark.c
 
-**v0.2.1** — NVIDIA DGX Spark (GB10) CUDA port of
+**v0.2.2** — NVIDIA DGX Spark (GB10) CUDA port of
 [antirez/h3.c](https://github.com/antirez/h3.c). MiniMax-H3 inference with the
 same CLI and model stack; the GPU backend is CUDA.
 
@@ -48,7 +48,7 @@ COMMON=(--width 512 --height 512 --frames 22 --steps 20 --layers 45 --reuse 2)
 Reference stills under `assets/showcase/refs/` were taken from the official
 MiniMax-H3 demo assets (`ref2va.mp4` / `fl2va.mp4`).
 
-## Status (v0.2.1, 2026-09-07)
+## Status (v0.2.2, 2026-09-14)
 
 | Capability | Status |
 |------------|--------|
@@ -98,12 +98,12 @@ Same fox-fast preset as the T2VA showcase clip:
 ```
 
 First run pays model load + filesystem cache; repeat runs for timing.
-On DGX Spark (GB10) at v0.2.1 (`7420692`, 2026-09-09 retest), **warm** repeats
+On DGX Spark (GB10) at v0.2.2 (`perf2`), **warm** repeats
 of this command are about **15.6 s** wall (**8.17 s** GPU Euler denoise);
 output md5 prefix `f5282774d3a4`. Dated tables:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md).
 
-## HIP-page presets (GB10, v0.2.1, retest 2026-09-09 / TR 2026-09-10)
+## HIP-page presets (GB10, v0.2.2, retest 2026-09-09 / TR 2026-09-10 / sol-attn 2026-09-14)
 
 Same CLI knobs as the [h3-hip.c](https://alexhegit.github.io/h3-hip.c/)
 reproduce section (`--seed 42`, `--profile`). These are Spark measurements of
@@ -221,7 +221,7 @@ three showcase samples are under [Showcase](#showcase-dgx-spark).
 
 ## Tests
 
-Timed on DGX Spark (GB10), v0.2.1 `7420692`, 2026-09-09. Full tables:
+Timed on DGX Spark (GB10), v0.2.1 `7420692`, 2026-09-09 (unchanged at v0.2.2). Full tables:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) (section *Retest 2026-09-09*).
 
 | Target | Wall |

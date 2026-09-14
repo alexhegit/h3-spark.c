@@ -2,8 +2,11 @@
 
 ## Unreleased
 
-Opt-in `--sol-attn` (Sol-Attn-style sparse MMA SDPA). Default generate path
-and fox-fast md5 `f5282774d3a4` are unchanged.
+## v0.2.2 — 2026-09-14
+
+Opt-in `--sol-attn` (Sol-Attn-style sparse MMA SDPA) for long T2VA. Default
+generate path and fox-fast md5 `f5282774d3a4` are unchanged. `--info` prints
+`H3_VERSION` **0.2.2**.
 
 ### Speed / quality (GB10, 2026-09-14, seed 42)
 
@@ -14,8 +17,13 @@ and fox-fast md5 `f5282774d3a4` are unchanged.
 | 15 s + `--reuse 3` | 13 min 25 s | −25% | 18.8 / 0.70 |
 | 15 s + `--token-reduction` | 11 min 14 s | −37% | 17.8 / 0.66 |
 
-Kernel seq 44800: **~3.0×** vs dense MMA. Usage and code map:
-[`docs/SOL_ATTN.md`](docs/SOL_ATTN.md).
+Kernel seq 44800: **~3.0×** vs dense MMA. Audio waveform SNR vs the quality
+path on the same 15 s clip: `--sol-attn` **8.6 dB**, `--token-reduction`
+3.1 dB, `--reuse 3` 2.6 dB. H3 audio is inherently dull (~1% energy above
+4 kHz on the quality path). `H3_SOL_ATTN_BLOCKS=8:36` was **REJECT** as an
+audio-protection setting (+0.6 dB audio, worse wall and video PSNR).
+
+Usage and code map: [`docs/SOL_ATTN.md`](docs/SOL_ATTN.md).
 
 ## v0.2.1 — 2026-09-07
 

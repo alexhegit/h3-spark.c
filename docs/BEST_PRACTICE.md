@@ -1,6 +1,6 @@
 # Quality vs speed: how to pick generate knobs
 
-Numbers below are **DGX Spark (GB10), v0.2.1**, seed 42, `--profile`.
+Numbers below are **DGX Spark (GB10), v0.2.2**, seed 42, `--profile`.
 PSNR/SSIM are ffmpeg lavfi vs the **same prompt/size/seed without the speed
 flag**. They are not a claim about “good video” in absolute terms — only how
 far you moved from this port’s quality path.

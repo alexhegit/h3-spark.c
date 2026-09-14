@@ -1,6 +1,6 @@
 # Spark performance baseline
 
-Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.1** shipping
+Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.2** shipping
 numbers are in the snapshots below. The 2026-08-17 tables after them are the
 **pre-optimization** CUDA baseline (`483ffdf` / `v0.1.0`), not shipping speed.
 
@@ -305,9 +305,9 @@ vs quality on this tree: E2E **−37.4 %**, SDPA **−42.9 %**. vs v0.2.0 TR: E2
 `ldmatrix.x2` P·V). Still opt-in; pixels are not the quality-path
 `60fd70cc309c`.
 
-## Current shipping (v0.2.1, retest 2026-09-09 / TR 2026-09-10)
+## Current shipping (v0.2.2, 2026-09-14)
 
-**Binary / tree:** `perf2` @ `59d307b` (kernels from `7420692`). Logs: `/tmp/h3_rebench/`.
+**Binary / tree:** `perf2` (kernels from `7420692` + `--sol-attn`). Logs: `/tmp/h3_rebench/`, `/tmp/h3_perf4h/sol-attn-15s.log`.
 
 | Preset | E2E | Denoise (sdpa / linear) | Notes |
 |---|---:|---|---|
@@ -315,6 +315,7 @@ vs quality on this tree: E2E **−37.4 %**, SDPA **−42.9 %**. vs v0.2.0 TR: E2
 | fox-fast | **15.6 s** warm | **8.17 s** (1.40 / 5.22) | md5 `f5282774d3a4` |
 | 15 s cinematic | **17 min 56 s** | **16 min 28 s** (845 / 110) | md5 `60fd70cc309c` |
 | 15 s + TR | **11 min 14 s** | **9 min 49 s** (482 / 81) | opt-in; md5 `19c109ebb0cb` |
+| 15 s + `--sol-attn` | **11 min 35 s** | **10 min 9 s** (464 / 111) | opt-in; md5 `6ad88ffb989a`; PSNR 19.2 / 0.72 |
 
 `H3_INT8_VAE=1`: fox-s2 VAE peak 9.45→2.73 GiB, PSNR 43.2 dB vs F32 (2026-09-07).
 

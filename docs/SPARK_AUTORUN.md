@@ -1,6 +1,6 @@
 # Spark autoloop progress log
 
-Automated **h3-cuda** port on DGX Spark. Shipping tag: **v0.2.1**
+Automated **h3-cuda** port on DGX Spark. Shipping tag: **v0.2.2**
 (`perf2`).
 
 ## Plan (revised 2026-08-17)
@@ -58,7 +58,7 @@ Script: `scripts/smoke_conditional.sh`
 | **A** | DiT F32 GPU API surface (KI-001) | **Skip** — BF16/INT8 (+ optional FP8 later) enough for Spark |
 | **B** | Metal NAX MLP (KI-002) | **Ignore** — Apple-only |
 | **C** | `--show` / frames preview UX | **Do now** (this phase) |
-| **D** | Perf + CUDA `--profile` phase marks | **Done** (v0.2.1) — scoreboard in README / PERF_BASELINE |
+| **D** | Perf + CUDA `--profile` phase marks | **Done** (v0.2.2) — scoreboard in README / PERF_BASELINE |
 | **E** | MLX fixture numerical parity | **Pending** — no Mac / no `misc/fixtures` |
 | **F** | `--ref-audio` hard gate | **Do now** (this phase) |
 
@@ -74,6 +74,7 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 - **v0.2.1 retest (2026-09-09, `7420692`):** fox-s2 **8.2 s** / fox-fast **15.6 s** / 15 s **17 min 56 s** (md5 unchanged). `make test` **16.2 s**, `test-conditional` **4 min 33 s**.
 - **15 s + TR (2026-09-10, `59d307b`):** **11 min 14 s** e2e / **9 min 49 s** denoise (sdpa 482 / linear 81), md5 `19c109ebb0cb` (same as v0.2.0 TR). vs quality 1076 s: **−37.4 %**.
 - **15 s + `--sol-attn` (2026-09-14):** **11 min 35 s** e2e (−35%), PSNR **19.2 / 0.72** vs quality. Opt-in; [`SOL_ATTN.md`](SOL_ATTN.md).
+- **v0.2.2 (2026-09-14):** ships `--sol-attn`. Audio SNR vs quality on 15 s: sol-attn **8.6 dB** (TR 3.1, reuse 3 2.6). `H3_SOL_ATTN_BLOCKS=8:36` REJECT.
 
 ### Pending (E)
 
@@ -82,4 +83,4 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 
 ---
 
-*Last updated: 2026-09-14 — `--sol-attn` opt-in*
+*Last updated: 2026-09-14 — v0.2.2 (`--sol-attn`)*
