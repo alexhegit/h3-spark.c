@@ -49,6 +49,23 @@ Kernel-only 3× does not become 3× e2e: only DiT blocks 4–40 are sparse,
 prefix KV stays exact, and linear + VAE do not shrink. Logs:
 `/tmp/h3_perf4h/sol-attn-15s.log`, md5 `6ad88ffb989a`.
 
+Audio waveform SNR vs the quality-path track on the same clip: `--sol-attn`
+**8.6 dB**, `--token-reduction` 3.1 dB, `--reuse 3` 2.6 dB. Sol-Attn is the
+least damaging speed flag for audio even though audio KV and audio query rows
+are already exact — video hidden states feed the audio branch through
+cross-modal attention. The quality path itself carries only ~1% of its audio
+energy above 4 kHz, so the dull character of H3 audio is the model, not the
+decode chain (AudioVAE stays 32 kHz native and matches the upstream reference
+to relative L2 < 0.05 in `tests/test_real_audio_vae.c`).
+
+**REJECT — `H3_SOL_ATTN_BLOCKS=8:36` to protect audio.** 28 sparse blocks
+instead of 36: audio SNR 8.6 → 9.2 dB (+0.6), but e2e 694.7 → **779.2 s**
+(−35% → −28%) and video PSNR/SSIM 19.2 / 0.72 → **18.3 / 0.71**. Worse on two
+of three axes. Quality is not monotonic in sparse block count because blocks
+4, 13, 14, 16, 17 are already gate-skipped at L45, so shifting the window
+changes which layers compound error. Log `/tmp/h3_audio/sol-b836-15s.log`,
+md5 `419c1d4570b9`. Default `4:40` stands.
+
 Do **not** default. Usage, env knobs, and code map: [`SOL_ATTN.md`](SOL_ATTN.md).
 
 ## 2026-09-10 — 4h autoloop (from 14:19 +0800)

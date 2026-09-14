@@ -63,6 +63,14 @@ shrinks N; reuse 3 only drops 11→8 evals. On this 15 s clip **Sol-Attn
 beats reuse 3 on both wall and PSNR**, and beats TR on PSNR at almost the
 same speed.
 
+All three speed flags also move the **audio**, even though nothing sparsifies
+or pools audio tokens directly: video hidden states feed the audio branch
+through cross-modal attention. Waveform SNR vs the quality-path track on this
+clip is `--sol-attn` **8.6 dB**, `--token-reduction` 3.1 dB, `--reuse 3`
+2.6 dB. If the soundtrack matters, use the quality path. Separately, H3 audio
+is inherently dull — the quality path puts only ~1% of its energy above
+4 kHz — so a muffled soundtrack is usually the model, not a flag.
+
 ~18–19 dB vs the quality path is a **visible** hit (soft fur, edges, luma).
 It is not a “slight” trade. Do not use these flags when you need the
 HIP-page md5.

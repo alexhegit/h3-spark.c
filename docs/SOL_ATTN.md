@@ -96,6 +96,36 @@ reuse 3 and TR**. It is ~20 s slower than TR. Kernel 3× does not become e2e
 3×: only DiT blocks 4–40 are sparse, prefix KV is exact, linear and VAE do
 not shrink. Log: `/tmp/h3_perf4h/sol-attn-15s.log`.
 
+### Audio on the same clip
+
+Audio tokens sit in the sequence prefix, so their KV tiles and their query
+rows both stay dense. The audio branch still moves, because video hidden
+states feed back into it through cross-modal attention. Waveform SNR against
+the quality-path audio track:
+
+| Flag | Audio SNR vs quality | Energy >4 kHz |
+|---|---:|---:|
+| (none) | — (reference) | 1.09% |
+| `--sol-attn` | **8.6 dB** | 1.49% |
+| `--token-reduction` | 3.1 dB | 0.42% |
+| `--reuse 3` | 2.6 dB | 0.82% |
+
+Sol-Attn is the **least damaging** of the three speed flags for audio, but
+8.6 dB is still an audible change. Note the quality path itself puts only
+~1% of its energy above 4 kHz — the dull, low-bitrate character of H3 audio
+is the model, not the decode chain (AudioVAE is 32 kHz native, 800 samples
+per latent frame at 40 Hz, and matches the upstream reference waveform to
+relative L2 < 0.05). Use the quality path when audio matters.
+
+**REJECT — narrowing the sparse block range to protect audio.**
+`H3_SOL_ATTN_BLOCKS=8:36` (28 sparse blocks instead of 36) buys only
+**+0.6 dB** audio SNR and loses on both other axes: e2e **779 s** (−28%
+instead of −35%) and video **18.3 / 0.71** instead of 19.2 / 0.72. Quality is
+not monotonic in the sparse block count here — blocks 4, 13, 14, 16, 17 are
+already gate-skipped at L45, so moving the window changes which layers
+compound error rather than simply reducing it. Log
+`/tmp/h3_audio/sol-b836-15s.log`, md5 `419c1d4570b9`.
+
 ## What the code does
 
 1. **CLI / params** — `h3_params.sol_attn` (`h3.h`). `--sol-attn` in `main.c`,
