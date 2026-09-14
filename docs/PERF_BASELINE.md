@@ -14,6 +14,43 @@ microbench predicts **≥15%** e2e.
 
 Harness: `scripts/perf2_fox.sh`.
 
+## 2026-09-14 — Sol-Attn-style sparse SDPA (`--sol-attn`, opt-in)
+
+Training-free block sparse attention on the default MMA kernel: 64-token
+tiles, query-block proxy `q̄·k_mean`, keep if local band / exact prefix
+(non-video tokens) / `score ≥ mean + τ·std`, else fold pooled K/V into
+online softmax. Default `τ=0.5`, band 1, DiT blocks `4:40`. Keep-all
+(`H3_SOL_ATTN_TAU=-100`) is **bit-identical** to dense MMA (ops test +
+fox-fast md5 `f5282774d3a4`).
+
+Kernel (`h3_sdpa_bench`, GB10):
+
+| seq | dense | `--sol-attn` τ=0.5 | kernel |
+|---:|---:|---:|---:|
+| 1874 (fox-fast) | 2.84 ms | 1.63–2.38 ms | ~1.2–1.7× |
+| 8192 | 44.4 ms | 20.3 ms | **2.2×** |
+| 16384 | 164.4 ms | 75.5 ms | **2.2×** |
+| 44800 (15 s) | 1682–1693 ms | **548–572 ms** | **3.0×** |
+
+fox-fast e2e vs `f5282774d3a4`: denoise 8.17→7.74 s, sdpa 1.40→1.05 s,
+**PSNR 17.6 / SSIM 0.71**. Fails KEEP (24 dB). Same quality class as
+`--token-reduction`. Short clips do not pay for this flag.
+
+15 s cinematic (864×480, L45 R2, seed 42) vs quality-path `60fd70cc309c`:
+
+| | E2E | Denoise (sdpa / linear) | vs quality | PSNR / SSIM |
+|---|---:|---|---:|---|
+| quality path | 1076 s | 988 s (845 / 110) | — | — |
+| `--token-reduction` | 674 s | 589 s (482 / 81) | **−37%** | 17.8 / 0.66 |
+| `--sol-attn` τ=0.5 | **694.7 s** (11 min 35 s) | **608.9 s** (464 / 111) | **−35%** | **19.2 / 0.72** |
+
+Sol-Attn is a bit slower than TR on this clip but **~1.4 dB** higher PSNR.
+Kernel-only 3× does not become 3× e2e: only DiT blocks 4–40 are sparse,
+prefix KV stays exact, and linear + VAE do not shrink. Logs:
+`/tmp/h3_perf4h/sol-attn-15s.log`, md5 `6ad88ffb989a`.
+
+Do **not** default. Usage, env knobs, and code map: [`SOL_ATTN.md`](SOL_ATTN.md).
+
 ## 2026-09-10 — 4h autoloop (from 14:19 +0800)
 
 ### REJECT serial heads / cooperative one-head SDPA (`H3_SDPA_SERIAL_HEADS`, `H3_SDPA_COOP_HEADS`)

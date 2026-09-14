@@ -73,6 +73,7 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 - **v0.2.0 shipping (2026-09-02, `03adb33`):** HIP-page knobs on GB10 — fox-s2 **~8.0 s** / fox-fast **~15.5 s** / 15 s cinematic **18 min 17 s** (TR **11 min 22 s**). Fox-fast denoise **~8.2 s**, md5 `f5282774d3a4`.
 - **v0.2.1 retest (2026-09-09, `7420692`):** fox-s2 **8.2 s** / fox-fast **15.6 s** / 15 s **17 min 56 s** (md5 unchanged). `make test` **16.2 s**, `test-conditional` **4 min 33 s**.
 - **15 s + TR (2026-09-10, `59d307b`):** **11 min 14 s** e2e / **9 min 49 s** denoise (sdpa 482 / linear 81), md5 `19c109ebb0cb` (same as v0.2.0 TR). vs quality 1076 s: **−37.4 %**.
+- **15 s + `--sol-attn` (2026-09-14):** **11 min 35 s** e2e (−35%), PSNR **19.2 / 0.72** vs quality. Opt-in; [`SOL_ATTN.md`](SOL_ATTN.md).
 
 ### Pending (E)
 
@@ -81,4 +82,4 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 
 ---
 
-*Last updated: 2026-09-09 — v0.2.1 retest*
+*Last updated: 2026-09-14 — `--sol-attn` opt-in*

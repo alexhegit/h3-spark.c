@@ -81,6 +81,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    h3_gpu_sol_attn_configure(gpu, 1, -1);
     float scale = 1.0f / sqrtf((float)head_dim);
     for (int warm = 0; warm < 3; warm++) {
         if (!h3_gpu_sdpa_bf16(gpu, output, query, key, value, sequence, heads,
@@ -105,6 +106,10 @@ int main(int argc, char **argv) {
     double flops = 4.0 * (double)sequence * sequence * head_dim * heads;
     printf("seq %u heads %u dim %u: %.3f ms  %.1f TFLOP/s", sequence, heads,
            head_dim, seconds * 1e3, flops / seconds * 1e-12);
+    if (getenv("H3_SOL_ATTN") && strcmp(getenv("H3_SOL_ATTN"), "0") != 0) {
+        const char *tau = getenv("H3_SOL_ATTN_TAU");
+        printf("  SOL tau=%s", tau && *tau ? tau : "0.5");
+    }
     const char *half = getenv("H3_SDPA_HALF");
     if (half && *half) printf("  HALF=%s", half);
     {

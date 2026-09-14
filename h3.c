@@ -243,11 +243,11 @@ static char *h3_prepared_key(const char *conditioning,
     if (!h3_key_append(
             &key,
             "%s|shape=%dx%dx%d|steps=%d|layers=%d|reuse-core=%d|reduce=%d"
-            "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
+            "|sol-attn=%d|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
             "|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
             params->steps, params->dit_layers, params->core_reuse,
-            params->token_reduction, params->use_int8_row_fc2,
+            params->token_reduction, params->sol_attn, params->use_int8_row_fc2,
             params->use_reference_rope,
             params->ssd_streaming,
             params->use_slower_bf16_mlp,
@@ -611,6 +611,10 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "token reduction must be zero or one");
         return 0;
     }
+    if (params->sol_attn != 0 && params->sol_attn != 1) {
+        h3_set_error(ctx, "sol-attn must be zero or one");
+        return 0;
+    }
     if (params->use_int8_row_fc2 != 0 &&
         params->use_int8_row_fc2 != 1) {
         h3_set_error(ctx, "int8 row FC2 must be zero or one");
@@ -935,6 +939,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             "loss (not bit-identical). Middle DiT blocks pool adjacent "
             "horizontal video tokens; fox-fast vs off is ~17.8 dB PSNR / "
             "0.72 SSIM (luma ~16 dB). See README.\n");
+    if (params->sol_attn) {
+        setenv("H3_SOL_ATTN", "1", 1);
+        fprintf(stderr,
+            "h3: --sol-attn is on: long-sequence SDPA keeps important KV "
+            "tiles and approximates the rest (not bit-identical). fox-fast "
+            "vs off is ~17.6 dB PSNR / 0.71 SSIM — same class as "
+            "--token-reduction, not KEEP. Tune H3_SOL_ATTN_TAU (default 0.5).\n");
+    }
     int render_width = params->render_width ? params->render_width :
                                                params->width;
     int render_height = params->render_height ? params->render_height :

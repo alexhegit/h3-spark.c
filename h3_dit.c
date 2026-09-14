@@ -2180,6 +2180,22 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
+    if (getenv("H3_SOL_ATTN") && strcmp(getenv("H3_SOL_ATTN"), "0") != 0) {
+        unsigned begin = 4, end = 40;
+        const char *range = getenv("H3_SOL_ATTN_BLOCKS");
+        if (range && *range) {
+            char *middle = NULL;
+            unsigned long parsed_begin = strtoul(range, &middle, 10);
+            if (middle && *middle == ':') {
+                unsigned long parsed_end = strtoul(middle + 1, NULL, 10);
+                if (parsed_end > parsed_begin && parsed_end <= 50)
+                    begin = (unsigned)parsed_begin, end = (unsigned)parsed_end;
+            }
+        }
+        int prefix = (int)((dit->video_target_start + 63u) / 64u);
+        h3_gpu_sol_attn_configure(dit->gpu,
+                                  index >= begin && index < end, prefix);
+    }
     if (head_major_attention_output)
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,

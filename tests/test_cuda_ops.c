@@ -2356,6 +2356,78 @@ int main(void) {
         free(mout);
     }
 
+    /* Sol-Attn keep-all (τ = -100) must match dense MMA on a long-enough
+     * sequence for the sparse kernel to run. */
+    {
+        const uint32_t sol_seq = 512;
+        const uint32_t sol_heads = 2;
+        const uint32_t sol_dim = 128;
+        const size_t sol_count = (size_t)sol_seq * sol_heads * sol_dim;
+        const float sol_scale = 1.0f / sqrtf((float)sol_dim);
+        uint16_t *sq = (uint16_t *)malloc(sol_count * sizeof(uint16_t));
+        uint16_t *sk = (uint16_t *)malloc(sol_count * sizeof(uint16_t));
+        uint16_t *sv = (uint16_t *)malloc(sol_count * sizeof(uint16_t));
+        uint16_t *dense = (uint16_t *)malloc(sol_count * sizeof(uint16_t));
+        uint16_t *sparse = (uint16_t *)malloc(sol_count * sizeof(uint16_t));
+        check(sq && sk && sv && dense && sparse, "sol-attn host alloc");
+        if (sq && sk && sv && dense && sparse) {
+            for (size_t i = 0; i < sol_count; i++) {
+                sq[i] = f32_to_bf16(sinf((float)i * 0.017f));
+                sk[i] = f32_to_bf16(cosf((float)i * 0.013f));
+                sv[i] = f32_to_bf16(sinf((float)i * 0.009f) * 0.5f);
+            }
+            h3_gpu_tensor *tq = h3_gpu_tensor_from_bf16(gpu, sq, sol_count);
+            h3_gpu_tensor *tk = h3_gpu_tensor_from_bf16(gpu, sk, sol_count);
+            h3_gpu_tensor *tv = h3_gpu_tensor_from_bf16(gpu, sv, sol_count);
+            h3_gpu_tensor *to = h3_gpu_tensor_new_bf16(gpu, sol_count);
+            check(tq && tk && tv && to, "sol-attn tensor alloc");
+            if (tq && tk && tv && to) {
+                unsetenv("H3_SOL_ATTN");
+                check(h3_gpu_sdpa_bf16(gpu, to, tq, tk, tv, sol_seq, sol_heads,
+                                       sol_dim, sol_scale),
+                      "sol-attn dense");
+                check(h3_gpu_submit(gpu), "submit sol-attn dense");
+                check(h3_gpu_tensor_read_bf16(to, dense, sol_count),
+                      "read sol-attn dense");
+                setenv("H3_SOL_ATTN", "1", 1);
+                setenv("H3_SOL_ATTN_TAU", "-100", 1);
+                check(h3_gpu_sdpa_bf16(gpu, to, tq, tk, tv, sol_seq, sol_heads,
+                                       sol_dim, sol_scale),
+                      "sol-attn keep-all");
+                check(h3_gpu_submit(gpu), "submit sol-attn keep-all");
+                check(h3_gpu_tensor_read_bf16(to, sparse, sol_count),
+                      "read sol-attn keep-all");
+                size_t ndiff = 0;
+                double worst = 0.0;
+                for (size_t i = 0; i < sol_count; i++) {
+                    if (dense[i] != sparse[i]) ndiff++;
+                    double delta = fabs(bf16_to_f32(dense[i]) -
+                                        bf16_to_f32(sparse[i]));
+                    if (delta > worst) worst = delta;
+                }
+                fprintf(stderr,
+                        "sol-attn keep-all bitwise diffs %zu / %zu worst %g\n",
+                        ndiff, sol_count, worst);
+                if (worst >= 6e-2) {
+                    fprintf(stderr,
+                            "FAIL: sol-attn keep-all diverged from dense MMA\n");
+                    failures++;
+                }
+                unsetenv("H3_SOL_ATTN");
+                unsetenv("H3_SOL_ATTN_TAU");
+            }
+            h3_gpu_tensor_free(tq);
+            h3_gpu_tensor_free(tk);
+            h3_gpu_tensor_free(tv);
+            h3_gpu_tensor_free(to);
+        }
+        free(sq);
+        free(sk);
+        free(sv);
+        free(dense);
+        free(sparse);
+    }
+
     /* The CPU reference above is limited to short sequences, so also compare
      * the two GPU kernels against each other at the DiT's own sequence length,
      * where the softmax range is much wider. */
