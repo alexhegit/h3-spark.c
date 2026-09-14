@@ -160,6 +160,7 @@ static void print_help(void) {
     puts("  !layers [N]              Set or show active DiT blocks");
     puts("  !core-reuse [N]          Set or show core reuse");
     puts("  !token-reduction [on|off]  Faster; visible quality loss");
+    puts("  !sol-attn [on|off]         Sparse SDPA; visible quality trade");
     puts("  !ssd-streaming [on|off]   Toggle original-BF16 SSD streaming");
     puts("  !int8-row-fc2 [on|off]    Toggle faster one-scale FC2");
     puts("  !reference-rope [on|off]  Toggle released spatial RoPE");
@@ -189,10 +190,11 @@ static void print_status(const h3_cli_state *state) {
     printf("\nFrames: %d requested, %d generated (%.3g seconds)\n",
            state->params.frames, aligned, (double)aligned / H3_FPS);
     printf("Steps: %d | reuse: %d | layers: %d | core reuse: %d | "
-           "tokens: %s | weights: %s | FC2: %s\n",
+           "tokens: %s | sol-attn: %s | weights: %s | FC2: %s\n",
            state->params.steps, state->params.denoise_reuse,
            state->params.dit_layers, state->params.core_reuse,
            state->params.token_reduction ? "reduced (lossy)" : "full",
+           state->params.sol_attn ? "on" : "off",
            state->params.ssd_streaming ? "SSD BF16" : "resident",
            state->params.ssd_streaming ? "BF16" :
            state->params.use_int8_row_fc2 ? "int8 row" : "int8 grouped");
@@ -595,6 +597,18 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
                     "h3: token reduction trades quality for speed "
                     "(fox-fast ~17.8 dB PSNR / 0.72 SSIM vs off). "
                     "Output is not bit-identical.\n");
+        }
+    } else if (!strcasecmp(command, "sol-attn")) {
+        int value;
+        if (!parse_toggle(argument, state->params.sol_attn, &value))
+            fprintf(stderr, "h3: use on or off\n");
+        else {
+            state->params.sol_attn = value;
+            printf("Sol-Attn: %s\n", value ? "on" : "off");
+            if (value)
+                fprintf(stderr,
+                    "h3: sol-attn is sparse SDPA; not bit-identical. "
+                    "Tune H3_SOL_ATTN_TAU / H3_SOL_ATTN_BAND.\n");
         }
     } else if (!strcasecmp(command, "ssd-streaming")) {
         int value;

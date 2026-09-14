@@ -18,6 +18,7 @@ of the HIP-page clips.
 | `--layers` | DiT blocks: **50** exact, **45** fast, **40** aggressive | 40 is a bigger quality hit than reuse 3; prefer reuse first |
 | `--reuse` | How often a denoise step **reuses** the last DiT residual: **1** close, **2** fast (default for fox-fast/15 s), **3** aggressive | Cuts **eval count**, not N. fox-fast 11→8 evals; 15 s same |
 | `--token-reduction` | Pools adjacent **horizontal video tokens** in middle blocks | Cuts **N** on those blocks. Big on long T2VA, modest on 512² 22f |
+| `--sol-attn` | Sparse SDPA: keep important 64-token KV tiles, approximate the rest | Cuts **attention traffic**. Kernel **3×** at seq 44800; fox-fast **~17.6 dB** (KEEP fail). Long T2VA only |
 | `H3_INT8_VAE=1` | INT8 video-VAE weights | **VRAM**, not wall clock (fox-s2 peak 9.45→2.73 GiB) |
 
 Leave `--core-reuse` alone unless you already know that knob. `H3_BF16_MLP=1`
@@ -53,23 +54,27 @@ HIP-page office prompt, L45, steps 20. Quality path **1076 s**.
 | Intent | Flags | Wall | vs quality-path `60fd70cc309c` |
 |---|---|---:|---|
 | **Final / publish** | `--layers 45 --reuse 2` | **18 min** | bit-stable quality path |
-| **Faster, keep more structure** | `--reuse 3` (keep L45) | **13 min 25 s (−25%)** | **PSNR 18.8 / 0.70** |
+| **Faster, keep more structure** | `--sol-attn` | **11 min 35 s (−35%)** | **PSNR 19.2 / 0.72** |
+| **Faster, reuse only** | `--reuse 3` (keep L45) | **13 min 25 s (−25%)** | **PSNR 18.8 / 0.70** |
 | **Need the minutes back** | `--token-reduction` | **11 min 14 s (−37%)** | **PSNR 17.8 / 0.66** (Y ~16.3) |
 
-Long video is N². Token-reduction shrinks N; reuse 3 only drops 11→8 evals, so
-**TR is the long-T2VA speed knob**, reuse 3 is the **less-ugly** knob.
+Long video is N². `--sol-attn` cuts attention tiles; `--token-reduction`
+shrinks N; reuse 3 only drops 11→8 evals. On this 15 s clip **Sol-Attn
+beats reuse 3 on both wall and PSNR**, and beats TR on PSNR at almost the
+same speed.
 
-~18 dB vs the quality path is a **visible** hit (soft fur, edges, luma). It
-is not a “slight” trade. Use it when wall clock matters more than matching the
-reference clip. Do not use TR when you need the HIP-page md5.
+~18–19 dB vs the quality path is a **visible** hit (soft fur, edges, luma).
+It is not a “slight” trade. Do not use these flags when you need the
+HIP-page md5.
 
 ### Iterate, then polish
 
 1. fox-s2 or a small `--frames` to check prompt and composition.
 2. Short fox-fast **without** TR to judge look.
-3. If the 15 s encode is too slow, generate a **`--reuse 3`** 15 s first.
-4. Only add `--token-reduction` if 13 minutes is still too long.
-5. Final delivery: drop the speed flags (`--reuse 2`, no TR).
+3. If the 15 s encode is too slow, generate with **`--sol-attn`** first.
+4. Only add `--token-reduction` if you still need the last ~20 s and accept
+   the extra quality drop.
+5. Final delivery: drop the speed flags (`--reuse 2`, no TR / sol-attn).
 
 ## How to read the quality numbers
 
@@ -80,7 +85,8 @@ These are **vs this repo’s quality path**, not vs a camera.
 | inf / SSIM 1.0 | Default KEEP (bit-identical or equivalent) |
 | **≥ 24 dB and SSIM ≥ 0.85** | Allowed as a **default** kernel change |
 | ~21 dB / 0.75 | `--reuse 3`: obviously different, usually still “the same shot” |
-| **≤ 18 dB / SSIM ~0.66–0.72** | TR: luma/detail collapse; draft or time-critical only |
+| ~19 dB / 0.72 | `--sol-attn` on 15 s: visible, but the best long-T2VA speed/quality point measured here |
+| **≤ 18 dB / SSIM ~0.66–0.72** | TR: luma/detail collapse; last-resort minutes |
 
 A VAE-tile experiment at **26.8 dB / SSIM 0.80** was still REJECT as default
 because seams were visible. Speed flags that land at 18 dB are **opt-in**,
@@ -118,13 +124,20 @@ MODEL=/path/to/MiniMax-H3
   --steps 20 --layers 45 --reuse 3 --seed 42 \
   -o out-faster.mp4
 
-# 15 s, less-ugly speed
+# 15 s, recommended speed flag (visible vs quality path, best PSNR of the fast set)
+./h3 -d "$MODEL" -p "$PROMPT_15S" \
+  --width 864 --height 480 --seconds 15 \
+  --steps 20 --layers 45 --reuse 2 --seed 42 \
+  --sol-attn \
+  -o out-15s-sol-attn.mp4
+
+# 15 s, reuse only (slower than sol-attn, similar look)
 ./h3 -d "$MODEL" -p "$PROMPT_15S" \
   --width 864 --height 480 --seconds 15 \
   --steps 20 --layers 45 --reuse 3 --seed 42 \
   -o out-15s-reuse3.mp4
 
-# 15 s, maximum wall-clock cut (visible quality loss)
+# 15 s, maximum wall-clock cut (uglier than sol-attn)
 ./h3 -d "$MODEL" -p "$PROMPT_15S" \
   --width 864 --height 480 --seconds 15 \
   --steps 20 --layers 45 --reuse 2 --seed 42 \
@@ -132,8 +145,10 @@ MODEL=/path/to/MiniMax-H3
   -o out-15s-tr.mp4
 ```
 
-Advanced TR tuning (`H3_TOKEN_REDUCTION_BLOCKS`, `H3_TOKEN_REDUCTION_EARLY`)
-exists but milder ranges on fox-fast never reached 19 dB and were **slower
-than `--reuse 3`**. Prefer reuse 3 before inventing a custom TR band.
+Do **not** stack `--sol-attn` with `--token-reduction` unless you are
+measuring that pair. Advanced TR tuning (`H3_TOKEN_REDUCTION_BLOCKS`,
+`H3_TOKEN_REDUCTION_EARLY`) exists but milder ranges on fox-fast never
+reached 19 dB and were **slower than `--reuse 3`**. Sol-Attn knobs:
+[`SOL_ATTN.md`](SOL_ATTN.md).
 
 Dated tables: [`PERF_BASELINE.md`](PERF_BASELINE.md).

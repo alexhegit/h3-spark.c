@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+Opt-in `--sol-attn` (Sol-Attn-style sparse MMA SDPA). Default generate path
+and fox-fast md5 `f5282774d3a4` are unchanged.
+
+### Speed / quality (GB10, 2026-09-14, seed 42)
+
+| Preset | E2E | vs quality path | PSNR / SSIM |
+|---|---:|---:|---|
+| 15 s cinematic | **17 min 56 s** | — | — |
+| 15 s + `--sol-attn` | **11 min 35 s** | **−35%** | **19.2 / 0.72** |
+| 15 s + `--reuse 3` | 13 min 25 s | −25% | 18.8 / 0.70 |
+| 15 s + `--token-reduction` | 11 min 14 s | −37% | 17.8 / 0.66 |
+
+Kernel seq 44800: **~3.0×** vs dense MMA. Usage and code map:
+[`docs/SOL_ATTN.md`](docs/SOL_ATTN.md).
+
 ## v0.2.1 — 2026-09-07
 
 Smaller SDPA default plus an opt-in VAE VRAM path. Fox-fast pixels still

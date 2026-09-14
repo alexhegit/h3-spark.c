@@ -64,7 +64,8 @@ Progress log: [`docs/SPARK_AUTORUN.md`](docs/SPARK_AUTORUN.md) · Known gaps:
 [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) · Porting notes:
 [`docs/SPARK_PORTING.md`](docs/SPARK_PORTING.md) · Perf baseline:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) · Quality vs speed:
-[`docs/BEST_PRACTICE.md`](docs/BEST_PRACTICE.md)
+[`docs/BEST_PRACTICE.md`](docs/BEST_PRACTICE.md) · `--sol-attn`:
+[`docs/SOL_ATTN.md`](docs/SOL_ATTN.md)
 
 ## Requirements
 
@@ -114,6 +115,7 @@ those commands, not a vendor bake-off.
 | **fox-fast** | 512² 22f, steps 20, L45 R2 | **15.6 s** warm | **8.17 s** (1.40 / 5.22) | `f5282774d3a4` |
 | **15 s cinematic** | 864×480, `--seconds 15`, L45 R2 | **17 min 56 s** | **16 min 28 s** (845 / 110) | `60fd70cc309c` |
 | same + `--token-reduction` | opt-in; quality trade | **11 min 14 s** | **9 min 49 s** (482 / 81) | `19c109ebb0cb` |
+| same + `--sol-attn` | opt-in; sparse SDPA | **11 min 35 s** | **10 min 9 s** (464 / 111) | `6ad88ffb989a` |
 
 fox-s2 wall is mostly video VAE (~2.6 s) + Qwen (~2.1 s), not DiT. 15 s wall
 is still long-N SDPA (same md5 as v0.2.0). Optional `H3_INT8_VAE=1` drops
@@ -134,7 +136,8 @@ fox-s2 VAE peak 9.45→2.73 GiB (PSNR 43 dB vs F32). Retest logs:
   --width 864 --height 480 --seconds 15 \
   --steps 20 --layers 45 --reuse 2 --seed 42 \
   -o outputs/long-15s-cinematic.mp4
-# optional: append --token-reduction  (11 min 14 s on this box, v0.2.1; not bit-identical)
+# optional: append --sol-attn       (11 min 35 s, ~19.2 dB vs quality; not bit-identical)
+# optional: append --token-reduction  (11 min 14 s, ~17.8 dB; not bit-identical)
 ```
 
 The 15 s prompt is the HIP-page office/cinematic text. For Ref2VA / FL2VA
@@ -147,9 +150,9 @@ bit-identical.
 
 | You want | Use | Do not |
 |---|---|---|
-| Showcase / publish / HIP-page md5 | `--layers 45 --reuse 2`, no TR | `--token-reduction`, `--layers 40` |
+| Showcase / publish / HIP-page md5 | `--layers 45 --reuse 2`, no TR | `--token-reduction`, `--sol-attn`, `--layers 40` |
 | Short 512² clip, faster | **`--reuse 3`** (~21 dB vs quality) | TR on a 22-frame clip |
-| 15 s, keep more structure | `--reuse 3` (**−25%**, PSNR **18.8**) | expect 24 dB |
+| 15 s, keep more structure | `--sol-attn` (**−35%**, PSNR **19.2**) | expect 24 dB |
 | 15 s, need the minutes | `--token-reduction` (**−37%**, PSNR **17.8**) | treat it as a slight loss |
 
 Full recipes, PSNR meaning, and what not to stack:
@@ -182,12 +185,33 @@ choose this vs `--reuse 3`:
 [`docs/BEST_PRACTICE.md`](docs/BEST_PRACTICE.md). Details:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md).
 
+## `--sol-attn` (sparse SDPA, opt-in)
+
+Training-free block-sparse attention on the MMA kernel. **Off by default.**
+Keep-all (`H3_SOL_ATTN_TAU=-100`) is bit-identical to dense MMA; the default
+`τ=0.5` is not. Full knobs, kernel table, and code map:
+[`docs/SOL_ATTN.md`](docs/SOL_ATTN.md).
+
+```bash
+./h3 --profile -d "$MODEL" -p "$PROMPT_15S" \
+  --width 864 --height 480 --seconds 15 \
+  --steps 20 --layers 45 --reuse 2 --seed 42 \
+  --sol-attn -o out-15s-sol-attn.mp4
+```
+
+On 15 s cinematic vs the quality path: **1076 s → 695 s (−35%)**, PSNR
+**19.2 / SSIM 0.72** — faster than `--reuse 3` (−25%, 18.8 dB) and about
+**1.4 dB** above `--token-reduction` (−37%, 17.8 dB). Fox-fast barely
+moves (SDPA is not the wall there). Do not default; do not use for HIP-page
+md5. Interactive: `!sol-attn on`.
+
 ## Conditional paths
 
 Ordered references (`--ref-image`, `--ref-video`, `--ref-audio`, …) and
 first/last-frame anchors (`--first-frame`, `--last-frame`) follow the same CLI
 as [antirez/h3.c](https://github.com/antirez/h3.c). Exact commands for the
 three showcase samples are under [Showcase](#showcase-dgx-spark).
+
 ## Preview while generating
 
 - **`--frames-dir DIR`** — write each decoded frame as PPM (works everywhere)

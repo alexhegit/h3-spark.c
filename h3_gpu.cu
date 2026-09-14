@@ -88,8 +88,13 @@ struct h3_gpu {
      * many times over. */
     void *conv_weight_scratch;
     size_t conv_weight_scratch_bytes;
+    /* Sol-Attn K-mean / V-sum scratch: 2 * n_kv_blocks * heads * 128 floats. */
+    void *sol_scratch;
+    size_t sol_scratch_bytes;
     uint64_t int8_cublas_ok;
     uint64_t int8_naive_fallback;
+    int sol_attn_layer;
+    int sol_attn_prefix;
     h3_gpu_tensor *ws_mlp_fc1;
     h3_gpu_tensor *ws_mlp_hidden;
     h3_gpu_tensor *ws_qkv;
@@ -453,6 +458,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path, char *error,
     gpu->profile_mark_stats = gpu->stats;
     gpu->profile_start_wall = h3_gpu_now();
     gpu->profile_mark_wall = gpu->profile_start_wall;
+    gpu->sol_attn_layer = 1;
+    gpu->sol_attn_prefix = -1;
     return gpu;
 }
 
@@ -510,6 +517,9 @@ void h3_gpu_free(h3_gpu *gpu) {
     if (gpu->conv_weight_scratch) cudaFree(gpu->conv_weight_scratch);
     gpu->conv_weight_scratch = NULL;
     gpu->conv_weight_scratch_bytes = 0;
+    if (gpu->sol_scratch) cudaFree(gpu->sol_scratch);
+    gpu->sol_scratch = NULL;
+    gpu->sol_scratch_bytes = 0;
     if (gpu->int8_accum) cudaFree(gpu->int8_accum);
     for (int i = 0; i < H3_STAGE_SLOTS; i++) {
         if (gpu->stage_event_recorded[i] && gpu->stage_copied[i])
@@ -3626,12 +3636,446 @@ __global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_kernel(
     }
 }
 
+#define H3_SOL_MAX_KV_BLOCKS 1024u
+
+__global__ static void h3_sdpa_kv_block_summary_kernel(
+    const uint16_t *__restrict__ key, const uint16_t *__restrict__ value,
+    float *__restrict__ k_mean, float *__restrict__ v_sum, uint32_t sequence,
+    uint32_t heads, uint32_t n_blocks) {
+    const uint32_t block = (uint32_t)blockIdx.x;
+    const uint32_t head = (uint32_t)blockIdx.y;
+    const uint32_t dim = (uint32_t)threadIdx.x;
+    if (block >= n_blocks || head >= heads || dim >= 128u) return;
+    const uint32_t n0 = block * H3_MMA_N;
+    const uint32_t n1 = n0 + H3_MMA_N < sequence ? n0 + H3_MMA_N : sequence;
+    float sum_k = 0.0f;
+    float sum_v = 0.0f;
+    for (uint32_t token = n0; token < n1; token++) {
+        size_t index = ((size_t)token * heads + head) * 128u + dim;
+        sum_k += h3_bf16_bits_to_f32(key[index]);
+        sum_v += h3_bf16_bits_to_f32(value[index]);
+    }
+    float count = (float)(n1 - n0);
+    size_t out = ((size_t)head * n_blocks + block) * 128u + dim;
+    k_mean[out] = count > 0.0f ? sum_k / count : 0.0f;
+    v_sum[out] = sum_v;
+}
+
+__device__ __forceinline__ static float h3_sol_qfrag_dot(
+    const uint32_t q_frag[8][4], int row_b, const float *k_mean) {
+    const uint32_t lane = (uint32_t)threadIdx.x & 31u;
+    const uint32_t tig = lane & 3u;
+    float acc = 0.0f;
+#pragma unroll
+    for (uint32_t kk = 0; kk < 8u; kk++) {
+        uint32_t k0 = kk * 16u + tig * 2u;
+        uint32_t packed0 = q_frag[kk][row_b ? 1u : 0u];
+        uint32_t packed8 = q_frag[kk][row_b ? 3u : 2u];
+        acc += h3_bf16_bits_to_f32((uint16_t)packed0) * k_mean[k0];
+        acc += h3_bf16_bits_to_f32((uint16_t)(packed0 >> 16u)) *
+               k_mean[k0 + 1u];
+        acc += h3_bf16_bits_to_f32((uint16_t)packed8) * k_mean[k0 + 8u];
+        acc += h3_bf16_bits_to_f32((uint16_t)(packed8 >> 16u)) *
+               k_mean[k0 + 9u];
+    }
+    acc += __shfl_xor_sync(0xffffffffu, acc, 1);
+    acc += __shfl_xor_sync(0xffffffffu, acc, 2);
+    return acc;
+}
+
+/* Training-free Sol-Attn on the default MMA path: keep KV tiles whose
+ * query-block proxy score is at or above mean + τ·std, always keep a local
+ * band, and fold skipped tiles into online softmax via pooled K/V. */
+__global__ __launch_bounds__(128) static void h3_sdpa_bf16_mma_d128_sol_kernel(
+    const uint16_t *__restrict__ query, const uint16_t *__restrict__ key,
+    const uint16_t *__restrict__ value, uint16_t *__restrict__ output,
+    const float *__restrict__ k_mean, const float *__restrict__ v_sum,
+    h3_sdpa_args args, uint32_t n_blocks, float tau, int band, int prefix,
+    int drop_unselected) {
+    __shared__ uint16_t k_tile[H3_MMA_N * H3_MMA_LD];
+    __shared__ uint16_t v_tile[128u * H3_MMA_VLD];
+    __shared__ float q_bar[128];
+    __shared__ float proxy[H3_SOL_MAX_KV_BLOCKS];
+    __shared__ float pooled_k[128];
+    __shared__ float pooled_v[128];
+    uint16_t *q_tile = v_tile;
+
+    const uint32_t sequence = args.sequence;
+    const uint32_t heads = args.heads;
+    const uint32_t head = (uint32_t)blockIdx.y;
+    const uint32_t m0 = (uint32_t)blockIdx.x * H3_MMA_M;
+    const uint32_t tid = (uint32_t)threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t group = lane >> 2u;
+    const uint32_t tig = lane & 3u;
+    const uint32_t row_a = warp * 16u + group;
+    const uint32_t row_b = row_a + 8u;
+    const uint32_t q_block = m0 / H3_MMA_M;
+
+    for (uint32_t i = tid; i < H3_MMA_M * 64u; i += 128u) {
+        uint32_t row = i >> 6u;
+        uint32_t column = (i & 63u) * 2u;
+        uint32_t packed = 0;
+        uint32_t source = m0 + row;
+        if (source < sequence)
+            packed = *(const uint32_t *)(query +
+                                         ((size_t)source * heads + head) *
+                                             128u + column);
+        *(uint32_t *)&q_tile[row * H3_MMA_LD + column] = packed;
+    }
+    __syncthreads();
+
+    uint32_t q_frag[8][4];
+#pragma unroll
+    for (uint32_t kk = 0; kk < 8u; kk++) {
+        uint32_t k0 = kk * 16u + tig * 2u;
+        q_frag[kk][0] = *(const uint32_t *)&q_tile[row_a * H3_MMA_LD + k0];
+        q_frag[kk][1] = *(const uint32_t *)&q_tile[row_b * H3_MMA_LD + k0];
+        q_frag[kk][2] = *(const uint32_t *)&q_tile[row_a * H3_MMA_LD + k0 + 8u];
+        q_frag[kk][3] = *(const uint32_t *)&q_tile[row_b * H3_MMA_LD + k0 + 8u];
+    }
+
+    if (tid < 128u) {
+        float sum = 0.0f;
+        uint32_t live = 0;
+        for (uint32_t row = 0; row < H3_MMA_M; row++) {
+            if (m0 + row < sequence) {
+                sum += h3_bf16_bits_to_f32(q_tile[row * H3_MMA_LD + tid]);
+                live++;
+            }
+        }
+        q_bar[tid] = live ? sum / (float)live : 0.0f;
+    }
+    __syncthreads();
+
+    for (uint32_t block = tid; block < n_blocks; block += 128u) {
+        const float *centroid =
+            k_mean + ((size_t)head * n_blocks + block) * 128u;
+        float score = 0.0f;
+#pragma unroll
+        for (uint32_t dim = 0; dim < 128u; dim++)
+            score = fmaf(q_bar[dim], centroid[dim], score);
+        proxy[block] = score * args.scale;
+    }
+    __syncthreads();
+
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+    if (tid == 0) {
+        for (uint32_t block = 0; block < n_blocks; block++) {
+            float score = proxy[block];
+            sum += score;
+            sumsq += score * score;
+        }
+        float mean = sum / (float)n_blocks;
+        float var = fmaxf(sumsq / (float)n_blocks - mean * mean, 0.0f);
+        float threshold = mean + tau * sqrtf(var);
+        for (uint32_t block = 0; block < n_blocks; block++) {
+            int local = (int)block >= (int)q_block - band &&
+                        (int)block <= (int)q_block + band;
+            int exact_prefix = (int)block < prefix || (int)q_block < prefix;
+            proxy[block] =
+                (local || exact_prefix || proxy[block] >= threshold) ? 1.0f
+                                                                     : 0.0f;
+        }
+    }
+    __syncthreads();
+
+    float out_acc[16][4];
+#pragma unroll
+    for (uint32_t dt = 0; dt < 16u; dt++)
+#pragma unroll
+        for (uint32_t e = 0; e < 4u; e++) out_acc[dt][e] = 0.0f;
+    float max_a = -INFINITY;
+    float max_b = -INFINITY;
+    float sum_a = 0.0f;
+    float sum_b = 0.0f;
+
+    for (uint32_t n0 = 0; n0 < sequence; n0 += H3_MMA_N) {
+        uint32_t kv_block = n0 / H3_MMA_N;
+        int keep = kv_block < n_blocks && proxy[kv_block] > 0.5f;
+        if (!keep) {
+            if (drop_unselected) continue;
+            const float *centroid =
+                k_mean + ((size_t)head * n_blocks + kv_block) * 128u;
+            const float *values =
+                v_sum + ((size_t)head * n_blocks + kv_block) * 128u;
+            if (tid < 128u) {
+                pooled_k[tid] = centroid[tid];
+                pooled_v[tid] = values[tid];
+            }
+            __syncthreads();
+            float score_a = h3_sol_qfrag_dot(q_frag, 0, pooled_k) * args.scale;
+            float score_b = h3_sol_qfrag_dot(q_frag, 1, pooled_k) * args.scale;
+            uint32_t live = sequence - n0;
+            if (live > H3_MMA_N) live = H3_MMA_N;
+            float new_max_a = fmaxf(max_a, score_a);
+            float new_max_b = fmaxf(max_b, score_b);
+            float alpha_a =
+                isfinite(new_max_a) ? __expf(max_a - new_max_a) : 1.0f;
+            float alpha_b =
+                isfinite(new_max_b) ? __expf(max_b - new_max_b) : 1.0f;
+            float p_a = __expf(score_a - new_max_a);
+            float p_b = __expf(score_b - new_max_b);
+            sum_a = sum_a * alpha_a + p_a * (float)live;
+            sum_b = sum_b * alpha_b + p_b * (float)live;
+            max_a = new_max_a;
+            max_b = new_max_b;
+            if (__any_sync(0xffffffffu, alpha_a != 1.0f || alpha_b != 1.0f)) {
+#pragma unroll
+                for (uint32_t dt = 0; dt < 16u; dt++) {
+                    out_acc[dt][0] *= alpha_a;
+                    out_acc[dt][1] *= alpha_a;
+                    out_acc[dt][2] *= alpha_b;
+                    out_acc[dt][3] *= alpha_b;
+                }
+            }
+#pragma unroll
+            for (uint32_t dt = 0; dt < 16u; dt++) {
+                uint32_t column = dt * 8u + tig * 2u;
+                out_acc[dt][0] += p_a * pooled_v[column];
+                out_acc[dt][1] += p_a * pooled_v[column + 1u];
+                out_acc[dt][2] += p_b * pooled_v[column];
+                out_acc[dt][3] += p_b * pooled_v[column + 1u];
+            }
+            __syncthreads();
+            continue;
+        }
+
+        __syncthreads();
+        for (uint32_t i = tid; i < H3_MMA_N * 64u; i += 128u) {
+            uint32_t row = i >> 6u;
+            uint32_t column = (i & 63u) * 2u;
+            uint32_t packed_k = 0;
+            uint32_t packed_v = 0;
+            uint32_t source = n0 + row;
+            if (source < sequence) {
+                size_t base = ((size_t)source * heads + head) * 128u + column;
+                packed_k = *(const uint32_t *)(key + base);
+                uint32_t raw_v = *(const uint32_t *)(value + base);
+                packed_v = h3_bf16_pair_to_f16(raw_v);
+            }
+            *(uint32_t *)&k_tile[row * H3_MMA_LD + column] = packed_k;
+            v_tile[column * H3_MMA_VLD + row] =
+                (uint16_t)(packed_v & 0xffffu);
+            v_tile[(column + 1u) * H3_MMA_VLD + row] =
+                (uint16_t)(packed_v >> 16u);
+        }
+        __syncthreads();
+
+        float score[8][4];
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++)
+#pragma unroll
+            for (uint32_t e = 0; e < 4u; e++) score[j][e] = 0.0f;
+#pragma unroll
+        for (uint32_t kk = 0; kk < 8u; kk++) {
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) {
+                uint32_t b_frag[2];
+                uint32_t r = j * 8u + (lane & 7u);
+                uint32_t c = kk * 16u + ((lane >> 3u) & 1u) * 8u;
+                h3_ldmatrix_b16_x2(b_frag[0], b_frag[1],
+                                   &k_tile[r * H3_MMA_LD + c]);
+                h3_mma_m16n8k16_bf16(score[j], q_frag[kk], b_frag);
+            }
+        }
+
+        uint32_t live = sequence - n0;
+        float tile_max_a = -INFINITY;
+        float tile_max_b = -INFINITY;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            uint32_t column = j * 8u + tig * 2u;
+#pragma unroll
+            for (uint32_t e = 0; e < 2u; e++) {
+                if (column + e < live) {
+                    score[j][e] *= args.scale;
+                    score[j][e + 2u] *= args.scale;
+                    tile_max_a = fmaxf(tile_max_a, score[j][e]);
+                    tile_max_b = fmaxf(tile_max_b, score[j][e + 2u]);
+                } else {
+                    score[j][e] = -INFINITY;
+                    score[j][e + 2u] = -INFINITY;
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t mask = 1u; mask < 4u; mask <<= 1u) {
+            tile_max_a =
+                fmaxf(tile_max_a, __shfl_xor_sync(0xffffffffu, tile_max_a,
+                                                  (int)mask));
+            tile_max_b =
+                fmaxf(tile_max_b, __shfl_xor_sync(0xffffffffu, tile_max_b,
+                                                  (int)mask));
+        }
+        float new_max_a = fmaxf(max_a, tile_max_a);
+        float new_max_b = fmaxf(max_b, tile_max_b);
+        float alpha_a = isfinite(new_max_a) ? __expf(max_a - new_max_a) : 1.0f;
+        float alpha_b = isfinite(new_max_b) ? __expf(max_b - new_max_b) : 1.0f;
+        float tile_sum_a = 0.0f;
+        float tile_sum_b = 0.0f;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+#pragma unroll
+            for (uint32_t e = 0; e < 2u; e++) {
+                float p_a = __expf(score[j][e] - new_max_a);
+                float p_b = __expf(score[j][e + 2u] - new_max_b);
+                score[j][e] = p_a;
+                score[j][e + 2u] = p_b;
+                tile_sum_a += p_a;
+                tile_sum_b += p_b;
+            }
+        }
+#pragma unroll
+        for (uint32_t mask = 1u; mask < 4u; mask <<= 1u) {
+            tile_sum_a += __shfl_xor_sync(0xffffffffu, tile_sum_a, (int)mask);
+            tile_sum_b += __shfl_xor_sync(0xffffffffu, tile_sum_b, (int)mask);
+        }
+        sum_a = sum_a * alpha_a + tile_sum_a;
+        sum_b = sum_b * alpha_b + tile_sum_b;
+        max_a = new_max_a;
+        max_b = new_max_b;
+        if (__any_sync(0xffffffffu, alpha_a != 1.0f || alpha_b != 1.0f)) {
+#pragma unroll
+            for (uint32_t dt = 0; dt < 16u; dt++) {
+                out_acc[dt][0] *= alpha_a;
+                out_acc[dt][1] *= alpha_a;
+                out_acc[dt][2] *= alpha_b;
+                out_acc[dt][3] *= alpha_b;
+            }
+        }
+#pragma unroll
+        for (uint32_t kk = 0; kk < 4u; kk++) {
+            uint32_t p_frag[4] = {
+                h3_pack_f16_pair(score[kk * 2u][0], score[kk * 2u][1]),
+                h3_pack_f16_pair(score[kk * 2u][2], score[kk * 2u][3]),
+                h3_pack_f16_pair(score[kk * 2u + 1u][0],
+                                 score[kk * 2u + 1u][1]),
+                h3_pack_f16_pair(score[kk * 2u + 1u][2],
+                                 score[kk * 2u + 1u][3])};
+#pragma unroll
+            for (uint32_t dt = 0; dt < 16u; dt++) {
+                uint32_t b_frag[2];
+                uint32_t r = dt * 8u + (lane & 7u);
+                uint32_t c = kk * 16u + ((lane >> 3u) & 1u) * 8u;
+                h3_ldmatrix_b16_x2(b_frag[0], b_frag[1],
+                                   &v_tile[r * H3_MMA_VLD + c]);
+                h3_mma_m16n8k16_f16(out_acc[dt], p_frag, b_frag);
+            }
+        }
+    }
+
+    float inverse_a = sum_a > 0.0f ? 1.0f / sum_a : 0.0f;
+    float inverse_b = sum_b > 0.0f ? 1.0f / sum_b : 0.0f;
+    uint32_t global_a = m0 + row_a;
+    uint32_t global_b = m0 + row_b;
+#pragma unroll
+    for (uint32_t dt = 0; dt < 16u; dt++) {
+        uint32_t column = dt * 8u + tig * 2u;
+        if (global_a < sequence)
+            *(uint32_t *)&output[h3_sdpa_output_index(args, global_a, head,
+                                                      column)] =
+                h3_pack_bf16_pair(out_acc[dt][0] * inverse_a,
+                                  out_acc[dt][1] * inverse_a);
+        if (global_b < sequence)
+            *(uint32_t *)&output[h3_sdpa_output_index(args, global_b, head,
+                                                      column)] =
+                h3_pack_bf16_pair(out_acc[dt][2] * inverse_b,
+                                  out_acc[dt][3] * inverse_b);
+    }
+}
+
+static int h3_gpu_sol_scratch(h3_gpu *gpu, uint32_t n_blocks, uint32_t heads) {
+    size_t need = (size_t)2u * n_blocks * heads * 128u * sizeof(float);
+    if (gpu->sol_scratch_bytes >= need) return 1;
+    if (gpu->sol_scratch) cudaFree(gpu->sol_scratch);
+    gpu->sol_scratch = NULL;
+    gpu->sol_scratch_bytes = 0;
+    if (cudaMalloc(&gpu->sol_scratch, need) != cudaSuccess)
+        return h3_gpu_fail(gpu, "cannot allocate Sol-Attn scratch");
+    gpu->sol_scratch_bytes = need;
+    return 1;
+}
+
+static float h3_sol_attn_tau(void) {
+    const char *text = getenv("H3_SOL_ATTN_TAU");
+    if (!text || !*text) return 0.5f;
+    char *tail = NULL;
+    float tau = strtof(text, &tail);
+    if (tail == text || !isfinite(tau)) return 0.5f;
+    return tau;
+}
+
+static int h3_sol_attn_band(void) {
+    const char *text = getenv("H3_SOL_ATTN_BAND");
+    if (!text || !*text) return 1;
+    long band = strtol(text, NULL, 10);
+    if (band < 0 || band > 16) return 1;
+    return (int)band;
+}
+
+static int h3_sol_attn_prefix(void) {
+    const char *text = getenv("H3_SOL_ATTN_PREFIX");
+    if (!text || !*text) return 8;
+    long prefix = strtol(text, NULL, 10);
+    if (prefix < 0 || prefix > 64) return 8;
+    return (int)prefix;
+}
+
+static int h3_sol_attn_prefix_value(h3_gpu *gpu) {
+    if (gpu && gpu->sol_attn_prefix >= 0) return gpu->sol_attn_prefix;
+    return h3_sol_attn_prefix();
+}
+
+void h3_gpu_sol_attn_configure(h3_gpu *gpu, int layer_on, int prefix_blocks) {
+    if (!gpu) return;
+    gpu->sol_attn_layer = layer_on ? 1 : 0;
+    if (prefix_blocks >= 0) gpu->sol_attn_prefix = prefix_blocks;
+}
+
+static int h3_gpu_sdpa_bf16_mma_sol(h3_gpu *gpu, h3_gpu_tensor *output,
+                                    const h3_gpu_tensor *query,
+                                    const h3_gpu_tensor *key,
+                                    const h3_gpu_tensor *value,
+                                    uint32_t sequence, uint32_t heads,
+                                    float scale, int head_major_output) {
+    uint32_t n_blocks = (sequence + H3_MMA_N - 1u) / H3_MMA_N;
+    if (n_blocks > H3_SOL_MAX_KV_BLOCKS)
+        return h3_gpu_fail(gpu, "Sol-Attn sequence exceeds 65536 tokens");
+    if (!h3_gpu_sol_scratch(gpu, n_blocks, heads)) return 0;
+    float *k_mean = (float *)gpu->sol_scratch;
+    float *v_sum = k_mean + (size_t)n_blocks * heads * 128u;
+    dim3 summary_blocks(n_blocks, heads, 1);
+    h3_sdpa_kv_block_summary_kernel<<<summary_blocks, 128, 0, gpu->stream>>>(
+        (const uint16_t *)key->device, (const uint16_t *)value->device, k_mean,
+        v_sum, sequence, heads, n_blocks);
+    if (!h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_kv_block_summary"))
+        return 0;
+    h3_sdpa_args args = {sequence, heads, 128u, scale,
+                         head_major_output ? 1u : 0u, 0u};
+    dim3 blocks((sequence + H3_MMA_M - 1u) / H3_MMA_M, heads, 1);
+    h3_sdpa_bf16_mma_d128_sol_kernel<<<blocks, 128, 0, gpu->stream>>>(
+        (const uint16_t *)query->device, (const uint16_t *)key->device,
+        (const uint16_t *)value->device, (uint16_t *)output->device, k_mean,
+        v_sum, args, n_blocks, h3_sol_attn_tau(), h3_sol_attn_band(),
+        h3_sol_attn_prefix_value(gpu),
+        h3_env_on("H3_SOL_ATTN_DROP") ? 1 : 0);
+    gpu->stats.mps_sdpa_dispatches++;
+    return h3_cuda_check(gpu, cudaGetLastError(), "h3_sdpa_bf16_mma_sol");
+}
+
 static int h3_gpu_sdpa_bf16_mma(h3_gpu *gpu, h3_gpu_tensor *output,
                                 const h3_gpu_tensor *query,
                                 const h3_gpu_tensor *key,
                                 const h3_gpu_tensor *value, uint32_t sequence,
                                 uint32_t heads, float scale,
                                 int head_major_output) {
+    if (h3_env_on("H3_SOL_ATTN") && gpu->sol_attn_layer && sequence >= 512u)
+        return h3_gpu_sdpa_bf16_mma_sol(gpu, output, query, key, value,
+                                        sequence, heads, scale,
+                                        head_major_output);
     h3_sdpa_args args = {sequence, heads, 128u, scale,
                          head_major_output ? 1u : 0u, 0u};
     dim3 blocks((sequence + H3_MMA_M - 1u) / H3_MMA_M, heads, 1);
