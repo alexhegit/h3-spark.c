@@ -623,6 +623,10 @@ int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
 int h3_gpu_sub_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);
+/* Relative L2 ||current - previous|| / ||previous||. Synchronizes stream. */
+int h3_gpu_rel_l2_bf16(h3_gpu *gpu, const h3_gpu_tensor *current,
+                       const h3_gpu_tensor *previous, uint32_t elements,
+                       float *relative);
 int h3_gpu_token_pool_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *input,
                            size_t input_offset,

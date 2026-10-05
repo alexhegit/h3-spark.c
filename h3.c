@@ -239,15 +239,19 @@ failed:
 static char *h3_prepared_key(const char *conditioning,
                              const h3_params *params,
                              int render_width, int render_height) {
+    const char *fbc_env = getenv("H3_FBC");
+    int fbc_key = params->fbc ||
+        (fbc_env && *fbc_env && strcmp(fbc_env, "0") != 0);
     h3_key key = {0};
     if (!h3_key_append(
             &key,
             "%s|shape=%dx%dx%d|steps=%d|layers=%d|reuse-core=%d|reduce=%d"
-            "|sol-attn=%d|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
+            "|sol-attn=%d|fbc=%d|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
             "|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
             params->steps, params->dit_layers, params->core_reuse,
-            params->token_reduction, params->sol_attn, params->use_int8_row_fc2,
+            params->token_reduction, params->sol_attn, fbc_key,
+            params->use_int8_row_fc2,
             params->use_reference_rope,
             params->ssd_streaming,
             params->use_slower_bf16_mlp,
@@ -615,6 +619,10 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "sol-attn must be zero or one");
         return 0;
     }
+    if (params->fbc != 0 && params->fbc != 1) {
+        h3_set_error(ctx, "first-block cache must be zero or one");
+        return 0;
+    }
     if (params->use_int8_row_fc2 != 0 &&
         params->use_int8_row_fc2 != 1) {
         h3_set_error(ctx, "int8 row FC2 must be zero or one");
@@ -947,6 +955,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             "vs off is ~17.6 dB PSNR / 0.71 SSIM — same class as "
             "--token-reduction, not KEEP. Tune H3_SOL_ATTN_TAU (default 0.5).\n");
     }
+    if (params->fbc) setenv("H3_FBC", "1", 1);
     int render_width = params->render_width ? params->render_width :
                                                params->width;
     int render_height = params->render_height ? params->render_height :

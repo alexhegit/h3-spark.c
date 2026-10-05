@@ -107,6 +107,15 @@ struct h3_dit {
     unsigned core_reuse_interval;
     unsigned core_forward_count;
     int core_residual_ready;
+    int fbc_enabled;
+    int fbc_ready;
+    int fbc_fulls;
+    int fbc_skips;
+    int fbc_streak;
+    unsigned fbc_warmup;
+    unsigned fbc_tail;
+    unsigned fbc_max_streak;
+    float fbc_rel;
     unsigned active_block_count;
     uint8_t block_active[H3_DIT_BLOCKS];
     h3_layout layout;
@@ -165,6 +174,11 @@ struct h3_dit {
     h3_gpu_tensor *hidden;
     h3_gpu_tensor *core_input;
     h3_gpu_tensor *core_residual;
+    h3_gpu_tensor *fbc_input;
+    h3_gpu_tensor *fbc_probe;
+    h3_gpu_tensor *fbc_residual;
+    h3_gpu_tensor *fbc_prev;
+    h3_gpu_tensor *fbc_tail_residual;
     h3_gpu_tensor *mod_attention;
     h3_gpu_tensor *qkv;
     h3_gpu_tensor *query;
@@ -1598,6 +1612,29 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
            dit->final_video_b && dit->final_audio_w && dit->final_audio_b;
 }
 
+static int fbc_requested(void) {
+    const char *value = getenv("H3_FBC");
+    return value && *value && strcmp(value, "0") != 0;
+}
+
+static unsigned fbc_env_unsigned(const char *name, unsigned fallback) {
+    const char *value = getenv(name);
+    if (!value || !*value) return fallback;
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value || *end || parsed > 100000ul) return fallback;
+    return (unsigned)parsed;
+}
+
+static float fbc_env_rel(void) {
+    const char *value = getenv("H3_FBC_REL");
+    if (!value || !*value) return 0.10f;
+    char *end = NULL;
+    float parsed = strtof(value, &end);
+    if (end == value || *end || parsed < 0.0f) return 0.10f;
+    return parsed;
+}
+
 static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     size_t sequence = dit->sequence;
     size_t audio = dit->audio_rows;
@@ -1786,6 +1823,47 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
                  "cannot allocate DiT core residual cache: %s",
                  h3_gpu_error(dit->gpu));
             return 0;
+        }
+    }
+    if (fbc_requested()) {
+        if (dit->core_reuse_interval > 1 || dit->token_reduction ||
+            dit->ssd_streaming) {
+            fprintf(stderr,
+                    "h3: first-block cache stays off with %s\n",
+                    dit->core_reuse_interval > 1 ? "core reuse" :
+                    dit->token_reduction ? "token reduction" :
+                    "SSD streaming");
+        } else {
+            dit->fbc_input = h3_gpu_tensor_new_bf16(
+                dit->gpu, sequence * HIDDEN);
+            dit->fbc_probe = h3_gpu_tensor_new_bf16(
+                dit->gpu, sequence * HIDDEN);
+            dit->fbc_residual = h3_gpu_tensor_new_bf16(
+                dit->gpu, sequence * HIDDEN);
+            dit->fbc_prev = h3_gpu_tensor_new_bf16(
+                dit->gpu, sequence * HIDDEN);
+            dit->fbc_tail_residual = h3_gpu_tensor_new_bf16(
+                dit->gpu, sequence * HIDDEN);
+            if (!dit->fbc_input || !dit->fbc_probe || !dit->fbc_residual ||
+                !dit->fbc_prev || !dit->fbc_tail_residual) {
+                fail(error, error_size,
+                     "cannot allocate first-block cache: %s",
+                     h3_gpu_error(dit->gpu));
+                return 0;
+            }
+            dit->fbc_enabled = 1;
+            dit->fbc_rel = fbc_env_rel();
+            dit->fbc_warmup = fbc_env_unsigned("H3_FBC_WARMUP", 4);
+            dit->fbc_tail = fbc_env_unsigned("H3_FBC_TAIL", 4);
+            dit->fbc_max_streak = fbc_env_unsigned("H3_FBC_MAX_STREAK", 4);
+            fprintf(stderr,
+                    "h3: first-block cache is on: after block 0, skip the "
+                    "remaining blocks when the block-0 residual relative L2 "
+                    "stays under %.4g (warmup %u, tail %u, max streak %u). "
+                    "Not bit-identical. Tune H3_FBC_REL, H3_FBC_WARMUP, "
+                    "H3_FBC_TAIL, H3_FBC_MAX_STREAK.\n",
+                    dit->fbc_rel, dit->fbc_warmup, dit->fbc_tail,
+                    dit->fbc_max_streak);
         }
     }
     return 1;
@@ -2337,6 +2415,73 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     return 1;
 }
 
+static int fbc_after_probe(h3_dit *dit, int step, uint32_t elements,
+                           int *skip, char *error, size_t error_size) {
+    *skip = 0;
+    if (!gpu_op(dit, h3_gpu_copy_bf16(
+            dit->gpu, dit->fbc_probe, 0, dit->hidden, 0, elements),
+            error, error_size, "save first-block output"))
+        return 0;
+    if (!gpu_op(dit, h3_gpu_sub_bf16(
+            dit->gpu, dit->fbc_residual, dit->fbc_probe, dit->fbc_input,
+            elements), error, error_size, "first-block residual"))
+        return 0;
+    int steps = h3_dit_schedule_steps(dit->schedule);
+    int forced = !dit->fbc_ready || (unsigned)step < dit->fbc_warmup ||
+        (unsigned)(steps - step) <= dit->fbc_tail ||
+        dit->fbc_streak >= (int)dit->fbc_max_streak;
+    float rel = 0.0f;
+    if (dit->fbc_ready) {
+        if (!gpu_op(dit, h3_gpu_rel_l2_bf16(
+                dit->gpu, dit->fbc_residual, dit->fbc_prev, elements, &rel),
+                error, error_size, "first-block residual distance"))
+            return 0;
+    }
+    int take_skip = dit->fbc_ready && !forced && rel < dit->fbc_rel;
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: fbc step %d rel %.5f %s\n", step, rel,
+                take_skip ? "skip" : "full");
+    if (!take_skip) return 1;
+    if (!gpu_op(dit, h3_gpu_add_bf16(
+            dit->gpu, dit->hidden, dit->fbc_probe, dit->fbc_tail_residual,
+            elements), error, error_size, "reuse cached DiT tail"))
+        return 0;
+    if (!gpu_op(dit, h3_gpu_copy_bf16(
+            dit->gpu, dit->fbc_prev, 0, dit->fbc_residual, 0, elements),
+            error, error_size, "update first-block residual"))
+        return 0;
+    dit->fbc_skips++;
+    dit->fbc_streak++;
+    *skip = 1;
+    return 1;
+}
+
+static int fbc_store_tail(h3_dit *dit, uint32_t elements, char *error,
+                          size_t error_size) {
+    if (!gpu_op(dit, h3_gpu_sub_bf16(
+            dit->gpu, dit->fbc_tail_residual, dit->hidden, dit->fbc_probe,
+            elements), error, error_size, "cache DiT tail residual"))
+        return 0;
+    if (!gpu_op(dit, h3_gpu_copy_bf16(
+            dit->gpu, dit->fbc_prev, 0, dit->fbc_residual, 0, elements),
+            error, error_size, "anchor first-block residual"))
+        return 0;
+    dit->fbc_ready = 1;
+    dit->fbc_streak = 0;
+    dit->fbc_fulls++;
+    return 1;
+}
+
+static void fbc_report(const h3_dit *dit) {
+    if (!dit || !dit->fbc_enabled || (!dit->fbc_fulls && !dit->fbc_skips))
+        return;
+    fprintf(stderr,
+            "h3: first-block cache full %d, skipped %d "
+            "(relative L2 < %.4g, warmup %u, tail %u, max streak %u)\n",
+            dit->fbc_fulls, dit->fbc_skips, dit->fbc_rel, dit->fbc_warmup,
+            dit->fbc_tail, dit->fbc_max_streak);
+}
+
 static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                           int disable_command_split, char *error,
                           size_t error_size) {
@@ -2469,6 +2614,9 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         unsigned completed_blocks = 0;
         int carried_attention_adaln = 0;
         int carried_attention_input_quantized = 0;
+        unsigned fbc_probe = dit->fbc_enabled ? first_active_block(dit)
+                                              : H3_DIT_BLOCKS;
+        int fbc_skipped = 0;
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
             int fused_token_adaln = carried_attention_adaln;
             int fused_attention_input_quantized =
@@ -2546,6 +2694,14 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 }
                 stream_started = 1;
             }
+            if (block == fbc_probe &&
+                !gpu_op(dit, h3_gpu_copy_bf16(
+                    dit->gpu, dit->fbc_input, 0, dit->hidden, 0,
+                    hidden_elements), error, error_size,
+                    "save first-block input")) {
+                if (stream_started) (void)pthread_join(stream_thread, NULL);
+                return 0;
+            }
             int block_ok = run_block(
                 dit, block, step, weight, fused_token_adaln,
                 fused_attention_input_quantized,
@@ -2589,7 +2745,20 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 OP(h3_gpu_begin(dit->gpu),
                    "continue after streamed DiT block");
             }
+            if (block == fbc_probe) {
+                int skip = 0;
+                if (!fbc_after_probe(dit, step, hidden_elements, &skip,
+                                     error, error_size))
+                    return 0;
+                if (skip) {
+                    fbc_skipped = 1;
+                    break;
+                }
+            }
         }
+        if (dit->fbc_enabled && !fbc_skipped && fbc_probe < H3_DIT_BLOCKS &&
+            !fbc_store_tail(dit, hidden_elements, error, error_size))
+            return 0;
         if (use_token_reduction &&
             token_reduction_end == H3_DIT_BLOCKS &&
             !leave_token_reduction(dit, error, error_size)) return 0;
@@ -2726,6 +2895,10 @@ int h3_dit_reset_run(h3_dit *dit,
     }
     dit->core_forward_count = 0;
     dit->core_residual_ready = 0;
+    dit->fbc_ready = 0;
+    dit->fbc_fulls = 0;
+    dit->fbc_skips = 0;
+    dit->fbc_streak = 0;
     return 1;
 }
 
@@ -3071,6 +3244,7 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
     if (ok) report(progress, progress_opaque, "denoise", dit->sigmas.steps,
                    dit->sigmas.steps);
     h3_gpu_profile_mark(dit->gpu, "GPU Euler denoise");
+    fbc_report(dit);
     return ok;
 }
 
@@ -3145,6 +3319,7 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
     free(audio_denoised); free(old_video); free(old_audio);
     free(video_next); free(audio_next);
     h3_gpu_profile_mark(dit->gpu, "RES denoise");
+    fbc_report(dit);
     return ok;
 }
 
@@ -3270,6 +3445,7 @@ int h3_dit_denoise_euler_preview(
     free(last_audio);
     free(previous_audio);
     h3_gpu_profile_mark(dit->gpu, "Euler denoise");
+    fbc_report(dit);
     return ok;
 }
 
@@ -3321,6 +3497,8 @@ void h3_dit_free(h3_dit *dit) {
     FREE(video_projected); FREE(audio_projected);
     FREE(video_projection_map); FREE(audio_projection_map); FREE(hidden);
     FREE(core_input); FREE(core_residual);
+    FREE(fbc_input); FREE(fbc_probe); FREE(fbc_residual); FREE(fbc_prev);
+    FREE(fbc_tail_residual);
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
     FREE(attention_heads); FREE(attention_output);
     FREE(token_pool_pairs); FREE(token_baseline_indices);

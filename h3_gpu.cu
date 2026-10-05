@@ -102,6 +102,7 @@ struct h3_gpu {
     h3_gpu_tensor *ws_adaln;
     h3_gpu_tensor *ws_int8_act;
     h3_gpu_tensor *ws_int8_row_scales;
+    double *rel_scratch;
 };
 
 enum {
@@ -520,6 +521,8 @@ void h3_gpu_free(h3_gpu *gpu) {
     if (gpu->sol_scratch) cudaFree(gpu->sol_scratch);
     gpu->sol_scratch = NULL;
     gpu->sol_scratch_bytes = 0;
+    if (gpu->rel_scratch) cudaFree(gpu->rel_scratch);
+    gpu->rel_scratch = NULL;
     if (gpu->int8_accum) cudaFree(gpu->int8_accum);
     for (int i = 0; i < H3_STAGE_SLOTS; i++) {
         if (gpu->stage_event_recorded[i] && gpu->stage_copied[i])
@@ -1321,6 +1324,89 @@ int h3_gpu_sub_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         (uint16_t *)output->device, elements);
     gpu->stats.direct_dispatches++;
     return h3_cuda_check(gpu, cudaGetLastError(), "h3_sub_bf16");
+}
+
+__global__ static void h3_rel_l2_bf16_kernel(const uint16_t *current,
+                                             const uint16_t *previous,
+                                             uint32_t count, double *diff_sum,
+                                             double *base_sum) {
+    double diff = 0.0;
+    double base = 0.0;
+    for (uint32_t index = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < count; index += (uint32_t)blockDim.x * gridDim.x) {
+        float now = h3_bf16_bits_to_f32(current[index]);
+        float before = h3_bf16_bits_to_f32(previous[index]);
+        float delta = now - before;
+        diff += (double)delta * (double)delta;
+        base += (double)before * (double)before;
+    }
+    unsigned lane = threadIdx.x & 31u;
+    unsigned warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        diff += __shfl_down_sync(0xffffffffu, diff, offset);
+        base += __shfl_down_sync(0xffffffffu, base, offset);
+    }
+    __shared__ double warp_diff[8];
+    __shared__ double warp_base[8];
+    if (lane == 0u) {
+        warp_diff[warp] = diff;
+        warp_base[warp] = base;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        double diff_block = 0.0;
+        double base_block = 0.0;
+        unsigned warps = blockDim.x >> 5;
+        for (unsigned index = 0; index < warps; index++) {
+            diff_block += warp_diff[index];
+            base_block += warp_base[index];
+        }
+        atomicAdd(diff_sum, diff_block);
+        atomicAdd(base_sum, base_block);
+    }
+}
+
+int h3_gpu_rel_l2_bf16(h3_gpu *gpu, const h3_gpu_tensor *current,
+                       const h3_gpu_tensor *previous, uint32_t elements,
+                       float *relative) {
+    if (!gpu || !current || !previous || !relative ||
+        current->dtype != H3_GPU_BF16 || previous->dtype != H3_GPU_BF16 ||
+        current->elements < elements || previous->elements < elements ||
+        !elements)
+        return h3_gpu_fail(gpu, "invalid BF16 relative L2 request");
+    if (!gpu->rel_scratch) {
+        if (cudaMalloc(&gpu->rel_scratch, 2 * sizeof(double)) != cudaSuccess) {
+            gpu->rel_scratch = NULL;
+            return h3_gpu_fail(gpu, "cannot allocate relative L2 scratch");
+        }
+    }
+    if (cudaMemsetAsync(gpu->rel_scratch, 0, 2 * sizeof(double),
+                        gpu->stream) != cudaSuccess)
+        return h3_cuda_check(gpu, cudaGetLastError(), "h3_rel_l2_bf16 memset");
+    unsigned threads = 256;
+    unsigned blocks = 512;
+    if ((size_t)elements < (size_t)threads * blocks)
+        blocks = (unsigned)(((size_t)elements + threads - 1) / threads);
+    h3_rel_l2_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)current->device, (const uint16_t *)previous->device,
+        elements, gpu->rel_scratch, gpu->rel_scratch + 1);
+    gpu->stats.direct_dispatches++;
+    if (!h3_cuda_check(gpu, cudaGetLastError(), "h3_rel_l2_bf16")) return 0;
+    double host[2];
+    cudaError_t copy = cudaMemcpyAsync(host, gpu->rel_scratch,
+                                       2 * sizeof(double),
+                                       cudaMemcpyDeviceToHost, gpu->stream);
+    if (copy != cudaSuccess)
+        return h3_cuda_check(gpu, copy, "h3_rel_l2_bf16 copy");
+    if (!h3_cuda_check(gpu, cudaStreamSynchronize(gpu->stream),
+                       "h3_rel_l2_bf16 sync"))
+        return 0;
+    double diff = host[0];
+    double base = host[1];
+    if (base > 0.0) *relative = (float)sqrt(diff / base);
+    else *relative = diff > 0.0 ? 1.0e9f : 0.0f;
+    return 1;
 }
 
 int h3_gpu_euler_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
