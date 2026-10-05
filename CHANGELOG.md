@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+15 s cinematic `--fbc` (864×480, 362 frames, steps 20, layers 45, reuse 1,
+seed 42, office prompt in `scripts/fox-15s.sh`): **16 min 44 s** e2e,
+denoise **15 min 17 s** (SDPA 783 / linear 100). Quality path is 17 min 56 s.
+10 of 20 steps stayed full. PSNR was not measured. Slower than `--sol-attn`
+and `--reuse 3` on this clip.
+
 ## v0.2.3 — 2026-10-05
 
 Opt-in `--fbc` (First Block Cache). Each denoise step runs block 0 and skips

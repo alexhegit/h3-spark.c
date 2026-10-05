@@ -1,9 +1,10 @@
 # Spark performance baseline
 
 Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.3** adds
-opt-in `--fbc`; the fox-fast / 15 s scoreboard below is still the **v0.2.2**
-measurement. The 2026-08-17 tables after them are the **pre-optimization**
-CUDA baseline (`483ffdf` / `v0.1.0`), not shipping speed.
+opt-in `--fbc`. Fox-fast and the 15 s quality / TR / Sol-Attn rows are still
+the **v0.2.2** measurement; the 15 s `--fbc` row is the 2026-10-05 one shot.
+The 2026-08-17 tables after them are the **pre-optimization** CUDA baseline
+(`483ffdf` / `v0.1.0`), not shipping speed.
 
 ## perf2 autoloop (2026-09-07)
 
@@ -14,6 +15,26 @@ gate is **fox-fast PSNR vs v0.2.0 ref** `f5282774d3a4`
 microbench predicts **≥15%** e2e.
 
 Harness: `scripts/perf2_fox.sh`.
+
+## 2026-10-05 — 15 s cinematic `--fbc`
+
+Same office prompt and shape as the quality path
+([`scripts/fox-15s.sh`](../scripts/fox-15s.sh)): 864×480, 362 frames,
+steps 20, layers 45, seed 42, plus `--reuse 1 --fbc`. Default FBC
+(`H3_FBC_REL=0.10`, warmup 4, tail 4, max streak 4). No Sol-Attn, no
+token reduction. One shot. Log `/tmp/h3_fbc/long-15s-fbc.log`, md5
+`841d0be4420e`.
+
+| | E2E | Denoise (sdpa / linear) | Video VAE |
+|---|---:|---|---:|
+| quality path, reuse 2 | 17 min 56 s | 16 min 28 s (845 / 110) | — |
+| **`--fbc`** | **16 min 44 s** | **15 min 17 s (783 / 100)** | 77.5 s |
+
+10 of 20 steps ran the full stack; the other 10 ran block 0 only (attention
+calls 460 = 10×45 + 10). Middle-step relative L2 stayed about 0.03–0.05, so
+the 0.10 threshold was not what limited the skips. The quality-path mp4 was
+not on disk, so there is no PSNR against `60fd70cc309c`. This does not beat
+15 s `--sol-attn` (11 min 35 s) or `--reuse 3` (13 min 25 s).
 
 ## 2026-10-05 — H3-OnDevice 832×480 / 5 s / 50 steps
 
@@ -318,7 +339,7 @@ vs quality on this tree: E2E **−37.4 %**, SDPA **−42.9 %**. vs v0.2.0 TR: E2
 `ldmatrix.x2` P·V). Still opt-in; pixels are not the quality-path
 `60fd70cc309c`.
 
-## Current shipping scoreboard (measured v0.2.2, 2026-09-14; unchanged at v0.2.3)
+## Current shipping scoreboard (fox-fast measured v0.2.2, 2026-09-14; 15 s `--fbc` added 2026-10-05)
 
 **Binary / tree:** `perf2` (kernels from `7420692` + `--sol-attn`). Logs: `/tmp/h3_rebench/`, `/tmp/h3_perf4h/sol-attn-15s.log`.
 
@@ -329,6 +350,7 @@ vs quality on this tree: E2E **−37.4 %**, SDPA **−42.9 %**. vs v0.2.0 TR: E2
 | 15 s cinematic | **17 min 56 s** | **16 min 28 s** (845 / 110) | md5 `60fd70cc309c` |
 | 15 s + TR | **11 min 14 s** | **9 min 49 s** (482 / 81) | opt-in; md5 `19c109ebb0cb` |
 | 15 s + `--sol-attn` | **11 min 35 s** | **10 min 9 s** (464 / 111) | opt-in; md5 `6ad88ffb989a`; PSNR 19.2 / 0.72 |
+| 15 s + `--fbc` | **16 min 44 s** | **15 min 17 s** (783 / 100) | opt-in; reuse 1; 2026-10-05 one shot; md5 `841d0be4420e`; PSNR not measured |
 
 `H3_INT8_VAE=1`: fox-s2 VAE peak 9.45→2.73 GiB, PSNR 43.2 dB vs F32 (2026-09-07).
 

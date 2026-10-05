@@ -59,7 +59,7 @@ MiniMax-H3 demo assets (`ref2va.mp4` / `fl2va.mp4`).
 | Opt-in `H3_INT8_VAE=1` (VAE VRAM, not default speed) | ✅ |
 | `--ref-audio` + preview UX (`--frames-dir`, `--show`) | ✅ |
 | fox-s2 / fox-fast / 15 s cinematic | GB10 scoreboard below — [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md). Unchanged at v0.2.3 |
-| Opt-in `--fbc` | First Block Cache. 832×480 / 5 s: **236.9 s** at 18.7 dB alone; **169.6 s** at 12.6 dB with 45 layers and Sol-Attn. [`docs/H3_ONDEVICE.md`](docs/H3_ONDEVICE.md) |
+| Opt-in `--fbc` | First Block Cache. 832×480 / 5 s: **236.9 s** at 18.7 dB alone. 15 s cinematic: **16 min 44 s** (−7% vs 17 min 56 s); PSNR not measured. [`docs/H3_ONDEVICE.md`](docs/H3_ONDEVICE.md) |
 
 Progress log: [`docs/SPARK_AUTORUN.md`](docs/SPARK_AUTORUN.md) · Known gaps:
 [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) · Porting notes:
@@ -118,6 +118,7 @@ those commands, not a vendor bake-off.
 | **15 s cinematic** | 864×480, `--seconds 15`, L45 R2 | **17 min 56 s** | **16 min 28 s** (845 / 110) | `60fd70cc309c` |
 | same + `--token-reduction` | opt-in; quality trade | **11 min 14 s** | **9 min 49 s** (482 / 81) | `19c109ebb0cb` |
 | same + `--sol-attn` | opt-in; sparse SDPA | **11 min 35 s** | **10 min 9 s** (464 / 111) | `6ad88ffb989a` |
+| same + `--fbc` | `--reuse 1`, default FBC; one shot 2026-10-05 | **16 min 44 s** | **15 min 17 s** (783 / 100) | `841d0be4420e` |
 
 fox-s2 wall is mostly video VAE (~2.6 s) + Qwen (~2.1 s), not DiT. 15 s wall
 is still long-N SDPA (same md5 as v0.2.0). Optional `H3_INT8_VAE=1` drops
@@ -138,6 +139,8 @@ fox-s2 VAE peak 9.45→2.73 GiB (PSNR 43 dB vs F32). Retest logs:
 #            (11 min 35 s, ~19.2 dB vs quality; not bit-identical)
 # optional: ./scripts/fox-15s.sh /path/to/MiniMax-H3 --token-reduction
 #            (11 min 14 s, ~17.8 dB; not bit-identical)
+# optional: ./scripts/fox-15s.sh /path/to/MiniMax-H3 --reuse 1 --fbc
+#            (16 min 44 s; 10 of 20 steps still full; PSNR not measured)
 ```
 
 The prompt and knobs live in [`scripts/fox-15s.sh`](scripts/fox-15s.sh).

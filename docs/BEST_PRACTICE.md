@@ -61,10 +61,18 @@ HIP's own `fox-15s.sh` adds `--token-reduction` and is not this quality path.
 
 | Intent | Flags | Wall | vs quality-path `60fd70cc309c` |
 |---|---|---:|---|
-| **Final / publish** | `--layers 45 --reuse 2` | **18 min** | bit-stable quality path |
+| **Final / publish** | `--layers 45 --reuse 2` | **17 min 56 s** | bit-stable quality path |
 | **Faster, keep more structure** | `--sol-attn` | **11 min 35 s (−35%)** | **PSNR 19.2 / 0.72** |
 | **Faster, reuse only** | `--reuse 3` (keep L45) | **13 min 25 s (−25%)** | **PSNR 18.8 / 0.70** |
 | **Need the minutes back** | `--token-reduction` | **11 min 14 s (−37%)** | **PSNR 17.8 / 0.66** (Y ~16.3) |
+| Measured, not the 15 s pick | `--reuse 1 --fbc` (L45, default FBC) | **16 min 44 s (−7%)** | PSNR not measured |
+
+`--fbc` on this 20-step clip still fully evaluates 10 of 20 steps (warmup 4,
+tail 4, and a streak cap of 4). Denoise **917 s** (SDPA 783 / linear 100)
+against the quality path's **988 s** (845 / 110). That is slower than
+`--reuse 3` and `--sol-attn`. One shot, 2026-10-05, md5 `841d0be4420e`.
+The quality-path mp4 was not on disk, so this row has no PSNR. Log:
+`/tmp/h3_fbc/long-15s-fbc.log`.
 
 Long video is N². `--sol-attn` cuts attention tiles; `--token-reduction`
 shrinks N; reuse 3 only drops 11→8 evals. On this 15 s clip **Sol-Attn
