@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## v0.2.3 — 2026-10-05
+
+Opt-in `--fbc` (First Block Cache). Each denoise step runs block 0 and skips
+the rest when that residual's relative L2 stays under `H3_FBC_REL` (default
+0.10). Early and late steps stay dense. Default generate path and fox-fast
+md5 `f5282774d3a4` are unchanged. `--info` prints `H3_VERSION` **0.2.3**.
+
+Measured on the H3-OnDevice Spark job (832×480, 124 frames, 50 steps, seed 42,
+one shot). PSNR/SSIM are against this tree's exact clip, not NVIDIA's frames.
+
+| Run | E2E | Denoise (sdpa / linear) | PSNR / SSIM |
+|---|---:|---|---|
+| exact, 50 layers | 641.9 s | 598.2 s (351 / 188) | — |
+| `--fbc` | **236.9 s** | 200.1 s (117 / 62) | **18.7 / 0.73** |
+| `--fbc --layers 45 --sol-attn`, τ=1 | **169.6 s** | 137.4 s (62 / 56) | 12.6 / 0.58 |
+| `--layers 45 --reuse 3 --sol-attn`, τ=1 | 180.8 s | 144.6 s (64 / 61) | 12.8 / 0.58 |
+
+169.6 s is faster than the fixed-stride all-opt path and does not improve on
+12.8 dB. The quality win at this shape is `--fbc` alone. Table:
+[`docs/H3_ONDEVICE.md`](docs/H3_ONDEVICE.md).
+
 ## v0.2.2 — 2026-09-14
 
 Opt-in `--sol-attn` (Sol-Attn-style sparse MMA SDPA) for long T2VA. Default

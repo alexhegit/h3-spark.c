@@ -1,8 +1,9 @@
 # Spark performance baseline
 
-Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.2** shipping
-numbers are in the snapshots below. The 2026-08-17 tables after them are the
-**pre-optimization** CUDA baseline (`483ffdf` / `v0.1.0`), not shipping speed.
+Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.3** adds
+opt-in `--fbc`; the fox-fast / 15 s scoreboard below is still the **v0.2.2**
+measurement. The 2026-08-17 tables after them are the **pre-optimization**
+CUDA baseline (`483ffdf` / `v0.1.0`), not shipping speed.
 
 ## perf2 autoloop (2026-09-07)
 
@@ -20,8 +21,10 @@ Same Spark job as NVIDIA's
 [H3-OnDevice](https://nvlabs.github.io/Sana/Sol-Engine/H3-OnDevice/) column
 (stock weights, 124 frames). Exact path **641.9 s**. all-opt
 (`--layers 45 --reuse 3 --sol-attn`, τ=1) **180.8 s**, next to their full
-stack **181.3 s**. Their 710.6 s column is PyTorch eager. Prompt on the page
-is compacted, so this is wall-clock only. Table and command:
+stack **181.3 s**. `--fbc` on the same job is **236.9 s** at 18.7 dB / 0.73
+vs our exact clip; `--fbc --layers 45 --sol-attn` (τ=1) is **169.6 s** at
+12.6 dB / 0.58. Their 710.6 s column is PyTorch eager. Prompt on the page
+is compacted, so the NVIDIA comparison is wall-clock only. Table and command:
 [`H3_ONDEVICE.md`](H3_ONDEVICE.md).
 
 ## 2026-09-14 — Sol-Attn-style sparse SDPA (`--sol-attn`, opt-in)
@@ -315,7 +318,7 @@ vs quality on this tree: E2E **−37.4 %**, SDPA **−42.9 %**. vs v0.2.0 TR: E2
 `ldmatrix.x2` P·V). Still opt-in; pixels are not the quality-path
 `60fd70cc309c`.
 
-## Current shipping (v0.2.2, 2026-09-14)
+## Current shipping scoreboard (measured v0.2.2, 2026-09-14; unchanged at v0.2.3)
 
 **Binary / tree:** `perf2` (kernels from `7420692` + `--sol-attn`). Logs: `/tmp/h3_rebench/`, `/tmp/h3_perf4h/sol-attn-15s.log`.
 

@@ -1,7 +1,7 @@
 # Spark autoloop progress log
 
-Automated **h3-cuda** port on DGX Spark. Shipping tag: **v0.2.2**
-(`perf2`).
+Automated **h3-cuda** port on DGX Spark. Shipping tag: **v0.2.3**
+(`main`).
 
 ## Plan (revised 2026-08-17)
 
@@ -75,6 +75,7 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 - **15 s + TR (2026-09-10, `59d307b`):** **11 min 14 s** e2e / **9 min 49 s** denoise (sdpa 482 / linear 81), md5 `19c109ebb0cb` (same as v0.2.0 TR). vs quality 1076 s: **−37.4 %**.
 - **15 s + `--sol-attn` (2026-09-14):** **11 min 35 s** e2e (−35%), PSNR **19.2 / 0.72** vs quality. Opt-in; [`SOL_ATTN.md`](SOL_ATTN.md).
 - **v0.2.2 (2026-09-14):** ships `--sol-attn`. Audio SNR vs quality on 15 s: sol-attn **8.6 dB** (TR 3.1, reuse 3 2.6). `H3_SOL_ATTN_BLOCKS=8:36` REJECT.
+- **v0.2.3 (2026-10-05):** ships `--fbc`. 832×480 / 5 s / 50 steps: **236.9 s** at 18.7 dB / 0.73 alone; **169.6 s** at 12.6 dB / 0.58 with 45 layers and Sol-Attn τ=1. Fox-fast scoreboard unchanged. [`H3_ONDEVICE.md`](H3_ONDEVICE.md).
 
 ### Pending (E)
 
@@ -83,4 +84,4 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 
 ---
 
-*Last updated: 2026-09-14 — v0.2.2 (`--sol-attn`)*
+*Last updated: 2026-10-05 — v0.2.3 (`--fbc`)*

@@ -1,6 +1,8 @@
 # Quality vs speed: how to pick generate knobs
 
-Numbers below are **DGX Spark (GB10), v0.2.2**, seed 42, `--profile`.
+Recipe tables below are **DGX Spark (GB10), v0.2.2**, seed 42, `--profile`,
+and are unchanged at v0.2.3. `--fbc` is measured separately in
+[`H3_ONDEVICE.md`](H3_ONDEVICE.md).
 PSNR/SSIM are ffmpeg lavfi vs the **same prompt/size/seed without the speed
 flag**. They are not a claim about “good video” in absolute terms — only how
 far you moved from this port’s quality path.
@@ -19,6 +21,7 @@ of the HIP-page clips.
 | `--reuse` | How often a denoise step **reuses** the last DiT residual: **1** close, **2** fast (default for fox-fast/15 s), **3** aggressive | Cuts **eval count**, not N. fox-fast 11→8 evals; 15 s same |
 | `--token-reduction` | Pools adjacent **horizontal video tokens** in middle blocks | Cuts **N** on those blocks. Big on long T2VA, modest on 512² 22f |
 | `--sol-attn` | Sparse SDPA: keep important 64-token KV tiles, approximate the rest | Cuts **attention traffic**. Kernel **3×** at seq 44800; fox-fast **~17.6 dB** (KEEP fail). Long T2VA only |
+| `--fbc` | Skip later DiT blocks when block 0's residual barely moves | Cuts **eval work** inside a step. 832×480 / 5 s: **236.9 s** at 18.7 dB alone. Not on the fox-fast scoreboard |
 | `H3_INT8_VAE=1` | INT8 video-VAE weights | **VRAM**, not wall clock (fox-s2 peak 9.45→2.73 GiB) |
 
 Leave `--core-reuse` alone unless you already know that knob. `H3_BF16_MLP=1`
