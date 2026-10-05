@@ -23,11 +23,7 @@ on purpose. Do not treat this as KEEP (fox-fast PSNR ≥ 24 dB / SSIM ≥ 0.85).
 ```bash
 MODEL=/path/to/MiniMax-H3
 
-./h3 --profile -d "$MODEL" -p "$PROMPT_15S" \
-  --width 864 --height 480 --seconds 15 \
-  --steps 20 --layers 45 --reuse 2 --seed 42 \
-  --sol-attn \
-  -o out-15s-sol-attn.mp4
+./scripts/fox-15s.sh "$MODEL" --sol-attn -o out-15s-sol-attn.mp4
 ```
 
 Interactive CLI: `!sol-attn on`. Same effect as the flag: sets `H3_SOL_ATTN=1`

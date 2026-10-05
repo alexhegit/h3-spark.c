@@ -52,7 +52,12 @@ you paid the uglier tax for little extra.
 
 ### Long clip (864×480, `--seconds 15`) — cinematic class
 
-HIP-page office prompt, L45, steps 20. Quality path **1076 s**.
+Office prompt from the
+[h3-hip.c Long video wiki](https://github.com/alexhegit/h3-hip.c/wiki/Long-video)
+(same text as `bench/fox-15s.sh`). Quality path is that command **without**
+`--token-reduction`: L45, steps 20, reuse 2, seed 42. Spark wall **1076 s**,
+md5 `60fd70cc309c`. The prompt is in [`scripts/fox-15s.sh`](../scripts/fox-15s.sh).
+HIP's own `fox-15s.sh` adds `--token-reduction` and is not this quality path.
 
 | Intent | Flags | Wall | vs quality-path `60fd70cc309c` |
 |---|---|---:|---|
@@ -135,25 +140,17 @@ MODEL=/path/to/MiniMax-H3
   --steps 20 --layers 45 --reuse 3 --seed 42 \
   -o out-faster.mp4
 
+# 15 s quality path — office prompt, 864×480, 362 frames, L45 R2, seed 42
+./scripts/fox-15s.sh
+
 # 15 s, recommended speed flag (visible vs quality path, best PSNR of the fast set)
-./h3 -d "$MODEL" -p "$PROMPT_15S" \
-  --width 864 --height 480 --seconds 15 \
-  --steps 20 --layers 45 --reuse 2 --seed 42 \
-  --sol-attn \
-  -o out-15s-sol-attn.mp4
+./scripts/fox-15s.sh --sol-attn -o out-15s-sol-attn.mp4
 
 # 15 s, reuse only (slower than sol-attn, similar look)
-./h3 -d "$MODEL" -p "$PROMPT_15S" \
-  --width 864 --height 480 --seconds 15 \
-  --steps 20 --layers 45 --reuse 3 --seed 42 \
-  -o out-15s-reuse3.mp4
+./scripts/fox-15s.sh --reuse 3 -o out-15s-reuse3.mp4
 
 # 15 s, maximum wall-clock cut (uglier than sol-attn)
-./h3 -d "$MODEL" -p "$PROMPT_15S" \
-  --width 864 --height 480 --seconds 15 \
-  --steps 20 --layers 45 --reuse 2 --seed 42 \
-  --token-reduction \
-  -o out-15s-tr.mp4
+./scripts/fox-15s.sh --token-reduction -o out-15s-tr.mp4
 ```
 
 Do **not** stack `--sol-attn` with `--token-reduction` unless you are

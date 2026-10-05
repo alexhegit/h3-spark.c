@@ -393,8 +393,9 @@ WALL 15.40 s, denoise 8.173 s, md5 `f5282774d3a4` (matches the n=3 snapshot).
 
 ### 15 s cinematic (864×480, `--seconds 15`, L45 R2, seed 42)
 
-HIP-page office prompt. 362 FFmpeg frames. Quality path is the bit-stable
-knob set (no token reduction).
+Office prompt from the h3-hip.c wiki, now in
+[`scripts/fox-15s.sh`](../scripts/fox-15s.sh). 362 FFmpeg frames. Quality
+path is the bit-stable knob set (no token reduction).
 
 | | WALL_SEC | denoise | sdpa | linear | video VAE | md5 |
 |---|---:|---:|---:|---:|---:|---|

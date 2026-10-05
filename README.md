@@ -132,18 +132,20 @@ fox-s2 VAE peak 9.45→2.73 GiB (PSNR 43 dB vs F32). Retest logs:
   --steps 2 --layers 35 --reuse 1 --seed 42 \
   -o outputs/fox-s2.mp4
 
-# 15 s cinematic — same knobs as the HIP page (paste that office prompt)
-./h3 --profile -d /path/to/MiniMax-H3 \
-  -p "$PROMPT_15S" \
-  --width 864 --height 480 --seconds 15 \
-  --steps 20 --layers 45 --reuse 2 --seed 42 \
-  -o outputs/long-15s-cinematic.mp4
-# optional: append --sol-attn       (11 min 35 s, ~19.2 dB vs quality; not bit-identical)
-# optional: append --token-reduction  (11 min 14 s, ~17.8 dB; not bit-identical)
+# 15 s cinematic — office prompt from the h3-hip.c wiki, L45 R2, seed 42
+./scripts/fox-15s.sh /path/to/MiniMax-H3
+# optional: ./scripts/fox-15s.sh /path/to/MiniMax-H3 --sol-attn
+#            (11 min 35 s, ~19.2 dB vs quality; not bit-identical)
+# optional: ./scripts/fox-15s.sh /path/to/MiniMax-H3 --token-reduction
+#            (11 min 14 s, ~17.8 dB; not bit-identical)
 ```
 
-The 15 s prompt is the HIP-page office/cinematic text. For Ref2VA / FL2VA
-reproduction, see [Showcase](#showcase-dgx-spark).
+The prompt and knobs live in [`scripts/fox-15s.sh`](scripts/fox-15s.sh).
+They match the
+[h3-hip.c Long video](https://github.com/alexhegit/h3-hip.c/wiki/Long-video)
+reproduce block. HIP's `bench/fox-15s.sh` adds `--token-reduction`; this
+script does not. For Ref2VA / FL2VA reproduction, see
+[Showcase](#showcase-dgx-spark).
 
 ## Quality vs speed (best practice)
 
@@ -195,10 +197,7 @@ Keep-all (`H3_SOL_ATTN_TAU=-100`) is bit-identical to dense MMA; the default
 [`docs/SOL_ATTN.md`](docs/SOL_ATTN.md).
 
 ```bash
-./h3 --profile -d "$MODEL" -p "$PROMPT_15S" \
-  --width 864 --height 480 --seconds 15 \
-  --steps 20 --layers 45 --reuse 2 --seed 42 \
-  --sol-attn -o out-15s-sol-attn.mp4
+./scripts/fox-15s.sh /path/to/MiniMax-H3 --sol-attn -o out-15s-sol-attn.mp4
 ```
 
 On 15 s cinematic vs the quality path: **1076 s → 695 s (−35%)**, PSNR
