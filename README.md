@@ -65,7 +65,8 @@ Progress log: [`docs/SPARK_AUTORUN.md`](docs/SPARK_AUTORUN.md) · Known gaps:
 [`docs/SPARK_PORTING.md`](docs/SPARK_PORTING.md) · Perf baseline:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) · Quality vs speed:
 [`docs/BEST_PRACTICE.md`](docs/BEST_PRACTICE.md) · `--sol-attn`:
-[`docs/SOL_ATTN.md`](docs/SOL_ATTN.md)
+[`docs/SOL_ATTN.md`](docs/SOL_ATTN.md) · H3-OnDevice comparison:
+[`docs/H3_ONDEVICE.md`](docs/H3_ONDEVICE.md)
 
 ## Requirements
 

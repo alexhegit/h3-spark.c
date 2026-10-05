@@ -14,6 +14,16 @@ microbench predicts **≥15%** e2e.
 
 Harness: `scripts/perf2_fox.sh`.
 
+## 2026-10-05 — H3-OnDevice 832×480 / 5 s / 50 steps
+
+Same Spark job as NVIDIA's
+[H3-OnDevice](https://nvlabs.github.io/Sana/Sol-Engine/H3-OnDevice/) column
+(stock weights, 124 frames). Exact path **641.9 s**. all-opt
+(`--layers 45 --reuse 3 --sol-attn`, τ=1) **180.8 s**, next to their full
+stack **181.3 s**. Their 710.6 s column is PyTorch eager. Prompt on the page
+is compacted, so this is wall-clock only. Table and command:
+[`H3_ONDEVICE.md`](H3_ONDEVICE.md).
+
 ## 2026-09-14 — Sol-Attn-style sparse SDPA (`--sol-attn`, opt-in)
 
 Training-free block sparse attention on the default MMA kernel: 64-token
