@@ -322,11 +322,62 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
 
 /* Portable BF16 storage path. Arithmetic accumulates in F32 and rounds at
  * operation boundaries, matching the released checkpoint's compute dtype. */
+/* TAEH3 tiny decoder. Tensors are NCHW. conv2d is stride-1 with pad k/2. */
+int h3_gpu_taeh3_conv2d(h3_gpu *gpu, h3_gpu_tensor *output,
+                        const h3_gpu_tensor *input,
+                        const h3_gpu_tensor *weight,
+                        const h3_gpu_tensor *bias, uint32_t batch,
+                        uint32_t in_channels, uint32_t out_channels,
+                        uint32_t height, uint32_t width, uint32_t kernel);
+int h3_gpu_taeh3_tanh_clamp(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *input, uint32_t elements);
+int h3_gpu_taeh3_relu(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, uint32_t elements);
+int h3_gpu_taeh3_add_relu(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *left, const h3_gpu_tensor *right,
+                          uint32_t elements);
+int h3_gpu_taeh3_upsample2(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input, uint32_t batch,
+                           uint32_t channels, uint32_t height, uint32_t width);
+int h3_gpu_taeh3_time_past(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *memory, uint32_t batch,
+                           uint32_t channels, uint32_t height, uint32_t width);
+int h3_gpu_taeh3_cat_channels(h3_gpu *gpu, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *left,
+                              const h3_gpu_tensor *right, uint32_t batch,
+                              uint32_t channels, uint32_t height,
+                              uint32_t width);
+int h3_gpu_taeh3_pixel_shuffle2(h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *input, uint32_t batch,
+                                uint32_t height, uint32_t width);
+int h3_gpu_taeh3_copy_frame(h3_gpu *gpu, h3_gpu_tensor *dst,
+                            const h3_gpu_tensor *src, uint32_t frame,
+                            uint32_t channels, uint32_t height,
+                            uint32_t width);
+int h3_gpu_taeh3_copy(h3_gpu *gpu, h3_gpu_tensor *dst,
+                      const h3_gpu_tensor *src, uint32_t elements);
 int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *input,
                        const h3_gpu_tensor *weight,
                        const h3_gpu_tensor *bias, uint32_t rows,
                        uint32_t input_dim, uint32_t output_dim);
+/* Load-time FastH3 merge. C = beta * C + scale * (B @ A), row-major. */
+int h3_gpu_fasth3_gemm_bf16(h3_gpu *gpu, h3_gpu_tensor *c, size_t c_elem,
+                            const h3_gpu_tensor *b, size_t b_elem,
+                            const h3_gpu_tensor *a, uint32_t rows,
+                            uint32_t cols, uint32_t rank, float scale,
+                            float beta);
+int h3_gpu_fasth3_qkv_scatter_bf16(h3_gpu *gpu, h3_gpu_tensor *weight,
+                                   const h3_gpu_tensor *delta, uint32_t heads,
+                                   uint32_t head_dim, uint32_t cols,
+                                   uint32_t which);
+int h3_gpu_fasth3_axpy_bf16(h3_gpu *gpu, h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *delta, size_t count,
+                            float scale);
+int h3_gpu_fasth3_axpy_f32(h3_gpu *gpu, h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *delta, size_t count,
+                           float scale);
 int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *input,
                     const h3_gpu_tensor *fc1_weight,
@@ -690,6 +741,22 @@ int h3_gpu_euler_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
                       size_t sample_offset, const h3_gpu_tensor *last,
                       const h3_gpu_tensor *previous, uint32_t elements,
                       float delta, float ratio);
+/* Pika step: x0 = sample + sigma * velocity, then
+ * sample = (1 - sigma_next) * x0 + sigma_next * noise.
+ * noise may be NULL when sigma_next is 0. noise_offset indexes into noise. */
+int h3_gpu_renoise_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
+                        size_t sample_offset, const h3_gpu_tensor *velocity,
+                        const h3_gpu_tensor *noise, size_t noise_offset,
+                        uint32_t elements, float sigma, float sigma_next);
+/* FastH3 VSA. prefix_rows are packed segments before the target video. */
+int h3_gpu_vsa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                    const h3_gpu_tensor *value, const h3_gpu_tensor *gate,
+                    uint32_t sequence, uint32_t heads, uint32_t head_dim,
+                    float scale, int kv_head_major, uint32_t latent_t,
+                    uint32_t token_h, uint32_t token_w,
+                    const uint32_t *prefix_rows, uint32_t n_prefix,
+                    float sparsity);
 int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *gate,
                          const h3_gpu_tensor *up, uint32_t elements);

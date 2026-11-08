@@ -35,11 +35,22 @@ static void usage(const char *program) {
         "                         off by default. Pays in quality (fox-fast\n"
         "                         ~17.8 dB PSNR / 0.72 SSIM vs off)\n"
         "      --sol-attn         Sparse SDPA for long T2VA; off by default.\n"
-        "                         15 s cinematic about −35% e2e, ~19.2 dB vs\n"
+        "                         15 s cinematic about −35%% e2e, ~19.2 dB vs\n"
         "                         the quality path. docs/SOL_ATTN.md\n"
         "      --fbc              First-block cache: skip later DiT blocks when\n"
         "                         block 0's residual barely moves. Off by default.\n"
         "                         Tune H3_FBC_REL (default 0.10).\n"
+        "      --fasth3-lora PATH Merge a FastH3 dense 4-step LoRA at load\n"
+        "                         (off by default). Forces timesteps\n"
+        "                         999,749,500,250, 50 layers, and --reuse 1.\n"
+        "      --taeh3 PATH       Decode video with the TAEH3 tiny decoder\n"
+        "                         (off by default). Softer preview, same\n"
+        "                         latents. Audio VAE is unchanged.\n"
+        "      --pika-lora PATH   Pika FL2VA LoRA (6-step renoise, --reuse 1).\n"
+        "      --pika-ref-lora PATH  Pika Ref2VA LoRA (with --ref-image).\n"
+        "      --vsa               FastH3 VSA (needs vsa-datafree LoRA);\n"
+        "                         off by default. Sparse-MMA fine; faster\n"
+        "                         than dense FastH3 on the 5 s OnDevice job.\n"
         "      --ssd-streaming    Stream original BF16 DiT layers from SSD\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
         "      --use-reference-rope  Disable native 256 RoPE adaptation\n"
@@ -250,6 +261,9 @@ int main(int argc, char **argv) {
            OPT_TOKEN_REDUCTION,
            OPT_SOL_ATTN,
            OPT_FBC,
+           OPT_FASTH3_LORA,
+           OPT_TAEH3,
+           OPT_PIKA_LORA, OPT_PIKA_REF_LORA, OPT_VSA,
            OPT_SSD_STREAMING,
            OPT_USE_INT8_ROW_FC2,
            OPT_USE_REFERENCE_ROPE,
@@ -285,6 +299,11 @@ int main(int argc, char **argv) {
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
         {"sol-attn", no_argument, NULL, OPT_SOL_ATTN},
         {"fbc", no_argument, NULL, OPT_FBC},
+        {"fasth3-lora", required_argument, NULL, OPT_FASTH3_LORA},
+        {"taeh3", required_argument, NULL, OPT_TAEH3},
+        {"pika-lora", required_argument, NULL, OPT_PIKA_LORA},
+        {"pika-ref-lora", required_argument, NULL, OPT_PIKA_REF_LORA},
+        {"vsa", no_argument, NULL, OPT_VSA},
         {"ssd-streaming", no_argument, NULL, OPT_SSD_STREAMING},
         {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
         {"use-reference-rope", no_argument, NULL, OPT_USE_REFERENCE_ROPE},
@@ -374,6 +393,11 @@ int main(int argc, char **argv) {
             case OPT_TOKEN_REDUCTION: params.token_reduction = 1; break;
             case OPT_SOL_ATTN: params.sol_attn = 1; break;
             case OPT_FBC: params.fbc = 1; break;
+            case OPT_FASTH3_LORA: params.fasth3_lora = optarg; break;
+            case OPT_TAEH3: params.taeh3 = optarg; break;
+            case OPT_PIKA_LORA: params.pika_lora = optarg; break;
+            case OPT_PIKA_REF_LORA: params.pika_ref_lora = optarg; break;
+            case OPT_VSA: params.vsa = 1; break;
             case OPT_SSD_STREAMING: params.ssd_streaming = 1; break;
             case OPT_USE_INT8_ROW_FC2:
                 params.use_int8_row_fc2 = 1;

@@ -1,6 +1,7 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_fasth3.h"
 #include "h3_weights.h"
 
 #include <errno.h>
@@ -9,6 +10,7 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +52,9 @@ typedef struct {
     h3_gpu_tensor *fc1_scales;
     h3_gpu_tensor *fc2_int8;
     h3_gpu_tensor *fc2_scales;
+    h3_gpu_tensor *gate_compress;
+    h3_gpu_tensor *gate_int8;
+    h3_gpu_tensor *gate_scales;
 } h3_dit_block;
 
 enum {
@@ -107,6 +112,11 @@ struct h3_dit {
     unsigned core_reuse_interval;
     unsigned core_forward_count;
     int core_residual_ready;
+    int vsa;
+    float vsa_sparsity;
+    uint32_t vsa_prefix_n;
+    uint32_t vsa_prefix[8];
+    h3_gpu_tensor *vsa_gate;
     int fbc_enabled;
     int fbc_ready;
     int fbc_fulls;
@@ -549,6 +559,30 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
     return 1;
 }
 
+static int fasth3_on(void) {
+    const char *path = getenv("H3_FASTH3_LORA");
+    return path && path[0] && strcmp(path, "0") != 0;
+}
+
+static int fasth3_block(h3_gpu *gpu, const h3_dit_block *block,
+                        const char *prefix, char *error, size_t error_size) {
+    char name[160];
+#define APPLY(field, suffix, rows, cols) do {                                  \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                     \
+    if (!h3_fasth3_apply(gpu, block->field, name, (uint32_t)(rows),            \
+                         (uint32_t)(cols), 0, error, error_size))              \
+        return 0;                                                              \
+} while (0)
+    APPLY(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN);
+    APPLY(out, "attn.out_proj.weight", HIDDEN, INNER);
+    APPLY(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN);
+    APPLY(fc2, "mlp.fc2.weight", HIDDEN, FFN);
+    APPLY(norm1, "norm1.weight", HIDDEN, 1);
+    APPLY(norm2, "norm2.weight", HIDDEN, 1);
+#undef APPLY
+    return 1;
+}
+
 static int load_block_norms(h3_dit *dit, h3_dit_block *block,
                             const char *prefix,
                             char *error, size_t error_size) {
@@ -583,6 +617,9 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->fc1_scales);
     free_tensor(&block->fc2_int8);
     free_tensor(&block->fc2_scales);
+    free_tensor(&block->gate_compress);
+    free_tensor(&block->gate_int8);
+    free_tensor(&block->gate_scales);
 }
 
 static double stream_now(void) {
@@ -717,20 +754,27 @@ static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
                               char *error, size_t error_size) {
     block->fc1_int8 = h3_gpu_tensor_new_i8(
         dit->gpu, (size_t)FFN * 2 * HIDDEN);
+    if (!block->fc1_int8) {
+        fail(error, error_size, "cannot quantize DiT MLP weights: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
     block->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
     block->fc2_int8 = h3_gpu_tensor_new_i8(
         dit->gpu, (size_t)HIDDEN * FFN);
     block->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
-    int ok = block->fc1_int8 && block->fc1_scales &&
-             block->fc2_int8 && block->fc2_scales &&
-             h3_gpu_begin(dit->gpu) &&
-             h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->fc1_int8, block->fc1_scales, block->fc1,
-                 FFN * 2, HIDDEN) &&
-             h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->fc2_int8, block->fc2_scales, block->fc2,
-                 HIDDEN, FFN);
-    if (!ok) {
+    if (!block->fc1_scales || !block->fc2_int8 || !block->fc2_scales) {
+        fail(error, error_size, "cannot quantize DiT MLP weights: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    if (!h3_gpu_begin(dit->gpu) ||
+        !h3_gpu_quantize_weight_int8(
+            dit->gpu, block->fc1_int8, block->fc1_scales, block->fc1,
+            FFN * 2, HIDDEN) ||
+        !h3_gpu_quantize_weight_int8(
+            dit->gpu, block->fc2_int8, block->fc2_scales, block->fc2,
+            HIDDEN, FFN)) {
         fail(error, error_size, "cannot quantize DiT MLP weights: %s",
              h3_gpu_error(dit->gpu));
         return 0;
@@ -872,6 +916,18 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
                  h3_gpu_error(dit->gpu));
         goto cleanup;
     }
+    ok = h3_fasth3_apply(dit->gpu, condition_w, "condition_proj.weight",
+                         HIDDEN, TEXT_DIM, 0, error, error_size) &&
+         h3_fasth3_apply(dit->gpu, condition_b, "condition_proj.bias",
+                         HIDDEN, 1, 0, error, error_size) &&
+         h3_fasth3_apply(dit->gpu, final_norm,
+                         "token_refiner.final_norm.weight", HIDDEN, 1, 0,
+                         error, error_size) &&
+         fasth3_block(dit->gpu, &refiner[0], "token_refiner.blocks.0.",
+                      error, error_size) &&
+         fasth3_block(dit->gpu, &refiner[1], "token_refiner.blocks.1.",
+                      error, error_size);
+    if (!ok) goto cleanup;
     ok = gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
                 "begin token refinement") &&
          gpu_op(dit, h3_gpu_linear_bf16(
@@ -1482,8 +1538,9 @@ static void dit_int8_cache_store(h3_dit_block *block, unsigned index,
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
     uint64_t cache_key =
-        (!dit->ssd_streaming && dit_int8_cacheable(dit)) ? dit_int8_cache_key(dit)
-                                                         : 0;
+        (!dit->ssd_streaming && !fasth3_on() && dit_int8_cacheable(dit))
+            ? dit_int8_cache_key(dit)
+            : 0;
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
         if (!dit->block_active[index]) {
             report(progress, opaque, "load transformer core", (int)index + 1,
@@ -1504,7 +1561,43 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size)) return 0;
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
-                            error, error_size)) return 0;
+                            error, error_size) ||
+                !fasth3_block(dit->gpu, &dit->blocks[index], prefix, error,
+                              error_size))
+                return 0;
+            /* Drain LoRA merge kernels before INT8 quantize so async CUDA
+             * errors surface here instead of as an empty quantize failure. */
+            if (fasth3_on() && !h3_gpu_submit(dit->gpu)) {
+                fail(error, error_size,
+                     "cannot finish FastH3 LoRA merge: %s",
+                     h3_gpu_error(dit->gpu));
+                return 0;
+            }
+            if (dit->vsa &&
+                !h3_fasth3_load_gate(dit->gpu, index, INNER, HIDDEN,
+                                     &dit->blocks[index].gate_compress,
+                                     error, error_size))
+                return 0;
+            if (dit->vsa && dit->blocks[index].gate_compress &&
+                !getenv("H3_VSA_BF16_GATE")) {
+                h3_dit_block *block = &dit->blocks[index];
+                block->gate_int8 =
+                    h3_gpu_tensor_new_i8(dit->gpu, (size_t)INNER * HIDDEN);
+                block->gate_scales =
+                    h3_gpu_tensor_new_f32(dit->gpu, INNER);
+                if (!block->gate_int8 || !block->gate_scales ||
+                    !h3_gpu_begin(dit->gpu) ||
+                    !h3_gpu_quantize_weight_int8(
+                        dit->gpu, block->gate_int8, block->gate_scales,
+                        block->gate_compress, INNER, HIDDEN) ||
+                    !h3_gpu_submit(dit->gpu)) {
+                    fail(error, error_size,
+                         "cannot quantize VSA gate weight: %s",
+                         h3_gpu_error(dit->gpu));
+                    return 0;
+                }
+                free_tensor(&block->gate_compress);
+            }
             if (dit->int8_mlp &&
                 !quantize_block_mlp(dit, &dit->blocks[index],
                                     error, error_size)) return 0;
@@ -1569,6 +1662,34 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                             HIDDEN, error, error_size);
     dit->final_audio_b = f1(dit, "final_layer.audio_out.bias", AUDIO_CHANNELS,
                             error, error_size);
+    if (dit->video_patch_w && dit->video_patch_b && dit->audio_patch_w &&
+        dit->audio_patch_b && dit->final_norm && dit->final_video_w &&
+        dit->final_video_b && dit->final_audio_w && dit->final_audio_b &&
+        (!h3_fasth3_apply(dit->gpu, dit->video_patch_w,
+                          "video_patch_proj.weight", HIDDEN, VIDEO_PATCH, 1,
+                          error, error_size) ||
+         !h3_fasth3_apply(dit->gpu, dit->video_patch_b, "video_patch_proj.bias",
+                          HIDDEN, 1, 1, error, error_size) ||
+         !h3_fasth3_apply(dit->gpu, dit->audio_patch_w,
+                          "audio_patch_proj.weight", HIDDEN, AUDIO_CHANNELS, 1,
+                          error, error_size) ||
+         !h3_fasth3_apply(dit->gpu, dit->audio_patch_b, "audio_patch_proj.bias",
+                          HIDDEN, 1, 1, error, error_size) ||
+         !h3_fasth3_apply(dit->gpu, dit->final_norm, "final_layer.norm.weight",
+                          HIDDEN, 1, 0, error, error_size) ||
+         !h3_fasth3_apply(dit->gpu, dit->final_video_w,
+                          "final_layer.video_out.weight", VIDEO_PATCH, HIDDEN, 1,
+                          error, error_size) ||
+         !h3_fasth3_apply(dit->gpu, dit->final_video_b,
+                          "final_layer.video_out.bias", VIDEO_PATCH, 1, 1,
+                          error, error_size) ||
+         !h3_fasth3_apply(dit->gpu, dit->final_audio_w,
+                          "final_layer.audio_out.weight", AUDIO_CHANNELS,
+                          HIDDEN, 1, error, error_size) ||
+         !h3_fasth3_apply(dit->gpu, dit->final_audio_b,
+                          "final_layer.audio_out.bias", AUDIO_CHANNELS, 1, 1,
+                          error, error_size)))
+        return 0;
     if (dit->bf16_final && dit->final_video_w && dit->final_video_b &&
         dit->final_audio_w && dit->final_audio_b) {
         h3_gpu_tensor *source[4] = {
@@ -1714,6 +1835,15 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
              "cannot allocate DiT activation buffers: %s",
              h3_gpu_error(dit->gpu));
         return 0;
+    }
+    if (dit->vsa) {
+        dit->vsa_gate = h3_gpu_tensor_new_bf16(
+            dit->gpu, sequence * INNER);
+        if (!dit->vsa_gate) {
+            fail(error, error_size, "cannot allocate VSA gate activation: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
     }
     if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
         dit->final_audio_input = h3_gpu_tensor_new_bf16(
@@ -1879,6 +2009,72 @@ static void schedule_report(int completed, int total, void *opaque) {
     report(state->callback, state->opaque, "precompute AdaLN", completed, total);
 }
 
+static int configure_vsa(h3_dit *dit, char *error, size_t error_size) {
+    const char *env = getenv("H3_VSA");
+    const char *sol;
+    const char *sparsity_text;
+    uint32_t sum = 0;
+    uint32_t token_h;
+    uint32_t token_w;
+    if (!env || !env[0] || !strcmp(env, "0")) return 1;
+    dit->vsa = 1;
+    dit->vsa_sparsity = 0.9f;
+    sparsity_text = getenv("H3_VSA_SPARSITY");
+    if (sparsity_text && *sparsity_text) {
+        char *tail = NULL;
+        float parsed = strtof(sparsity_text, &tail);
+        if (tail == sparsity_text || *tail || parsed < 0.0f || parsed >= 1.0f) {
+            fail(error, error_size, "H3_VSA_SPARSITY must be in [0, 1)");
+            return 0;
+        }
+        dit->vsa_sparsity = parsed;
+    }
+    sol = getenv("H3_SOL_ATTN");
+    {
+        const char *fbc = getenv("H3_FBC");
+        if (dit->token_reduction || dit->ssd_streaming ||
+            dit->core_reuse_interval > 1 ||
+            (sol && sol[0] && strcmp(sol, "0") != 0) ||
+            (fbc && fbc[0] && strcmp(fbc, "0") != 0)) {
+            fail(error, error_size,
+                 "VSA cannot be combined with token reduction, sol-attn, "
+                 "first-block cache, SSD streaming, or core reuse");
+            return 0;
+        }
+    }
+    token_h = (uint32_t)dit->latent_h / 2u;
+    token_w = (uint32_t)dit->latent_w / 2u;
+    if (!token_h || !token_w ||
+        (uint64_t)(uint32_t)dit->latent_t * token_h * token_w !=
+            dit->video_rows ||
+        dit->video_target_start + dit->video_rows != dit->sequence) {
+        fail(error, error_size,
+             "VSA requires the target video to end the packed layout");
+        return 0;
+    }
+    for (size_t index = 0; index < dit->layout.segment_count; index++) {
+        const h3_segment *segment = &dit->layout.segments[index];
+        uint32_t rows;
+        if (segment->kind == H3_SEG_VIDEO) continue;
+        if (segment->kind == H3_SEG_REF_IMAGE) {
+            fail(error, error_size, "VSA does not support a reference image");
+            return 0;
+        }
+        if (dit->vsa_prefix_n >= 8u) {
+            fail(error, error_size, "VSA prefix has too many segments");
+            return 0;
+        }
+        rows = (uint32_t)(segment->stop - segment->start);
+        dit->vsa_prefix[dit->vsa_prefix_n++] = rows;
+        sum += rows;
+    }
+    if (sum != dit->video_target_start) {
+        fail(error, error_size, "VSA prefix does not match the video start");
+        return 0;
+    }
+    return 1;
+}
+
 static h3_dit *load_dit(const char *weight_directory,
                         const char *shader_source_path,
                         const h3_text_embedding *text,
@@ -1934,7 +2130,8 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size) ||
         !configure_token_reduction(dit, token_reduction,
-                                   error, error_size)) goto failed;
+                                   error, error_size) ||
+        !configure_vsa(dit, error, error_size)) goto failed;
     size_t wanted_video_condition =
         (size_t)dit->video_condition_rows * VIDEO_PATCH;
     size_t wanted_audio_condition =
@@ -2016,6 +2213,7 @@ static h3_dit *load_dit(const char *weight_directory,
         !prepare_projection_maps(dit, error, error_size) ||
         !prepare_token_reduction_maps(dit, error, error_size) ||
         !load_core(dit, progress, progress_opaque, error, error_size) ||
+        !h3_fasth3_finish(error, error_size) ||
         !allocate_activations(dit, error, error_size)) goto failed;
     if ((wanted_video_condition && !h3_gpu_tensor_write_f32_range(
              dit->video_input, 0, condition_video_rows,
@@ -2258,7 +2456,40 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
-    if (getenv("H3_SOL_ATTN") && strcmp(getenv("H3_SOL_ATTN"), "0") != 0) {
+    int use_vsa =
+        weight->gate_compress != NULL || weight->gate_int8 != NULL;
+    if (use_vsa) {
+        if (dit->token_reduction_active || !dit->vsa_gate) {
+            fail(error, error_size, dit->token_reduction_active
+                     ? "VSA cannot run with token reduction"
+                     : "VSA gate activation is missing");
+            return 0;
+        }
+        head_major_attention_output = 0;
+        if (weight->gate_int8 && weight->gate_scales &&
+            dit->int8_activation && dit->int8_activation_scales) {
+            OP(h3_gpu_linear_int8_bf16(
+                   dit->gpu, dit->vsa_gate, dit->int8_activation,
+                   dit->int8_activation_scales, dit->mod_attention,
+                   weight->gate_int8, weight->gate_scales, rows, HIDDEN,
+                   INNER, dit->use_slower_uncached_int8_scales, 0),
+               "DiT VSA int8 gate");
+        } else {
+            OP(h3_gpu_linear_bf16(dit->gpu, dit->vsa_gate, dit->mod_attention,
+                                  weight->gate_compress, NULL, rows, HIDDEN,
+                                  INNER),
+               "DiT VSA gate");
+        }
+        OP(h3_gpu_vsa_bf16(
+               dit->gpu, dit->attention_heads, dit->query, dit->key,
+               dit->value, dit->vsa_gate, rows, HEADS, HEAD_DIM,
+               1.0f / sqrtf((float)HEAD_DIM), 0, (uint32_t)dit->latent_t,
+               (uint32_t)dit->latent_h / 2u, (uint32_t)dit->latent_w / 2u,
+               dit->vsa_prefix, dit->vsa_prefix_n, dit->vsa_sparsity),
+           "DiT VSA");
+    }
+    if (!use_vsa && getenv("H3_SOL_ATTN") &&
+        strcmp(getenv("H3_SOL_ATTN"), "0") != 0) {
         unsigned begin = 4, end = 40;
         const char *range = getenv("H3_SOL_ATTN_BLOCKS");
         if (range && *range) {
@@ -2274,7 +2505,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         h3_gpu_sol_attn_configure(dit->gpu,
                                   index >= begin && index < end, prefix);
     }
-    if (head_major_attention_output)
+    if (use_vsa) {
+        /* Sparse attention already wrote row-major heads. */
+    } else if (head_major_attention_output)
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
@@ -3073,6 +3306,21 @@ static int ensure_previous_velocities(h3_dit *dit, char *error,
     return 0;
 }
 
+static int pika_requested(void) {
+    const char *value = getenv("H3_PIKA");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static uint64_t pika_seed(void) {
+    const char *value = getenv("H3_PIKA_SEED");
+    char *end = NULL;
+    unsigned long long parsed;
+    if (!value || !value[0]) return 42;
+    parsed = strtoull(value, &end, 10);
+    if (end == value || *end) return 42;
+    return (uint64_t)parsed;
+}
+
 static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                              float *audio_latent, int reuse_interval,
                              h3_dit_progress progress, void *progress_opaque,
@@ -3093,8 +3341,10 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
     if (reuse_interval > 1 && getenv("H3_PROFILE"))
         fprintf(stderr, "h3: %s GPU reuse schedule has %d evaluations\n",
                 custom_count > 0 ? "custom" : "selected", selected_count);
+    int pika = pika_requested();
     unsigned window = gpu_sampler_window();
-    int disable_command_split = window == 1 &&
+    if (pika && getenv("H3_GPU_SAMPLER_WINDOW") == NULL) window = 0;
+    int disable_command_split = (window == 1 || pika) &&
                                 getenv("H3_DIT_COMMAND_BLOCKS") == NULL;
     if (getenv("H3_PROFILE"))
         fprintf(stderr, "h3: GPU sampler encode window is %s; internal split "
@@ -3129,10 +3379,68 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                                       audio_rows, audio_count);
     if (!ok) fail(error, error_size, "cannot pack/write GPU Euler latents");
 
+    h3_rng pika_rng;
+    float *pika_video_noise = NULL;
+    float *pika_audio_noise = NULL;
+    h3_gpu_tensor *pika_video_noise_gpu = NULL;
+    h3_gpu_tensor *pika_audio_noise_gpu = NULL;
+    int pika_noise_draws = 0;
+    if (ok && pika) {
+        for (int step = 0; step < dit->sigmas.steps; step++) {
+            if (dit->sigmas.video[step + 1] != 0.0f ||
+                dit->sigmas.audio[step + 1] != 0.0f)
+                pika_noise_draws++;
+        }
+        size_t video_noise_count = video_count * (size_t)pika_noise_draws;
+        size_t audio_noise_count = audio_count * (size_t)pika_noise_draws;
+        h3_rng_seed(&pika_rng, pika_seed());
+        pika_video_noise = malloc(video_noise_count * sizeof(*pika_video_noise));
+        pika_audio_noise = malloc(audio_noise_count * sizeof(*pika_audio_noise));
+        pika_video_noise_gpu =
+            h3_gpu_tensor_new_f32(dit->gpu, video_noise_count);
+        pika_audio_noise_gpu =
+            h3_gpu_tensor_new_f32(dit->gpu, audio_noise_count);
+        if (!pika_video_noise || !pika_audio_noise ||
+            !pika_video_noise_gpu || !pika_audio_noise_gpu) {
+            fail(error, error_size, "out of memory allocating Pika renoise");
+            ok = 0;
+        } else {
+            int draw = 0;
+            for (int step = 0; step < dit->sigmas.steps; step++) {
+                int video_draw = dit->sigmas.video[step + 1] != 0.0f;
+                int audio_draw = dit->sigmas.audio[step + 1] != 0.0f;
+                if (!video_draw && !audio_draw) continue;
+                if (video_draw)
+                    h3_rng_fill_normal(&pika_rng,
+                                       pika_video_noise +
+                                           (size_t)draw * video_count,
+                                       video_count);
+                if (audio_draw)
+                    h3_rng_fill_normal(&pika_rng,
+                                       pika_audio_noise +
+                                           (size_t)draw * audio_count,
+                                       audio_count);
+                draw++;
+            }
+            ok = h3_gpu_tensor_write_f32(pika_video_noise_gpu, pika_video_noise,
+                                         video_noise_count) &&
+                 h3_gpu_tensor_write_f32(pika_audio_noise_gpu, pika_audio_noise,
+                                         audio_noise_count);
+            if (!ok)
+                fail(error, error_size, "cannot upload Pika renoise noise");
+            else
+                fprintf(stderr,
+                        "h3: Pika H3 Flex re-noises the clean prediction; "
+                        "pre-uploaded video then audio noise for %d steps\n",
+                        pika_noise_draws);
+        }
+    }
+
     int last_evaluated = -1;
     int previous_evaluated = -1;
     unsigned pending_evaluations = 0;
     int command_active = 0;
+    int pika_draw = 0;
     for (int step = 0; step < dit->sigmas.steps && ok; step++) {
         report(progress, progress_opaque, "denoise enqueue", step,
                dit->sigmas.steps);
@@ -3179,16 +3487,43 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
             ? dit->previous_video_velocity : dit->video_output_bf16;
         const h3_gpu_tensor *previous_audio = previous_evaluated >= 0
             ? dit->previous_audio_velocity : dit->audio_output_bf16;
-        ok = gpu_op(dit, h3_gpu_euler_bf16(
-                dit->gpu, dit->video_input, video_offset,
-                dit->video_output_bf16, previous_video, (uint32_t)video_count,
-                dit->sigmas.video[step] - dit->sigmas.video[step + 1],
-                video_ratio), error, error_size, "GPU video Euler step") &&
-             gpu_op(dit, h3_gpu_euler_bf16(
-                dit->gpu, dit->audio_input, audio_offset,
-                dit->audio_output_bf16, previous_audio, (uint32_t)audio_count,
-                dit->sigmas.audio[step] - dit->sigmas.audio[step + 1],
-                audio_ratio), error, error_size, "GPU audio Euler step");
+        if (pika) {
+            int video_draw = dit->sigmas.video[step + 1] != 0.0f;
+            int audio_draw = dit->sigmas.audio[step + 1] != 0.0f;
+            size_t noise_index = (size_t)pika_draw;
+            if ((!video_draw && !audio_draw) || pika_draw >= pika_noise_draws) {
+                video_draw = 0;
+                audio_draw = 0;
+                noise_index = 0;
+            } else {
+                pika_draw++;
+            }
+            ok = gpu_op(dit, h3_gpu_renoise_bf16(
+                        dit->gpu, dit->video_input, video_offset,
+                        dit->video_output_bf16,
+                        video_draw ? pika_video_noise_gpu : NULL,
+                        noise_index * video_count, (uint32_t)video_count,
+                        dit->sigmas.video[step], dit->sigmas.video[step + 1]),
+                    error, error_size, "GPU video renoise step") &&
+                 gpu_op(dit, h3_gpu_renoise_bf16(
+                        dit->gpu, dit->audio_input, audio_offset,
+                        dit->audio_output_bf16,
+                        audio_draw ? pika_audio_noise_gpu : NULL,
+                        noise_index * audio_count, (uint32_t)audio_count,
+                        dit->sigmas.audio[step], dit->sigmas.audio[step + 1]),
+                    error, error_size, "GPU audio renoise step");
+        } else {
+            ok = gpu_op(dit, h3_gpu_euler_bf16(
+                    dit->gpu, dit->video_input, video_offset,
+                    dit->video_output_bf16, previous_video, (uint32_t)video_count,
+                    dit->sigmas.video[step] - dit->sigmas.video[step + 1],
+                    video_ratio), error, error_size, "GPU video Euler step") &&
+                 gpu_op(dit, h3_gpu_euler_bf16(
+                    dit->gpu, dit->audio_input, audio_offset,
+                    dit->audio_output_bf16, previous_audio, (uint32_t)audio_count,
+                    dit->sigmas.audio[step] - dit->sigmas.audio[step + 1],
+                    audio_ratio), error, error_size, "GPU audio Euler step");
+        }
         if (ok && (evaluate || preview)) {
             int finish = preview || step + 1 == dit->sigmas.steps ||
                          (window && pending_evaluations >= window);
@@ -3241,6 +3576,10 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
         fail(error, error_size, "cannot unpack GPU Euler latents");
     free(video_rows);
     free(audio_rows);
+    free(pika_video_noise);
+    free(pika_audio_noise);
+    free_tensor(&pika_video_noise_gpu);
+    free_tensor(&pika_audio_noise_gpu);
     if (ok) report(progress, progress_opaque, "denoise", dit->sigmas.steps,
                    dit->sigmas.steps);
     h3_gpu_profile_mark(dit->gpu, "GPU Euler denoise");
@@ -3500,7 +3839,7 @@ void h3_dit_free(h3_dit *dit) {
     FREE(fbc_input); FREE(fbc_probe); FREE(fbc_residual); FREE(fbc_prev);
     FREE(fbc_tail_residual);
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
-    FREE(attention_heads); FREE(attention_output);
+    FREE(attention_heads); FREE(vsa_gate); FREE(attention_output);
     FREE(token_pool_pairs); FREE(token_baseline_indices);
     FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
     FREE(activated); FREE(mlp_output); FREE(int8_activation);

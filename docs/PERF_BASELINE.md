@@ -3,8 +3,51 @@
 Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.3** adds
 opt-in `--fbc`. Fox-fast and the 15 s quality / TR / Sol-Attn rows are still
 the **v0.2.2** measurement; the 15 s `--fbc` row is the 2026-10-05 one shot.
-The 2026-08-17 tables after them are the **pre-optimization** CUDA baseline
-(`483ffdf` / `v0.1.0`), not shipping speed.
+Unreleased adds FastH3 / TAEH3 / Pika / VSA (2026-11-07). The 2026-08-17
+tables after them are the **pre-optimization** CUDA baseline (`483ffdf` /
+`v0.1.0`), not shipping speed.
+
+## 2026-11-07 — FastH3 / TAEH3 / Pika / VSA (H3-OnDevice 5 s)
+
+Same job shape as [`H3_ONDEVICE.md`](H3_ONDEVICE.md): 832×480, 124 frames,
+seed 42, starship prompt, 50 layers, `--reuse 1`. One shot each. Logs and
+MP4s under `/tmp/h3_fasth3_bench/`. Default path fox-fast md5 still
+`f5282774d3a4` after the port.
+
+| Run | Flags | E2E | Denoise (sdpa / linear) | Decode | md5 |
+|---|---|---:|---|---:|---|
+| exact (prior) | stock 50-step | 641.9 s | 598.2 s (351 / 188) | VAE 26.7 s | `7e2a92b49a3d` |
+| `--fasth3-lora` dense-datafree | 4 evals | **94.1 s** | **46.8 s** (27.7 / 14.3) | VAE 26.3 s | `7f21f9a7cf2d` |
+| + `--taeh3` | 4 evals + tiny decode | **72.4 s** | 47.7 s (28.0 / 14.9) | **TAEH3 4.4 s** | `7754988c50d6` |
+| `--pika-lora` fl2va | 6-step renoise | **118.8 s** | **71.4 s** (42.1 / 22.2) | VAE 25.8 s | `a2cb065b3291` |
+| `--fasth3-lora` vsa-datafree `--vsa --taeh3` (pre-MMA) | 4 evals, sparsity 0.9 | 180.1 s | 151.2 s (VSA / 17.3) | TAEH3 4.4 s | `b5c1edda0d7e` |
+| **`--vsa --taeh3` + sparse-MMA fine** (2026-11-07 night) | same | **58.0 s** | **34.0 s** (VSA / 17.4) | TAEH3 ~5 s | see `/tmp/h3_autoloop_vsa/` |
+| fasth3+taeh3 after prefetch skip | 4 evals | **69.4 s** | 47.5 s (27.8 / 15.0) | TAEH3 ~5 s | — |
+
+FastH3 cuts the 50-step exact wall by about **6.8×** (641.9 → 94.1 s); most
+of the remaining time is load + VAE. TAEH3 drops decode 26 s → 4.4 s.
+Pika’s 6 renoise steps sit between FastH3 and the exact path on the clock.
+
+### 2026-11-07 night autoloop — VSA sparse MMA **KEEP**
+
+Scalar VSA fine was **~3.2× slower** than dense MMA (151 s vs 47 s denoise)
+despite keep-29 (~15% FLOPs): CDNA-shaped one-token blocks, no Tensor Cores.
+`h3_vsa_fine_mma_kernel` (128 threads / `(q_tile, head)`, `mma.sync.m16n8k16`,
+mask-selected KV tiles only) + skip tiled memsets: denoise **151→34 s**,
+e2e **180→58 s**. Beats dense FastH3+TAEH3 denoise (47 s) and e2e (69.4 s
+after `--taeh3` VAE-prefetch skip). fox-fast md5 still `f5282774d3a4`.
+Serial-tile and 1024-thread scalar tile launches were **REJECT**. Dropping
+scatter/gather for token-major pool/fine via `inv` was also **REJECT**
+(denoise 34→38 s): coalesced tiled reads beat the retile savings. INT8 VSA
+gate (was BF16) does **not** cut e2e/linear (~61 s / 17.3 s) but lowers
+denoise peak **24.1→22.4 GiB** — kept as default (`H3_VSA_BF16_GATE=1` to
+opt out). Autoloop stopped: no further ≥5% e2e left without reopening
+FP8/MXFP8 (historically REJECT for quality).
+
+Downloads: `tools/download_fasth3_lora.sh`, `tools/download_taeh3.sh`,
+`tools/download_pika_lora.sh`. Weights used:
+`/home/alex/HF-MODELS/FastH3-4-step-LoRA/{dense,vsa}-datafree/`,
+`…/taeh3.safetensors`, `/home/alex/HF-MODELS/Pika-H3-Flex/fl2va/`.
 
 ## perf2 autoloop (2026-09-07)
 

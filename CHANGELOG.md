@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+Opt-in FastH3 / TAEH3 / Pika / VSA paths are in tree and measured on GB10
+(H3-OnDevice 832×480 / 5 s / 124f / seed 42, starship prompt). Default
+kernels and fox-fast md5 `f5282774d3a4` are unchanged. Logs:
+`/tmp/h3_fasth3_bench/`.
+
+| Run | Flags | E2E | Denoise (sdpa / linear) | Decode | md5 |
+|---|---|---:|---|---:|---|
+| exact (v0.2.3) | 50 layers, reuse 1 | 641.9 s | 598.2 s (351 / 188) | VAE 26.7 s | `7e2a92b49a3d` |
+| **`--fasth3-lora` dense** | 4 steps 999/749/500/250 | **94.1 s** | **46.8 s** (27.7 / 14.3) | VAE 26.3 s | `7f21f9a7cf2d` |
+| **+ `--taeh3`** | same + tiny decode | **72.4 s** | 47.7 s (28.0 / 14.9) | **TAEH3 4.4 s** | `7754988c50d6` |
+| **`--pika-lora` FL2VA** | 6-step renoise | **118.8 s** | **71.4 s** (42.1 / 22.2) | VAE 25.8 s | `a2cb065b3291` |
+| **`--vsa` + TAEH3** (pre-MMA) | vsa-datafree LoRA | 180.1 s | 151.2 s (VSA / 17.3) | TAEH3 4.4 s | `b5c1edda0d7e` |
+| **`--vsa` + TAEH3** sparse-MMA | same | **58.0 s** | **34.0 s** (VSA / 17.4) | TAEH3 ~5 s | `/tmp/h3_autoloop_vsa/` |
+
+`--fasth3-lora PATH` merges `W += B @ A` (+ `.diff`) at load, then INT8.
+Forces 50 layers and `--reuse 1`. Download: `./tools/download_fasth3_lora.sh`.
+`--taeh3 PATH` replaces the video VAE decode only (softer picture; audio
+unchanged). `./tools/download_taeh3.sh`. Skipping stock VAE prefetch under
+`--taeh3` is a **KEEP** (fasth3+taeh3 **72.4→69.4 s**). `--pika-lora` /
+`--pika-ref-lora` merge Pika rank-128 factors and run the 6-step renoise
+schedule. `./tools/download_pika_lora.sh`. `--vsa` needs vsa-datafree; after
+`h3_vsa_fine_mma_kernel` it is a **speed** path on this shape (**34 s**
+denoise vs dense FastH3 **47 s**).
+
 15 s cinematic `--fbc` (864×480, 362 frames, steps 20, layers 45, reuse 1,
 seed 42, office prompt in `scripts/fox-15s.sh`): **16 min 44 s** e2e,
 denoise **15 min 17 s** (SDPA 783 / linear 100). Quality path is 17 min 56 s.

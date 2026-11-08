@@ -114,6 +114,15 @@ double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
 int h3_schedule_build(int steps, h3_sigma_schedule *schedule);
 /* Released linear base grid: evaluations model forwards plus terminal zero. */
 int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule);
+/* FastH3 distilled ladder: timesteps 999, 749, 500, 250 and a terminal zero. */
+int h3_fasth3_schedule_build(h3_sigma_schedule *schedule);
+/* Pika H3 Flex knots 1000,750,500,250,100,40,0. Six DiT evaluations. */
+int h3_pika_schedule_build(h3_sigma_schedule *schedule);
+/* Center-crop box matching Pika FL2VA keyframes (Python round-half-to-even). */
+int h3_keyframe_center_crop(int source_width, int source_height,
+                            int canvas_width, int canvas_height,
+                            int *crop_width, int *crop_height,
+                            int *left, int *top);
 
 int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
                     char *error, size_t error_size);
@@ -136,6 +145,9 @@ int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
 int h3_res_step(float *output, const float *sample, const float *denoised,
                 const float *old_denoised, size_t count,
                 const float *sigmas, int step, int total_steps);
+int h3_renoise_velocity_step(float *sample, const float *velocity,
+                             const float *noise, size_t count,
+                             float sigma, float sigma_next);
 int h3_euler_velocity_step(float *sample, const float *velocity, size_t count,
                            float sigma, float sigma_next);
 

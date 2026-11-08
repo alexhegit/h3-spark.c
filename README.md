@@ -60,6 +60,10 @@ MiniMax-H3 demo assets (`ref2va.mp4` / `fl2va.mp4`).
 | `--ref-audio` + preview UX (`--frames-dir`, `--show`) | ✅ |
 | fox-s2 / fox-fast / 15 s cinematic | GB10 scoreboard below — [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md). Unchanged at v0.2.3 |
 | Opt-in `--fbc` | First Block Cache. 832×480 / 5 s: **236.9 s** at 18.7 dB alone. 15 s cinematic: **16 min 44 s** (−7% vs 17 min 56 s); PSNR not measured. [`docs/H3_ONDEVICE.md`](docs/H3_ONDEVICE.md) |
+| Opt-in `--fasth3-lora` | FastH3 dense 4-step LoRA. 832×480 / 5 s: **94.1 s** e2e (denoise 46.8 s). Forces 999/749/500/250, 50 layers, `--reuse 1`. Not the quality path |
+| Opt-in `--taeh3` | TAEH3 tiny video decoder. With FastH3: **72.4 s** e2e (decode **4.4 s** vs VAE 26 s). Softer preview; audio VAE unchanged |
+| Opt-in `--pika-lora` | Pika FL2VA 6-step renoise LoRA. 832×480 / 5 s: **118.8 s** e2e (denoise 71.4 s) |
+| Opt-in `--vsa` | FastH3 VSA (vsa-datafree LoRA). Sparse-MMA fine: 832×480 / 5 s **58 s** e2e (denoise **34 s**, beats dense FastH3 47 s) |
 
 Progress log: [`docs/SPARK_AUTORUN.md`](docs/SPARK_AUTORUN.md) · Known gaps:
 [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) · Porting notes:

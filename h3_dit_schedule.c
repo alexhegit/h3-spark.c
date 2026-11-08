@@ -1,4 +1,5 @@
 #include "h3_dit_schedule.h"
+#include "h3_fasth3.h"
 
 #include <errno.h>
 #include <math.h>
@@ -355,6 +356,15 @@ static h3_gpu_tensor *time_embeddings(const h3_weight_store *weights,
             goto cleanup;
         }
     }
+    if (!h3_fasth3_apply(gpu, in_w, "time_embedder.proj_in.weight",
+                         TIME_HIDDEN, TIME_INPUT, 1, error, error_size) ||
+        !h3_fasth3_apply(gpu, in_b, "time_embedder.proj_in.bias",
+                         TIME_HIDDEN, 1, 1, error, error_size) ||
+        !h3_fasth3_apply(gpu, out_w, "time_embedder.proj_out.weight",
+                         H3_DIT_TIME_DIM, TIME_HIDDEN, 1, error, error_size) ||
+        !h3_fasth3_apply(gpu, out_b, "time_embedder.proj_out.bias",
+                         H3_DIT_TIME_DIM, 1, 1, error, error_size))
+        goto cleanup;
     if (!gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
                 "begin timestep embedding") ||
         !gpu_op(gpu, h3_gpu_linear_f32(gpu, hidden, input, in_w, in_b, rows,
@@ -417,7 +427,9 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                                          schedule->time_rows, visual_condition,
                                          audio_condition);
     char cache_file[1024];
-    int cacheable =
+    const char *fasth3_env = getenv("H3_FASTH3_LORA");
+    int fasth3 = fasth3_env && fasth3_env[0] && strcmp(fasth3_env, "0") != 0;
+    int cacheable = !fasth3 &&
         cache_key && adaln_cache_path(cache_file, sizeof(cache_file), cache_key);
     if (cacheable && adaln_cache_load(schedule, gpu, cache_file, cache_key)) {
         free(features);
@@ -450,8 +462,13 @@ h3_dit_schedule *h3_dit_schedule_precompute(
             weights, gpu, bias_name, BLOCK_OUTPUT, error, error_size);
         schedule->blocks[block] = h3_gpu_tensor_new_bf16(
             gpu, (size_t)schedule->time_rows * BLOCK_OUTPUT);
-        if (!weight || !bias || !schedule->blocks[block]) {
-            if (!error || !*error)
+        if (!weight || !bias || !schedule->blocks[block] ||
+            !h3_fasth3_apply(gpu, weight, weight_name, BLOCK_OUTPUT,
+                             H3_DIT_TIME_DIM, 0, error, error_size) ||
+            !h3_fasth3_apply(gpu, bias, bias_name, BLOCK_OUTPUT, 1, 0,
+                             error, error_size)) {
+            if ((!error || !*error) &&
+                (!weight || !bias || !schedule->blocks[block]))
                 fail(error, error_size, "cannot allocate AdaLN block %u: %s",
                      block, h3_gpu_error(gpu));
             free_tensor(&weight);
@@ -485,6 +502,10 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     schedule->final = h3_gpu_tensor_new_bf16(
         gpu, (size_t)schedule->time_rows * FINAL_OUTPUT);
     if (!final_w || !final_b || !schedule->final ||
+        !h3_fasth3_apply(gpu, final_w, "final_layer.adaln_proj.linear.weight",
+                         FINAL_OUTPUT, H3_DIT_TIME_DIM, 0, error, error_size) ||
+        !h3_fasth3_apply(gpu, final_b, "final_layer.adaln_proj.linear.bias",
+                         FINAL_OUTPUT, 1, 0, error, error_size) ||
         !gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
                 "begin final AdaLN") ||
         !gpu_op(gpu, h3_gpu_linear_bf16(

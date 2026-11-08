@@ -115,6 +115,52 @@ static void test_schedule(void) {
         CHECK(schedule.video[index] > schedule.video[index + 1]);
         CHECK(schedule.audio[index] > schedule.audio[index + 1]);
     }
+    CHECK(h3_fasth3_schedule_build(&schedule));
+    CHECK(schedule.steps == 4);
+    CHECK(close_enough(schedule.video[0], 12.0f * 0.999f /
+                       (1.0f + 11.0f * 0.999f), 1e-5));
+    CHECK(schedule.video[4] == 0.0f && schedule.audio[4] == 0.0f);
+    CHECK(schedule.video[0] > schedule.video[1]);
+    CHECK(schedule.video[3] > schedule.video[4]);
+    CHECK(h3_pika_schedule_build(&schedule));
+    CHECK(schedule.steps == 6);
+    CHECK(close_enough(schedule.video[0], 1.0f, 1e-5));
+    CHECK(schedule.video[6] == 0.0f && schedule.audio[6] == 0.0f);
+    CHECK(schedule.video[0] > schedule.video[1]);
+    CHECK(schedule.video[5] > schedule.video[6]);
+    CHECK(!h3_pika_schedule_build(NULL));
+    {
+        int cw = 0, ch = 0, left = 0, top = 0;
+        CHECK(h3_keyframe_center_crop(1000, 500, 832, 480,
+                                      &cw, &ch, &left, &top));
+        CHECK(cw == 867 && ch == 500 && left == 66 && top == 0);
+        CHECK(h3_keyframe_center_crop(500, 1000, 832, 480,
+                                      &cw, &ch, &left, &top));
+        CHECK(cw == 500 && ch == 288 && left == 0 && top == 356);
+        CHECK(h3_keyframe_center_crop(832, 480, 832, 480,
+                                      &cw, &ch, &left, &top));
+        CHECK(cw == 832 && ch == 480 && left == 0 && top == 0);
+        CHECK(!h3_keyframe_center_crop(0, 1, 832, 480,
+                                       &cw, &ch, &left, &top));
+    }
+    {
+        float sample[2] = {1.0f, 2.0f};
+        float velocity[2] = {0.5f, -0.25f};
+        float noise[2] = {0.0f, 1.0f};
+        CHECK(h3_renoise_velocity_step(sample, velocity, noise, 2,
+                                       0.5f, 0.25f));
+        CHECK(close_enough(sample[0],
+                           (1.0f - 0.25f) * (1.0f + 0.5f * 0.5f) +
+                               0.25f * 0.0f, 1e-5));
+        sample[0] = 1.0f;
+        sample[1] = 2.0f;
+        CHECK(h3_renoise_velocity_step(sample, velocity, NULL, 2,
+                                       0.5f, 0.0f));
+        CHECK(close_enough(sample[0], 1.0f + 0.5f * 0.5f, 1e-5));
+        CHECK(!h3_renoise_velocity_step(sample, velocity, NULL, 2,
+                                        0.5f, 0.25f));
+    }
+    CHECK(!h3_fasth3_schedule_build(NULL));
     CHECK(!h3_serving_schedule_build(1, &schedule));
     CHECK(!h3_serving_schedule_build(H3_MAX_STEPS + 1, &schedule));
 }

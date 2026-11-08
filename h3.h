@@ -96,6 +96,20 @@ typedef struct {
      * (H3_FBC_WARMUP, default 4), late steps (H3_FBC_TAIL, default 4), and a
      * streak cap (H3_FBC_MAX_STREAK, default 4) stay dense. Not bit-identical. */
     int fbc;
+    /* Off by default. FastH3 dense 4-step LoRA merged at load. Forces
+     * timesteps 999, 749, 500, 250, 50 layers, and --reuse 1. */
+    const char *fasth3_lora;
+    /* Off by default. Decode video latents with the TAEH3 tiny decoder.
+     * Softer preview. Audio VAE is unchanged. */
+    const char *taeh3;
+    /* Off by default. Pika H3 Flex FL2VA LoRA. Forces the 6-step renoise
+     * schedule, 50 layers, and --reuse 1. */
+    const char *pika_lora;
+    /* Off by default. Pika H3 Flex Ref2VA LoRA. Used with references. */
+    const char *pika_ref_lora;
+    /* Off by default. FastH3 video sparse attention. Requires --fasth3-lora
+     * pointing at the vsa-datafree adapter. */
+    int vsa;
     /* Use one int8 activation scale per FC2 row and the M5 full-K kernel.
      * Faster, but more numerically aggressive than grouped int8. */
     int use_int8_row_fc2;
@@ -140,7 +154,7 @@ typedef struct {
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
 }
 
 typedef struct {

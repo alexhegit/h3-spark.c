@@ -9,6 +9,7 @@
 #include "h3_text_encoder.h"
 #include "h3_tokenizer.h"
 #include "h3_video_encoder.h"
+#include "h3_taeh3.h"
 #include "h3_video_vae.h"
 #include "h3_vision_encoder.h"
 
@@ -18,6 +19,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -236,6 +238,18 @@ failed:
     return NULL;
 }
 
+static int h3_pika_requested(const h3_params *params) {
+    return (params->pika_lora && params->pika_lora[0]) ||
+           (params->pika_ref_lora && params->pika_ref_lora[0]);
+}
+
+static const char *h3_pika_active_path(const h3_params *params) {
+    if (params->reference_count)
+        return params->pika_ref_lora && params->pika_ref_lora[0]
+            ? params->pika_ref_lora : NULL;
+    return params->pika_lora && params->pika_lora[0] ? params->pika_lora : NULL;
+}
+
 static char *h3_prepared_key(const char *conditioning,
                              const h3_params *params,
                              int render_width, int render_height) {
@@ -246,11 +260,19 @@ static char *h3_prepared_key(const char *conditioning,
     if (!h3_key_append(
             &key,
             "%s|shape=%dx%dx%d|steps=%d|layers=%d|reuse-core=%d|reduce=%d"
-            "|sol-attn=%d|fbc=%d|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
+            "|sol-attn=%d|fbc=%d|fasth3=%s|taeh3=%s|pika=%s|pika-ref=%s|vsa=%d|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
             "|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
             params->steps, params->dit_layers, params->core_reuse,
             params->token_reduction, params->sol_attn, fbc_key,
+            params->fasth3_lora && params->fasth3_lora[0] ?
+                params->fasth3_lora : "0",
+            params->taeh3 && params->taeh3[0] ? params->taeh3 : "0",
+            params->pika_lora && params->pika_lora[0] ?
+                params->pika_lora : "0",
+            params->pika_ref_lora && params->pika_ref_lora[0] ?
+                params->pika_ref_lora : "0",
+            params->vsa,
             params->use_int8_row_fc2,
             params->use_reference_rope,
             params->ssd_streaming,
@@ -623,6 +645,73 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "first-block cache must be zero or one");
         return 0;
     }
+    if (h3_pika_requested(params) &&
+        params->fasth3_lora && params->fasth3_lora[0]) {
+        h3_set_error(ctx, "Pika H3 Flex cannot be combined with --fasth3-lora");
+        return 0;
+    }
+    if (params->pika_ref_lora && params->pika_ref_lora[0] &&
+        !params->reference_count) {
+        h3_set_error(ctx, "Pika Ref2VA LoRA requires a reference (--ref-image)");
+        return 0;
+    }
+    if (params->reference_count && params->pika_lora && params->pika_lora[0] &&
+        !(params->pika_ref_lora && params->pika_ref_lora[0])) {
+        h3_set_error(ctx,
+            "references use the Ref2VA transformer; pass --pika-ref-lora");
+        return 0;
+    }
+    if (h3_pika_requested(params)) {
+        if (params->denoise_reuse != 1) {
+            h3_set_error(ctx, "Pika H3 Flex requires --reuse 1");
+            return 0;
+        }
+        if (params->dit_layers != H3_DEFAULT_DIT_LAYERS) {
+            h3_set_error(ctx, "Pika H3 Flex keeps all 50 DiT layers");
+            return 0;
+        }
+        if (params->token_reduction || params->sol_attn || params->fbc ||
+            params->vsa || params->ssd_streaming || params->core_reuse > 1) {
+            h3_set_error(ctx,
+                "Pika H3 Flex cannot be combined with token reduction, "
+                "sol-attn, first-block cache, VSA, SSD streaming, or core reuse");
+            return 0;
+        }
+    }
+    if (params->fasth3_lora && params->fasth3_lora[0]) {
+        if (params->denoise_reuse != 1) {
+            h3_set_error(ctx, "FastH3 LoRA requires --reuse 1");
+            return 0;
+        }
+        if (params->dit_layers != H3_DEFAULT_DIT_LAYERS) {
+            h3_set_error(ctx, "FastH3 LoRA keeps all 50 DiT layers");
+            return 0;
+        }
+        if (params->token_reduction || params->sol_attn || params->fbc ||
+            params->ssd_streaming || params->core_reuse > 1) {
+            h3_set_error(ctx,
+                "FastH3 LoRA cannot be combined with token reduction, "
+                "sol-attn, first-block cache, SSD streaming, or core reuse");
+            return 0;
+        }
+    }
+    if (params->vsa != 0 && params->vsa != 1) {
+        h3_set_error(ctx, "VSA must be zero or one");
+        return 0;
+    }
+    if (params->vsa &&
+        !(params->fasth3_lora && params->fasth3_lora[0])) {
+        h3_set_error(ctx, "VSA requires --fasth3-lora");
+        return 0;
+    }
+    if (params->vsa &&
+        (params->token_reduction || params->sol_attn || params->fbc ||
+         params->ssd_streaming || params->core_reuse > 1)) {
+        h3_set_error(ctx,
+            "VSA cannot be combined with token reduction, sol-attn, "
+            "first-block cache, SSD streaming, or core reuse");
+        return 0;
+    }
     if (params->use_int8_row_fc2 != 0 &&
         params->use_int8_row_fc2 != 1) {
         h3_set_error(ctx, "int8 row FC2 must be zero or one");
@@ -956,6 +1045,34 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             "--token-reduction, not KEEP. Tune H3_SOL_ATTN_TAU (default 0.5).\n");
     }
     if (params->fbc) setenv("H3_FBC", "1", 1);
+    {
+        const char *lora_path = h3_pika_active_path(params);
+        if (!lora_path && params->fasth3_lora && params->fasth3_lora[0])
+            lora_path = params->fasth3_lora;
+        setenv("H3_FASTH3_LORA", lora_path ? lora_path : "0", 1);
+    }
+    setenv("H3_PIKA", h3_pika_active_path(params) ? "1" : "0", 1);
+    {
+        char seed_text[32];
+        snprintf(seed_text, sizeof(seed_text), "%" PRIu64, params->seed);
+        setenv("H3_PIKA_SEED", seed_text, 1);
+    }
+    if (h3_pika_active_path(params) &&
+        !getenv("H3_GPU_SAMPLER") && !getenv("H3_CPU_SAMPLER"))
+        setenv("H3_GPU_SAMPLER", "1", 0);
+    if (params->fasth3_lora && params->fasth3_lora[0])
+        fprintf(stderr,
+            "h3: --fasth3-lora merges a 4-step adapter at load and overrides "
+            "--steps with timesteps 999, 749, 500, 250. Not the quality path.\n");
+    if (h3_pika_active_path(params))
+        fprintf(stderr,
+            "h3: --pika-lora/--pika-ref-lora merges a 6-step renoise adapter "
+            "at load. Not the quality path.\n");
+    setenv("H3_VSA", params->vsa ? "1" : "0", 1);
+    if (params->vsa)
+        fprintf(stderr,
+            "h3: --vsa is on: video tiles stay 4x4x4 and the prefix "
+            "stays dense (off by default). H3_VSA_SPARSITY default 0.9.\n");
     int render_width = params->render_width ? params->render_width :
                                                params->width;
     int render_height = params->render_height ? params->render_height :
@@ -1325,11 +1442,21 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             if (progress.cancelled) goto cleanup;
         }
     } else {
+        h3_image_fit first_fit = H3_IMAGE_FIT_STRETCH;
+        h3_image_fit last_fit = H3_IMAGE_FIT_COVER;
+        if (h3_pika_active_path(params) &&
+            (params->first_frame || params->last_frame)) {
+            first_fit = H3_IMAGE_FIT_ASPECT_CROP;
+            last_fit = H3_IMAGE_FIT_ASPECT_CROP;
+            fprintf(stderr,
+                    "h3: Pika keyframes are center-cropped to the canvas "
+                    "aspect, then resized.\n");
+        }
         if (params->first_frame) {
             keyframes[keyframe_count++] = 0;
             if (!h3_ffmpeg_read_image_f32(
                     params->first_frame, render_width, render_height,
-                    H3_IMAGE_FIT_STRETCH, &condition_pixels[visual_count],
+                    first_fit, &condition_pixels[visual_count],
                     detail, sizeof(detail))) {
                 h3_set_error(ctx, "%s", detail);
                 goto cleanup;
@@ -1343,7 +1470,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             keyframes[keyframe_count++] = temporal.frame_count - 1;
             if (!h3_ffmpeg_read_image_f32(
                     params->last_frame, render_width, render_height,
-                    H3_IMAGE_FIT_COVER, &condition_pixels[visual_count],
+                    last_fit, &condition_pixels[visual_count],
                     detail, sizeof(detail))) {
                 h3_set_error(ctx, "%s", detail);
                 goto cleanup;
@@ -1560,7 +1687,25 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_sigma_schedule sigmas;
-    if (!h3_serving_schedule_build(params->steps, &sigmas)) {
+    if (h3_pika_active_path(params)) {
+        if (!h3_pika_schedule_build(&sigmas)) {
+            h3_set_error(ctx, "cannot construct the Pika H3 Flex sigma schedule");
+            goto cleanup;
+        }
+        fprintf(stderr,
+                "h3: Pika H3 Flex schedule overrides --steps %d with 6 "
+                "evaluations at timesteps 1000, 750, 500, 250, 100, 40\n",
+                params->steps);
+    } else if (params->fasth3_lora && params->fasth3_lora[0]) {
+        if (!h3_fasth3_schedule_build(&sigmas)) {
+            h3_set_error(ctx, "cannot construct the FastH3 sigma schedule");
+            goto cleanup;
+        }
+        fprintf(stderr,
+                "h3: FastH3 schedule overrides --steps %d with 4 evaluations "
+                "at timesteps 999, 749, 500, 250\n",
+                params->steps);
+    } else if (!h3_serving_schedule_build(params->steps, &sigmas)) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
     }
@@ -1662,7 +1807,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         live_preview.output_height = params->height;
         if (progress.cancelled) goto cleanup;
     }
-    if (!preview_decoder)
+    /* --taeh3 never touches the stock video VAE; prefetching its safetensors
+     * only burns ~10 GiB of bandwidth during denoise. */
+    if (!preview_decoder && !(params->taeh3 && params->taeh3[0]))
         vae_prefetch_started = h3_prefetch_start(&vae_prefetch, vae_path);
     size_t video_count = h3_dit_video_elements(dit);
     size_t audio_count = h3_dit_audio_elements(dit);
@@ -1709,7 +1856,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     free(audio);
     audio = NULL;
     if (progress.cancelled) goto cleanup;
-    if (!preview_decoder && ctx->cache_enabled) {
+    if (!preview_decoder && ctx->cache_enabled &&
+        !(params->taeh3 && params->taeh3[0])) {
         h3_progress_emit(&progress, "video VAE load", 0, 36);
         preview_decoder = h3_acquire_video_decoder(
             ctx, decoder_key, vae_path, latent_h, latent_w,
@@ -1722,15 +1870,24 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
-    int video_ok = preview_decoder ?
-        h3_video_vae_decoder_decode(
-            preview_decoder, video, temporal.video_t, &frames,
-            detail, sizeof(detail)) :
-        h3_video_vae_decode(
-            vae_path, "h3_shaders.metal", video,
-            temporal.video_t, latent_h, latent_w,
-            h3_vae_progress_bridge, &progress, &frames,
-            detail, sizeof(detail));
+    int video_ok;
+    if (params->taeh3 && params->taeh3[0]) {
+        h3_progress_emit(&progress, "video TAEH3", 0, 1);
+        video_ok = h3_taeh3_decode(
+            params->taeh3, video, temporal.video_t, latent_h, latent_w,
+            &frames, detail, sizeof(detail));
+        if (video_ok) h3_progress_emit(&progress, "video TAEH3", 1, 1);
+    } else {
+        video_ok = preview_decoder ?
+            h3_video_vae_decoder_decode(
+                preview_decoder, video, temporal.video_t, &frames,
+                detail, sizeof(detail)) :
+            h3_video_vae_decode(
+                vae_path, "h3_shaders.metal", video,
+                temporal.video_t, latent_h, latent_w,
+                h3_vae_progress_bridge, &progress, &frames,
+                detail, sizeof(detail));
+    }
     if (!video_ok) {
         h3_set_error(ctx, "%s", detail);
         goto cleanup;

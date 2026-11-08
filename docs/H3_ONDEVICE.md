@@ -25,6 +25,17 @@ sample frames. Do not compute PSNR against their videos.
 | fbc | `--fbc` (50 layers, reuse 1) | 16 full / 34 skip | **236.9 s** | 200.1 s (117 / 62) | 26.6 s | `70ca55e095f8` |
 | fbc+sol | `--fbc --layers 45 --sol-attn`, `H3_SOL_ATTN_TAU=1` | 16 full / 34 skip | **169.6 s** | 137.4 s (62 / 56) | 26.1 s | `1cf883e369bb` |
 | all-opt | `--layers 45 --reuse 3 --sol-attn`, `H3_SOL_ATTN_TAU=1` | 18 | **180.8 s** | 144.6 s (64 / 61) | 26.5 s | `8119514ece0e` |
+| **fasth3** | `--fasth3-lora` dense-datafree | 4 | **94.1 s** | **46.8 s** (27.7 / 14.3) | 26.3 s | `7f21f9a7cf2d` |
+| **fasth3+taeh3** | FastH3 + `--taeh3` | 4 | **72.4 s** | 47.7 s (28.0 / 14.9) | **TAEH3 4.4 s** | `7754988c50d6` |
+| **pika** | `--pika-lora` fl2va | 6 | **118.8 s** | **71.4 s** (42.1 / 22.2) | 25.8 s | `a2cb065b3291` |
+| vsa+taeh3 (pre-MMA) | vsa-datafree + `--vsa --taeh3` | 4 | 180.1 s | 151.2 s (VSA / 17.3) | TAEH3 4.4 s | `b5c1edda0d7e` |
+| **vsa+taeh3 MMA** | sparse-MMA fine | 4 | **58.0 s** | **34.0 s** (VSA / 17.4) | TAEH3 ~5 s | `/tmp/h3_autoloop_vsa/` |
+
+FastH3 / TAEH3 / Pika rows are **2026-11-07** one-shots
+(`/tmp/h3_fasth3_bench/`). VSA sparse-MMA is the same-night autoloop
+**KEEP** (denoise 151→34 s; beats dense FastH3). Adapters via
+`tools/download_*.sh`; not the quality path. Details:
+[`PERF_BASELINE.md`](PERF_BASELINE.md).
 
 `--fbc` is off by default. It runs block 0 every step and skips the rest when
 that residual's relative L2 stays under `H3_FBC_REL` (default 0.10). The first
@@ -69,6 +80,9 @@ Same GPU class, resolution, frame count, and nominal 50 steps. Recipes differ.
 | H3-OnDevice + kernel + Sol-Attn + First Block Cache | **181.3 s** | **3.92×** |
 | **h3-spark.c all-opt** (45 layers, reuse 3, Sol-Attn τ=1) | **180.8 s** | **3.93×** |
 | **h3-spark.c `--fbc` + 45 layers + Sol-Attn τ=1** | **169.6 s** | **4.19×** |
+| **h3-spark.c `--fasth3-lora` dense** (4-step LoRA) | **94.1 s** | **7.55×** |
+| **h3-spark.c FastH3 + `--taeh3`** (prefetch skip) | **69.4 s** | **10.2×** |
+| **h3-spark.c `--vsa --taeh3` sparse-MMA** | **58.0 s** | **12.3×** |
 
 641.9 s is already past their eager baseline because this tree is not PyTorch
 eager. 180.8 s matches their full stack on the clock with a different recipe:
@@ -80,3 +94,6 @@ reaches 169.6 s, ahead of both 180.8 s and their 181.3 s on the clock, at
 LPIPS figure.
 
 Video VAE stays ~26.5 s once denoise shrinks, about 15% of the 181 s.
+FastH3 / TAEH3 rows use a distilled 4-step adapter (and optional tiny
+decode), so they are not comparable on quality to the 50-step NVIDIA
+column — wall clock only.

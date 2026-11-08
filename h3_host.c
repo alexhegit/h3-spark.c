@@ -166,6 +166,79 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     return 1;
 }
 
+int h3_fasth3_schedule_build(h3_sigma_schedule *schedule) {
+    static const int timesteps[4] = {999, 749, 500, 250};
+    if (!schedule) return 0;
+    memset(schedule, 0, sizeof(*schedule));
+    schedule->steps = 4;
+    for (int index = 0; index < 4; index++) {
+        float base = (float)timesteps[index] / 1000.0f;
+        float video_shift = (float)H3_VIDEO_SIGMA_SHIFT;
+        float audio_shift = (float)H3_AUDIO_SIGMA_SHIFT;
+        schedule->video[index] = video_shift * base /
+            (1.0f + (video_shift - 1.0f) * base);
+        schedule->audio[index] = audio_shift * base /
+            (1.0f + (audio_shift - 1.0f) * base);
+    }
+    schedule->video[4] = 0.0f;
+    schedule->audio[4] = 0.0f;
+    return 1;
+}
+
+int h3_pika_schedule_build(h3_sigma_schedule *schedule) {
+    static const int knots[7] = {1000, 750, 500, 250, 100, 40, 0};
+    if (!schedule) return 0;
+    memset(schedule, 0, sizeof(*schedule));
+    schedule->steps = 6;
+    for (int index = 0; index < 7; index++) {
+        double base = (double)knots[index] / 1000.0;
+        double video = H3_VIDEO_SIGMA_SHIFT * base /
+            (1.0 + (H3_VIDEO_SIGMA_SHIFT - 1.0) * base);
+        double audio = H3_AUDIO_SIGMA_SHIFT * base /
+            (1.0 + (H3_AUDIO_SIGMA_SHIFT - 1.0) * base);
+        schedule->video[index] = (float)video;
+        schedule->audio[index] = (float)audio;
+    }
+    return 1;
+}
+
+static int h3_python_round_nonneg(double value) {
+    if (!(value >= 0.0)) return 0;
+    double floored = floor(value);
+    double frac = value - floored;
+    if (frac > 0.5) return (int)floored + 1;
+    if (frac < 0.5) return (int)floored;
+    return ((int)floored % 2 == 0) ? (int)floored : (int)floored + 1;
+}
+
+int h3_keyframe_center_crop(int source_width, int source_height,
+                            int canvas_width, int canvas_height,
+                            int *crop_width, int *crop_height,
+                            int *left, int *top) {
+    if (source_width < 1 || source_height < 1 ||
+        canvas_width < 1 || canvas_height < 1 ||
+        !crop_width || !crop_height || !left || !top) return 0;
+    double aspect = (double)canvas_width / (double)canvas_height;
+    int cropped_w;
+    int cropped_h;
+    if ((double)source_width / (double)source_height > aspect) {
+        cropped_h = source_height;
+        cropped_w = h3_python_round_nonneg((double)source_height * aspect);
+        if (cropped_w < 1) cropped_w = 1;
+        if (cropped_w > source_width) cropped_w = source_width;
+    } else {
+        cropped_w = source_width;
+        cropped_h = h3_python_round_nonneg((double)source_width / aspect);
+        if (cropped_h < 1) cropped_h = 1;
+        if (cropped_h > source_height) cropped_h = source_height;
+    }
+    *crop_width = cropped_w;
+    *crop_height = cropped_h;
+    *left = (source_width - cropped_w) / 2;
+    *top = (source_height - cropped_h) / 2;
+    return 1;
+}
+
 typedef struct {
     h3_layout *layout;
     size_t position_capacity;
@@ -690,6 +763,22 @@ int h3_res_step(float *output, const float *sample, const float *denoised,
     for (size_t index = 0; index < count; index++) {
         output[index] = (float)(decay * sample[index] + h *
             (b1 * denoised[index] + b2 * old_denoised[index]));
+    }
+    return 1;
+}
+
+int h3_renoise_velocity_step(float *sample, const float *velocity,
+                             const float *noise, size_t count,
+                             float sigma, float sigma_next) {
+    if (!sample || !velocity || !count || !isfinite(sigma) ||
+        !isfinite(sigma_next) || sigma < 0.0f || sigma_next < 0.0f ||
+        sigma_next > sigma) return 0;
+    if (sigma_next != 0.0f && !noise) return 0;
+    for (size_t index = 0; index < count; index++) {
+        float clean = sample[index] + sigma * velocity[index];
+        sample[index] = sigma_next == 0.0f
+            ? clean
+            : (1.0f - sigma_next) * clean + sigma_next * noise[index];
     }
     return 1;
 }

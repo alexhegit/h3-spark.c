@@ -13,13 +13,13 @@ LDFLAGS := -L$(CUDA_LIB) -Wl,-rpath,$(CUDA_LIB) -lcudart -lcublas -lcublasLt \
 	-lstdc++ -licuuc -lm -pthread
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	h3_dit_schedule.c h3_dit.c h3_video_vae.c h3_video_encoder.c \
+	h3_dit_schedule.c h3_dit.c h3_fasth3.c h3_taeh3.c h3_video_vae.c h3_video_encoder.c \
 	h3_audio_vae.c h3_ffmpeg.c h3_terminal.c h3_vision_encoder.c \
 	h3_multimodal.c h3_device.c h3_cuda.c h3_tokenizer.c third_party/cJSON.c
 
-LIB_CUDA := h3_gpu.cu h3_gpu_stubs.c
+LIB_CUDA := h3_gpu.cu h3_taeh3_kernels.cu h3_vsa_kernels.cu h3_gpu_stubs.c
 
-LIB_OBJ := $(LIB_C:.c=.o) h3_gpu.o h3_gpu_stubs.o
+LIB_OBJ := $(LIB_C:.c=.o) h3_gpu.o h3_taeh3_kernels.o h3_vsa_kernels.o h3_gpu_stubs.o
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test test-step test-conditional smoke probe clean tokenizer_test tokenizer_smoke
@@ -226,6 +226,12 @@ probe: h3_cuda_probe
 	$(CC) $(CFLAGS) -c $< -o $@
 
 h3_gpu.o: h3_gpu.cu
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+h3_taeh3_kernels.o: h3_taeh3_kernels.cu
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+h3_vsa_kernels.o: h3_vsa_kernels.cu
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 h3_gpu_stubs.o: h3_gpu_stubs.c
