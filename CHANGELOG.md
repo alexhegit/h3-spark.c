@@ -1,10 +1,11 @@
 # Changelog
 
-## Unreleased
+## v0.2.4 — 2026-11-08
 
-Opt-in FastH3 / TAEH3 / Pika / VSA paths are in tree and measured on GB10
-(H3-OnDevice 832×480 / 5 s / 124f / seed 42, starship prompt). Default
-kernels and fox-fast md5 `f5282774d3a4` are unchanged. Logs:
+Opt-in FastH3 / TAEH3 / Pika / VSA, measured on GB10 (H3-OnDevice 832×480 /
+5 s / 124f / seed 42, starship prompt). Default kernels and fox-fast md5
+`f5282774d3a4` are unchanged. `--info` prints `H3_VERSION` **0.2.4**.
+Sample clips: [`assets/bench-2026-11-07/`](assets/bench-2026-11-07/). Logs:
 `/tmp/h3_fasth3_bench/`.
 
 | Run | Flags | E2E | Denoise (sdpa / linear) | Decode | md5 |

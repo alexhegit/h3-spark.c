@@ -1,7 +1,7 @@
 # Quality vs speed: how to pick generate knobs
 
 Recipe tables below are **DGX Spark (GB10), v0.2.2**, seed 42, `--profile`,
-and are unchanged at v0.2.3. `--fbc` is measured separately in
+and are unchanged at v0.2.4. `--fbc` and FastH3 / TAEH3 / Pika / VSA are measured separately in
 [`H3_ONDEVICE.md`](H3_ONDEVICE.md).
 PSNR/SSIM are ffmpeg lavfi vs the **same prompt/size/seed without the speed
 flag**. They are not a claim about “good video” in absolute terms — only how

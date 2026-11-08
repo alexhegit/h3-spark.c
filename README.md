@@ -1,6 +1,6 @@
 # h3-spark.c
 
-**v0.2.3** — NVIDIA DGX Spark (GB10) CUDA port of
+**v0.2.4** — NVIDIA DGX Spark (GB10) CUDA port of
 [antirez/h3.c](https://github.com/antirez/h3.c). MiniMax-H3 inference with the
 same CLI and model stack; the GPU backend is CUDA.
 
@@ -48,7 +48,20 @@ COMMON=(--width 512 --height 512 --frames 22 --steps 20 --layers 45 --reuse 2)
 Reference stills under `assets/showcase/refs/` were taken from the official
 MiniMax-H3 demo assets (`ref2va.mp4` / `fl2va.mp4`).
 
-## Status (v0.2.3, 2026-10-05)
+### Speed samples (v0.2.4)
+
+Same starship prompt, **832×480**, 5 s, seed 42. These are the opt-in speed
+paths, not the default quality clips above. TAEH3 clips have about three
+snow frames at the start (MemBlock cold start).
+
+| Path | Sample |
+|------|--------|
+| **FastH3** 4-step + VAE (~94 s) | [![FastH3](assets/bench-2026-11-07/fasth3-4step.jpg)](assets/bench-2026-11-07/fasth3-4step.mp4) [mp4](assets/bench-2026-11-07/fasth3-4step.mp4) |
+| **FastH3 + TAEH3** (~72 s) | [![FastH3+TAEH3](assets/bench-2026-11-07/fasth3-taeh3.jpg)](assets/bench-2026-11-07/fasth3-taeh3.mp4) [mp4](assets/bench-2026-11-07/fasth3-taeh3.mp4) |
+| **Pika** 6-step (~119 s) | [![Pika](assets/bench-2026-11-07/pika-6step.jpg)](assets/bench-2026-11-07/pika-6step.mp4) [mp4](assets/bench-2026-11-07/pika-6step.mp4) |
+| **VSA + TAEH3** (~58 s) | [![VSA](assets/bench-2026-11-07/vsa-taeh3-mma.jpg)](assets/bench-2026-11-07/vsa-taeh3-mma.mp4) [mp4](assets/bench-2026-11-07/vsa-taeh3-mma.mp4) |
+
+## Status (v0.2.4, 2026-11-08)
 
 | Capability | Status |
 |------------|--------|
@@ -58,7 +71,7 @@ MiniMax-H3 demo assets (`ref2va.mp4` / `fl2va.mp4`).
 | Runtime INT8 MLP (default on GB10; `H3_BF16_MLP=1` is slower and fails the PSNR floor) | ✅ |
 | Opt-in `H3_INT8_VAE=1` (VAE VRAM, not default speed) | ✅ |
 | `--ref-audio` + preview UX (`--frames-dir`, `--show`) | ✅ |
-| fox-s2 / fox-fast / 15 s cinematic | GB10 scoreboard below — [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md). Unchanged at v0.2.3 |
+| fox-s2 / fox-fast / 15 s cinematic | GB10 scoreboard below — [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md). Unchanged at v0.2.4 |
 | Opt-in `--fbc` | First Block Cache. 832×480 / 5 s: **236.9 s** at 18.7 dB alone. 15 s cinematic: **16 min 44 s** (−7% vs 17 min 56 s); PSNR not measured. [`docs/H3_ONDEVICE.md`](docs/H3_ONDEVICE.md) |
 | Opt-in `--fasth3-lora` | FastH3 dense 4-step LoRA. 832×480 / 5 s: **94.1 s** e2e (denoise 46.8 s). Forces 999/749/500/250, 50 layers, `--reuse 1`. Not the quality path |
 | Opt-in `--taeh3` | TAEH3 tiny video decoder. With FastH3: **72.4 s** e2e (decode **4.4 s** vs VAE 26 s). Softer preview; audio VAE unchanged |

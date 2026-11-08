@@ -1,9 +1,9 @@
 # Spark performance baseline
 
-Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.3** adds
-opt-in `--fbc`. Fox-fast and the 15 s quality / TR / Sol-Attn rows are still
-the **v0.2.2** measurement; the 15 s `--fbc` row is the 2026-10-05 one shot.
-Unreleased adds FastH3 / TAEH3 / Pika / VSA (2026-11-07). The 2026-08-17
+Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.4** adds
+opt-in FastH3 / TAEH3 / Pika / VSA (2026-11-07). **v0.2.3** added `--fbc`.
+Fox-fast and the 15 s quality / TR / Sol-Attn rows are still the **v0.2.2**
+measurement; the 15 s `--fbc` row is the 2026-10-05 one shot. The 2026-08-17
 tables after them are the **pre-optimization** CUDA baseline (`483ffdf` /
 `v0.1.0`), not shipping speed.
 

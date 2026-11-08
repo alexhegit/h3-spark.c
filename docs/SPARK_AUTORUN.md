@@ -1,6 +1,6 @@
 # Spark autoloop progress log
 
-Automated **h3-cuda** port on DGX Spark. Shipping tag: **v0.2.3**
+Automated **h3-cuda** port on DGX Spark. Shipping tag: **v0.2.4**
 (`main`).
 
 ## Plan (revised 2026-08-17)
@@ -76,6 +76,7 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 - **15 s + `--sol-attn` (2026-09-14):** **11 min 35 s** e2e (−35%), PSNR **19.2 / 0.72** vs quality. Opt-in; [`SOL_ATTN.md`](SOL_ATTN.md).
 - **v0.2.2 (2026-09-14):** ships `--sol-attn`. Audio SNR vs quality on 15 s: sol-attn **8.6 dB** (TR 3.1, reuse 3 2.6). `H3_SOL_ATTN_BLOCKS=8:36` REJECT.
 - **v0.2.3 (2026-10-05):** ships `--fbc`. 832×480 / 5 s / 50 steps: **236.9 s** at 18.7 dB / 0.73 alone; **169.6 s** at 12.6 dB / 0.58 with 45 layers and Sol-Attn τ=1. 15 s cinematic `--fbc`: **16 min 44 s** (−7% vs 17 min 56 s); 10/20 steps full; PSNR not measured. [`H3_ONDEVICE.md`](H3_ONDEVICE.md).
+- **v0.2.4 (2026-11-08):** ships opt-in `--fasth3-lora`, `--taeh3`, `--pika-lora`, `--vsa`. Same 832×480 / 5 s job: FastH3 **94.1 s**, FastH3+TAEH3 **69.4 s** after VAE-prefetch skip, Pika **118.8 s**, VSA sparse-MMA **58 s** (denoise **34 s**). Fox-fast md5 unchanged. Clips: [`assets/bench-2026-11-07/`](../assets/bench-2026-11-07/).
 
 ### Pending (E)
 
@@ -84,4 +85,4 @@ See [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-001 / KI-002 (won't-fix on Spar
 
 ---
 
-*Last updated: 2026-10-05 — v0.2.3 (`--fbc`)*
+*Last updated: 2026-11-08 — v0.2.4 (FastH3 / TAEH3 / Pika / VSA)*
