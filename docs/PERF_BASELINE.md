@@ -10,8 +10,10 @@ tables after them are the **pre-optimization** CUDA baseline (`483ffdf` /
 ## 2026-11-07 — FastH3 / TAEH3 / Pika / VSA (H3-OnDevice 5 s)
 
 Same job shape as [`H3_ONDEVICE.md`](H3_ONDEVICE.md): 832×480, 124 frames,
-seed 42, starship prompt, 50 layers, `--reuse 1`. One shot each. Logs and
-MP4s under `/tmp/h3_fasth3_bench/`. Default path fox-fast md5 still
+seed 42, starship prompt, 50 layers, `--reuse 1`. One shot each. Logs under
+`/tmp/h3_fasth3_bench/`; checked-in sample MP4s in
+[`assets/bench-2026-11-07/`](../assets/bench-2026-11-07/). TAEH3 clips start
+with ~3 snow frames (zero MemBlock past). Default path fox-fast md5 still
 `f5282774d3a4` after the port.
 
 | Run | Flags | E2E | Denoise (sdpa / linear) | Decode | md5 |

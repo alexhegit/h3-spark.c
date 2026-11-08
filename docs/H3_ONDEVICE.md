@@ -33,8 +33,10 @@ sample frames. Do not compute PSNR against their videos.
 
 FastH3 / TAEH3 / Pika rows are **2026-11-07** one-shots
 (`/tmp/h3_fasth3_bench/`). VSA sparse-MMA is the same-night autoloop
-**KEEP** (denoise 151→34 s; beats dense FastH3). Adapters via
-`tools/download_*.sh`; not the quality path. Details:
+**KEEP** (denoise 151→34 s; beats dense FastH3). Sample MP4s:
+[`assets/bench-2026-11-07/`](../assets/bench-2026-11-07/). TAEH3 clips have
+~3 snow frames at the start (zero MemBlock past); full-VAE clips do not.
+Adapters via `tools/download_*.sh`; not the quality path. Details:
 [`PERF_BASELINE.md`](PERF_BASELINE.md).
 
 `--fbc` is off by default. It runs block 0 every step and skips the rest when

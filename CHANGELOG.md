@@ -19,8 +19,11 @@ kernels and fox-fast md5 `f5282774d3a4` are unchanged. Logs:
 `--fasth3-lora PATH` merges `W += B @ A` (+ `.diff`) at load, then INT8.
 Forces 50 layers and `--reuse 1`. Download: `./tools/download_fasth3_lora.sh`.
 `--taeh3 PATH` replaces the video VAE decode only (softer picture; audio
-unchanged). `./tools/download_taeh3.sh`. Skipping stock VAE prefetch under
-`--taeh3` is a **KEEP** (fasth3+taeh3 **72.4→69.4 s**). `--pika-lora` /
+unchanged). MemBlock starts with zero past, so the **first ~3 output frames
+are snow**; from frame 4 the picture is real but soft. Preview only — final
+exports should keep the stock VAE. `./tools/download_taeh3.sh`. Sample MP4s:
+`assets/bench-2026-11-07/`. Skipping stock VAE prefetch under `--taeh3` is a
+**KEEP** (fasth3+taeh3 **72.4→69.4 s**). `--pika-lora` /
 `--pika-ref-lora` merge Pika rank-128 factors and run the 6-step renoise
 schedule. `./tools/download_pika_lora.sh`. `--vsa` needs vsa-datafree; after
 `h3_vsa_fine_mma_kernel` it is a **speed** path on this shape (**34 s**
